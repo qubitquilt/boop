@@ -628,7 +628,7 @@ async function postReview(octokit, body, reviewNumber) {
     body:
       `${reviewHeader(reviewNumber)}\n\n` +
       trimmed +
-      `\n\n<sub>Posted by [BoopPr](https://github.com/michaelruelas/homelab-infra) · PR \`${shortSha(PR_HEAD_SHA)}\`${reviewTag} · good boy powered</sub>` +
+      `\n\n<sub>Posted by [BoopPr](https://github.com/qubitquilt/boop) · PR \`${shortSha(PR_HEAD_SHA)}\`${reviewTag} · good boy powered</sub>` +
       `\n${headMarker}`,
   });
 }

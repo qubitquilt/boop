@@ -186,7 +186,7 @@ runner wraps it with:
 
 <body the model produced>
 
-<sub>Posted by [BoopPr](https://github.com/michaelruelas/homelab-infra) · PR `<sha7>` · [review #N · ]good boy powered</sub>
+<sub>Posted by [BoopPr](https://github.com/qubitquilt/boop) · PR `<sha7>` · [review #N · ]good boy powered</sub>
 ```
 
 The body is trimmed to 65 KB (GitHub's hard cap on issue comments) by

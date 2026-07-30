@@ -89,7 +89,7 @@ before merging.]
 
 A footer (added by the runner, not by the skill) reads:
 
-> <sub>Posted by [BoopPr](https://github.com/michaelruelas/homelab-infra) ·
+> <sub>Posted by [BoopPr](https://github.com/qubitquilt/boop) ·
 > PR `a1b2c3d` · review #2 · good boy powered</sub>
 
 ### 3. Inline comments (line-specific)
