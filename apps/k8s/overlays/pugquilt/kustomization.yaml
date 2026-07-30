@@ -8,13 +8,21 @@ resources:
   - ../../base
   - ingressroute.yaml
 
-# Default to :latest (main HEAD). After cutting a v0.x.x tag, switch
-# to :stable or a specific tag (e.g. :v0.1.0) for reproducible deployments.
+# Pin the receiver image to a digest. The sync-image-digests workflow
+# updates this whenever a new image is pushed, so the deployed
+# Deployment references the exact bytes that the most recent build
+# produced. Without this, the manifest's :latest tag is a moving
+# target and K8s does not roll the Deployment on a registry-only image
+# change.
+#
+# The runner image is referenced indirectly via JOB_IMAGE in the
+# boop-config ConfigMap (base/config.yaml), not as a direct image
+# field, so kustomize's images: override does not reach it. Each
+# review Job pulls the runner image fresh, so the rollout-on-registry-
+# change problem does not apply to it; it stays pinned to :stable.
 images:
   - name: ghcr.io/qubitquilt/boop-receiver
-    newTag: latest
-  - name: ghcr.io/qubitquilt/boop-runner
-    newTag: latest
+    digest: sha256:a44fd40d4c3d99b482d4f4a2f12a4be79a40d2f6215b7c48f838da7c9d3948c6
 
 labels:
   - includeSelectors: false

@@ -1,0 +1,75 @@
+name: sync-image-digests
+
+# After a successful build, query the registry for the current :latest
+# digest of each image and update the kustomize overlay so the next
+# ArgoCD sync pins the Deployment to the bytes that were just built.
+# Without this, K8s never rolls the Deployment on a registry-only
+# image change (the :latest tag is the same string in git).
+
+on:
+  workflow_run:
+    workflows: [build-receiver, build-runner]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve current receiver digest from GHCR
+        id: digests
+        run: |
+          set -euo pipefail
+          DIGEST="$(
+            docker buildx imagetools inspect "ghcr.io/qubitquilt/boop-receiver:latest" --raw 2>/dev/null \
+              | jq -r '.manifests[0].digest // empty'
+          )"
+          if [ -z "${DIGEST}" ]; then
+            echo "::error::Failed to resolve digest for ghcr.io/qubitquilt/boop-receiver"
+            exit 1
+          fi
+          echo "boop-receiver=${DIGEST}" >> "${GITHUB_OUTPUT}"
+
+      - name: Update overlay digest
+        env:
+          RECEIVER_DIGEST: ${{ steps.digests.outputs.boop-receiver }}
+        run: |
+          set -euo pipefail
+          pip install --quiet ruamel.yaml
+          python3 - <<'PY'
+          import os
+          from ruamel.yaml import YAML
+
+          yaml = YAML()
+          yaml.preserve_quotes = True
+          path = "apps/k8s/overlays/pugquilt/kustomization.yaml"
+          with open(path) as f:
+              data = yaml.load(f)
+
+          for img in data.get("images", []):
+              if img["name"] == "ghcr.io/qubitquilt/boop-receiver":
+                  img["digest"] = os.environ["RECEIVER_DIGEST"]
+
+          with open(path, "w") as f:
+              yaml.dump(data, f)
+          PY
+
+      - name: Commit and push
+        run: |
+          if git diff --quiet apps/k8s/overlays/pugquilt/kustomization.yaml; then
+            echo "No digest changes; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add apps/k8s/overlays/pugquilt/kustomization.yaml
+          git commit -m "chore(deps): update image digests"
+          git push

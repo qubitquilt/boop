@@ -66,8 +66,38 @@ Both `boop-receiver` and `boop-runner` share the same tag scheme so an
 operator can pin the runner image independently of the receiver by
 editing `JOB_IMAGE` in the `boop-config` ConfigMap.
 
-The default overlay pins `:stable`. For reproducible rollouts, pin a
-specific tag (`:v0.1.0`) in the overlay.
+### Digest pinning
+
+The default overlay does **not** track `:latest` or `:stable` directly.
+Instead, each image is pinned to a SHA digest:
+
+```yaml
+images:
+  - name: ghcr.io/qubitquilt/boop-receiver
+    digest: sha256:…
+  - name: ghcr.io/qubitquilt/boop-runner
+    digest: sha256:…
+```
+
+The `sync-image-digests` workflow (`.github/workflows/sync-image-digests.yaml`)
+runs after every successful `build-receiver` or `build-runner` run, queries
+GHCR for the current `:latest` digest of each image, and updates the
+overlay. This is what makes the K8s Deployment roll on a registry-only
+image change: ArgoCD tracks the git manifest, the manifest changes, K8s
+sees a diff in the pod template, the Deployment rolls.
+
+To pin a specific tag (e.g. for a hotfix rollback or a multi-cluster
+pin to a known-good build), edit the overlay by hand:
+
+```bash
+# edit apps/k8s/overlays/pugquilt/kustomization.yaml to set the digest
+# of the receiver or runner to the value of `docker buildx imagetools
+# inspect <image>:<tag> --raw | jq -r .manifests[0].digest`
+```
+
+Or trigger `sync-image-digests` from the Actions tab with
+`workflow_dispatch` — it will resolve whichever tag the GHCR `:latest`
+currently points to.
 
 ## Kustomize layout
 
@@ -110,12 +140,12 @@ apps/k8s/
 
 ### `overlays/pugquilt/`
 
-The home cluster. Pins `:latest` for both images (main HEAD); bump to
-`:stable` or a specific tag for reproducible rollouts. Sets
-`namespace: dev-tools` and adds the `cluster: pugquilt` label
-(non-selector). Ingress: Traefik `IngressRoute` for
-`Host(boop.qubitquilt.dev) && PathPrefix(/webhook)` → `boop-receiver:http`
-on `websecure`.
+The home cluster. Pins to image digests (updated by the
+`sync-image-digests` workflow on every push). For reproducible rollouts,
+pin a specific digest by hand. Sets `namespace: dev-tools` and adds the
+`cluster: pugquilt` label (non-selector). Ingress: Traefik
+`IngressRoute` for `Host(boop.qubitquilt.dev) && PathPrefix(/webhook)`
+→ `boop-receiver:http` on `websecure`.
 
 To add a new cluster:
 
@@ -186,13 +216,20 @@ ServiceAccounts + Role, the Traefik IngressRoute, and the
 
 ## Rollout
 
-Receiver:
+Image updates are automatic. Push a commit to `main` (or open a PR
+against it) and the image CI rebuilds the affected image, pushes to
+GHCR, the `sync-image-digests` workflow updates the digest in the
+overlay, ArgoCD syncs, the Deployment rolls.
+
+For a manual rollout (e.g. pinning a specific tag for a hotfix or
+rollback):
 
 ```
-cd apps/receiver
-make docker-build docker-push IMAGE=ghcr.io/qubitquilt/boop-receiver:0.2.0
-# edit apps/k8s/overlays/pugquilt/kustomization.yaml to pin newTag: 0.2.0
-git commit -am "bump receiver to 0.2.0"
+DIGEST=$(docker buildx imagetools inspect ghcr.io/qubitquilt/boop-receiver:v0.2.0 --raw | jq -r .manifests[0].digest)
+# edit apps/k8s/overlays/pugquilt/kustomization.yaml:
+#   - name: ghcr.io/qubitquilt/boop-receiver
+#     digest: $DIGEST
+git commit -am "pin receiver to v0.2.0"
 git push   # ArgoCD syncs
 ```
 

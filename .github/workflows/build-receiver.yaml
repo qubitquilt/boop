@@ -4,8 +4,16 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+    paths-ignore:
+      - 'apps/k8s/overlays/**'
+      - '.github/workflows/sync-image-digests.yaml'
+      - 'docs/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'apps/k8s/overlays/**'
+      - '.github/workflows/sync-image-digests.yaml'
+      - 'docs/**'
 
 env:
   IMAGE: ghcr.io/qubitquilt/boop-receiver
