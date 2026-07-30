@@ -10,7 +10,6 @@ resources:
   - role.yaml
   - deployment.yaml
   - config.yaml
-  - externalsecret.yaml
 
 configMapGenerator:
   - name: boop-runner-config
