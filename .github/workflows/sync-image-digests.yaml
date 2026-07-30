@@ -39,6 +39,10 @@ jobs:
           chmod 644 ~/.ssh/id_signing.pub
           eval "$(ssh-agent -s)"
           ssh-add ~/.ssh/id_signing
+          echo "DEBUG: key fingerprint in agent:"
+          ssh-add -l
+          echo "DEBUG: public key on disk:"
+          cat ~/.ssh/id_signing.pub
           git config --global gpg.format ssh
           git config --global user.signingkey ~/.ssh/id_signing.pub
           git config --global commit.gpgsign true
