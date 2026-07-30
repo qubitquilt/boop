@@ -67,6 +67,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", h.HandleWebhook)
 	mux.HandleFunc("GET /health", h.Health)
+	mux.HandleFunc("GET /api/reviews", h.ListReviews)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
