@@ -258,6 +258,32 @@ disagree."** Optional means "consider this"; Blocking means "I think
 this is wrong." Findings carry rationale and a suggested approach, not
 "you must" — the author owns the decision.
 
+### Default-config risk
+
+A new environment variable, feature flag, or runtime default that
+changes the cost or shape of the system deserves its own check. The
+diff can be correct, the test can pass, and the change can still
+introduce a regression in production because the new default scales
+badly at real input sizes.
+
+When the diff adds or modifies a default:
+
+- **New env var or config default.** Flag if the default changes
+  runtime resource cost (memory, CPU, recursion depth, request
+  timeout, batch size). A `MAX_DEPTH=2` or `TIMEOUT=30s` is a
+  product decision as much as a code decision.
+- **Default-on feature flags.** Flag when the flag defaults to `true`
+  on a path the PR is enabling. The PR is a config change as much
+  as a code change.
+- **Default-off deprecation.** Flag when a feature is removed from
+  the default path but still load-bearing in tests or fixtures.
+
+Report these under the existing tier system (the cost is what makes
+it Blocking or Follow-up), but call out the **config surface** in
+the finding body so the author can verify the default is intentional.
+A new default is rarely an "implementation detail" — the next
+reviewer's machine will inherit it.
+
 ---
 
 ## Finding ID Scheme
@@ -362,9 +388,17 @@ The runner parses the **last** block Boop emits. Format is exact:
 <Markdown body — the structure above>
 === INLINE COMMENTS ===
 <empty line, or one inline comment per line, in path:line: body form>
+=== CONFIDENCE ===
+<high|medium|low>
 === END ===
 ```
 
+- The `=== CONFIDENCE ===` block is recommended on every summary. Boop
+  emits exactly one of `high`, `medium`, or `low` on the next line. If
+  the block is missing or the value is unrecognised, the runner
+  defaults to `medium` so older or non-conforming model output still
+  posts a review. The runner surfaces whatever value lands in the
+  badge above the body.
 - Anything Boop writes before the `=== SUMMARY ===` block is allowed
   (Boop can think out loud, walk the lenses, etc.) but is discarded by
   the runner. The runner reads the *last* `=== SUMMARY === … === END ===`
@@ -376,6 +410,22 @@ The runner parses the **last** block Boop emits. Format is exact:
   ignored.
 - If the SUMMARY or INLINE COMMENTS section is empty, that's fine —
   the runner still emits the comment (with the appropriate body).
+
+### Confidence line
+
+Every summary ends with a confidence call. This is Boop's merge signal
+in one line. Pick the value that matches the audit:
+
+| Value | Meaning |
+|-------|---------|
+| `high` | Boop walked every lens, found nothing that would survive an honest "I disagree," or only Optional findings. Ready to merge. |
+| `medium` | Boop found Follow-ups worth addressing but no Blocking findings. Mergeable; the author should look at the Follow-ups before the next change. |
+| `low` | Boop found at least one Blocking finding, or multiple lenses flagged the same concern, or the audit could not cover a meaningful slice of the diff (missing fixtures, no test runner reachable). Not safe to merge without changes. |
+
+The runner displays the confidence value as a small badge above the
+review body so the author can scan the merge signal before reading
+the body. Use it sparingly — every review gets one of the three
+values, but `low` is the only one that should change behavior.
 
 ---
 
@@ -393,6 +443,12 @@ The runner parses the **last** block Boop emits. Format is exact:
 - Don't catch optional cleanups as follow-ups.
 - Three to eight inline comments. Prune to the most important.
 - Comment only on lines added or modified by the PR.
+- Emit the `=== CONFIDENCE ===` line on every summary. Pick `high`,
+  `medium`, or `low` based on whether the audit found Blocking
+  findings, whether the diff could be covered, and how many lenses
+  agreed. If Boop genuinely cannot decide (e.g. truncated run, parser
+  failure mid-output), the runner defaults to `medium`, so a missing
+  block is recoverable but should never be deliberate.
 - The runner posts directly to the PR. There is no human-in-the-loop
   edit step. The text Boop emits is what the author sees — make it
   count.

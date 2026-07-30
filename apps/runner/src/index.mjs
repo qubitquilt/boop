@@ -161,6 +161,7 @@ async function main() {
     log("review", "opencode returned", {
       summaryBytes: review.summary.length,
       inlineCount: review.inlineComments.length,
+      confidence: review.confidence,
     });
   } catch (err) {
     errlog("review", "opencode failed", { error: String(err?.message ?? err) });
@@ -168,8 +169,11 @@ async function main() {
     throw err;
   }
 
-  await postReview(statusClient, review.summary, reviewNumber);
-  log("done", "summary comment posted", { review_number: reviewNumber });
+  await postReview(statusClient, review.summary, reviewNumber, review.confidence);
+  log("done", "summary comment posted", {
+    review_number: reviewNumber,
+    confidence: review.confidence,
+  });
 
   for (const c of review.inlineComments) {
     try {
@@ -346,31 +350,35 @@ async function runOpenCodeSkill() {
   }
   const clean = stripAnsi(stdout.trim());
 
-  // Parse the structured SUMMARY / INLINE COMMENTS / END block the
-  // model is required to emit. We strip the TUI transcript (everything
-  // before the SUMMARY marker) and return:
-  //   { summary, inlineComments: [{path, line, body}, ...] }
+  // Parse the structured SUMMARY / INLINE COMMENTS / CONFIDENCE / END
+  // block the model is required to emit. We strip the TUI transcript
+  // (everything before the SUMMARY marker) and return:
+  //   { summary, inlineComments: [{path, line, body}, ...], confidence }
   // so the caller can post one summary comment + N inline comments
-  // via GitHub's PR review comments API.
+  // via GitHub's PR review comments API, and surface the confidence
+  // badge in the summary footer.
   return parseReviewOutput(clean);
 }
 
 // parseReviewOutput extracts the structured block from the opencode
 // output. Anything before "=== SUMMARY ===" (the TUI prompt, bash
 // transcripts, etc.) is dropped. The INLINE COMMENTS section is parsed
-// as one "path:line: body" per line.
+// as one "path:line: body" per line. The optional CONFIDENCE section
+// is parsed as `high`, `medium`, or `low`; missing or unrecognized
+// values default to `medium` so older models keep working.
 function parseReviewOutput(output) {
   const summaryMatch = output.match(
-    /===\s*SUMMARY\s*===\s*([\s\S]*?)\s*===[\s\S]*?INLINE COMMENTS\s*===\s*([\s\S]*?)\s*===\s*END\s*===/i,
+    /===\s*SUMMARY\s*===\s*([\s\S]*?)\s*===[\s\S]*?INLINE COMMENTS\s*===\s*([\s\S]*?)\s*===\s*(?:CONFIDENCE\s*===\s*([\s\S]*?)\s*===\s*)?END\s*===/i,
   );
   if (!summaryMatch) {
     // Fallback: no structured block found. Treat the whole output
     // as the summary.
-    return { summary: output, inlineComments: [] };
+    return { summary: output, inlineComments: [], confidence: "medium" };
   }
 
   const summary = summaryMatch[1].trim();
   const inlineBlock = summaryMatch[2].trim();
+  const confidenceRaw = (summaryMatch[3] || "").trim().toLowerCase();
 
   const inlineComments = [];
   for (const rawLine of inlineBlock.split("\n")) {
@@ -386,7 +394,11 @@ function parseReviewOutput(output) {
     inlineComments.push({ path, line: lineNum, body });
   }
 
-  return { summary, inlineComments };
+  const confidence = ["high", "medium", "low"].includes(confidenceRaw)
+    ? confidenceRaw
+    : "medium";
+
+  return { summary, inlineComments, confidence };
 }
 
 // stripAnsi removes common ANSI escape sequences so the TUI's
@@ -509,6 +521,8 @@ async function buildBoopPrompt() {
     "<empty line, or one inline comment per line in this exact format:>",
     "path/to/file.ext:LINE: <comment body>",
     "path/to/other.ext:LINE: <comment body>",
+    "=== CONFIDENCE ===",
+    "<high|medium|low — one line, the merge signal>",
     "=== END ===",
     "",
     "Rules:",
@@ -523,6 +537,9 @@ async function buildBoopPrompt() {
     `- Comments must be on lines that were ADDED or MODIFIED in the diff ` +
       `range \`${diffRange}\`. Don't comment on unchanged code.`,
     "- Don't include empty SUMMARY or INLINE COMMENTS sections.",
+    "- The CONFIDENCE line is the merge signal: `high` if no Blocking " +
+      "findings and full coverage, `medium` if Follow-ups only, `low` " +
+      "if any Blocking finding or coverage was incomplete.",
     "",
     "## Skill: boop (orchestrator)",
     "",
@@ -543,8 +560,8 @@ async function buildBoopPrompt() {
     `- ${diffHint}`,
     "",
     "Use the orchestrator and the lenses above to do the actual review. " +
-      "When done, emit the SUMMARY / INLINE COMMENTS / END block as the LAST " +
-      "thing in your response.",
+      "When done, emit the SUMMARY / INLINE COMMENTS / CONFIDENCE / END " +
+      "block as the LAST thing in your response.",
   ].join("\n");
 }
 
@@ -634,11 +651,28 @@ function runOpencode(prompt, configContent) {
   });
 }
 
-async function postReview(octokit, body, reviewNumber) {
+// confidenceBadge renders Boop's merge-signal badge for the summary
+// footer. Keep the visual cues (✅ / ⚠️ / 🚨) and the wording aligned
+// with the table in apps/k8s/base/runner-config/skills/boop/SKILL.md
+// ("Confidence line" subsection).
+function confidenceBadge(c) {
+  switch (c) {
+    case "high":
+      return "✅ **Confidence: high** — ready to merge.";
+    case "medium":
+      return "⚠️ **Confidence: medium** — Follow-ups worth addressing, no Blocking findings.";
+    case "low":
+    default:
+      return "🚨 **Confidence: low** — Blocking finding(s) present, not safe to merge without changes.";
+  }
+}
+
+async function postReview(octokit, body, reviewNumber, confidence) {
   const max = 65000;
   const cleaned = body.replace(/\n{3,}/g, "\n\n").trim();
   const trimmed = cleaned.length > max ? cleaned.slice(0, max - 50) + "\n\n…(truncated)" : cleaned;
   const reviewTag = reviewNumber > 1 ? ` · review #${reviewNumber}` : "";
+  const badge = confidenceBadge(confidence || "medium");
   // Hidden marker carrying the full head SHA so the next re-review
   // can diff the delta from this commit. The receiver parses this
   // (see priorReviewHeadSHARegex in client.go). GitHub renders HTML
@@ -651,6 +685,7 @@ async function postReview(octokit, body, reviewNumber) {
     issue_number: Number(PR_NUMBER),
     body:
       `${reviewHeader(reviewNumber)}\n\n` +
+      `${badge}\n\n` +
       trimmed +
       `\n\n<sub>Posted by [BoopPr](https://github.com/qubitquilt/boop) · PR \`${shortSha(PR_HEAD_SHA)}\`${reviewTag} · good boy powered</sub>` +
       `\n${headMarker}`,

@@ -6,7 +6,9 @@ description: >
   cause silent failures, incorrect status codes, or leaked internals.
   Audits silent fallbacks for bug-shape re-introduction: a fallback
   that returns the same value as the pre-fix path is the highest-
-  priority finding.
+  priority finding. Audits threading & cooperative cancellation
+  patterns (executor timeouts, blocking shutdown, missing cancellation
+  signals, race conditions on shared state).
 compatibility: opencode-ai
 version: "1.0"
 ---
@@ -116,7 +118,56 @@ cases where the code returns a wrong code for a known condition:
 - Are there fire-and-forget async calls (no `await`, no `.catch`)
   where a failure would be invisible?
 
-## 5. Recovery & resilience
+## 5. Threading & cooperative cancellation
+
+Threading bugs are silent until they aren't. A `Future.result()` with
+no timeout, an `Executor` that is shut down before in-flight tasks
+complete, or a worker that blocks on a long-running call without
+honoring a cancellation token are all candidates for deadlocks,
+leaked threads, or hung shutdowns. Audit every async-shaped API
+the diff touches, even if the code "looks synchronous."
+
+- **`Future.result(timeout=...)` and `ThreadPoolExecutor`.** A
+  `Future.result()` with no timeout will block forever if the
+  underlying task hangs. Wrap with a timeout or use the
+  `concurrent.futures.wait(..., timeout=...)` shape so a hung worker
+  cannot pin the calling thread indefinitely. Flag as Blocking when
+  the call sits on a request-handling path.
+- **`Executor.shutdown(wait=...)` blocking shutdown.** `wait=True`
+  blocks until every in-flight task finishes. If a task is
+  long-running and the process receives `SIGTERM`, shutdown blocks
+  until the task finishes — which can be longer than the grace
+  period. Use `wait=False, cancel_futures=True` (Python 3.9+) or
+  track tasks explicitly so the executor can wind down.
+- **Missing cooperative cancellation.** A worker function takes no
+  signal (no `Event`, no cancellation token, no deadline) and runs
+  to completion. On `SIGTERM` the executor cannot interrupt it.
+  Flag when the worker sits behind a shutdown path.
+- **`asyncio.wait_for` without a sensible timeout.** A coroutine
+  awaited with `wait_for(coro, timeout=None)` is the same shape as
+  `Future.result()` with no timeout — silent hang. Default the
+  timeout to something bounded; flag when the default is unbounded
+  on a request-handling path.
+- **Thread leaks.** A `Thread(target=...)` is started with no
+  `daemon=True`, no join, and no reference. The thread outlives the
+  caller; if the caller was the only thing keeping the process
+  alive, this leaks. On request handlers, prefer the executor pool
+  over ad-hoc threads.
+- **`Process` / `Subprocess` with no timeout.** `subprocess.run`
+  without `timeout=` will hang the parent. Audit every
+  `subprocess.run` / `subprocess.Popen` call for a bounded timeout
+  and a defined cancellation behavior.
+- **Race on shared state.** A shared mutable structure (dict, list,
+  counter) read and written from multiple threads without a lock.
+  Flag when the read-modify-write is non-atomic and the race is
+  reachable on the diff's code path.
+
+For every threading-shaped finding, ask: **what is the worst case if
+this hangs in production?** A hung worker in a request-handling pool
+is a process-wide outage; a hung worker in a one-shot CLI is a
+noisy log line. Tier accordingly.
+
+## 6. Recovery & resilience
 
 - Are calls to external services (HTTP, DB, queue) wrapped with any
   retry logic, or will a single transient failure surface directly to
@@ -126,7 +177,7 @@ cases where the code returns a wrong code for a known condition:
 - Does the app handle `SIGTERM` gracefully (drain in-flight requests,
   flush logs) or does it cut off immediately?
 
-## 6. Silent fallback bug-shape check
+## 7. Silent fallback bug-shape check
 
 For every silent fallback (`?? defaultValue`, `catch { return old }`,
 `|| fallback`, `if (!x) return safeDefault`), ask:

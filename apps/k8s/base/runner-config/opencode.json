@@ -7,5 +7,6 @@
       }
     }
   },
-  "model": "openrouter/minimax/minimax-m3"
+  "model": "openrouter/minimax/minimax-m3",
+  "small_model": "deepseek/deepseek-v4-flash"
 }

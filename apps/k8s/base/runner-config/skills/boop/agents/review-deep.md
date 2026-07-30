@@ -158,6 +158,48 @@ This is the same check the test-quality lens performs, but this lens
 focuses on the code path rather than the test. A finding here and a
 finding there is two angles on the same concern — both are valuable.
 
+## 6. Regex-literal audit
+
+Regex literals are easy to write, hard to read, and silent when wrong.
+Greedy quantifiers over `.` plus nested groups swallow far more than
+the author intended; lazy quantifiers do the opposite. A regex that
+"worked in the author's test" can still match nothing, match too much,
+or capture the wrong group on production input.
+
+When the diff adds or modifies a regex literal (`re.search`,
+`re.sub`, `re.match`, `re.findall`, `String.prototype.match`, `/.../g`):
+
+- **Greedy `.*` across groups.** `re.search(r"(.*)\((.*)\)", s)` —
+  greedy `.*` will eat across the `(...)` boundary. Use `[^)]*` or a
+  lazy `.*?` depending on intent. Flag as Blocking if the captured
+  group is used downstream (parser, dispatcher, sanitizer).
+- **Lazy `.*?` that misses greedily intended content.** Sometimes
+  the opposite mistake: a lazy quantifier stops at the first match
+  when the author wanted "last." Verify against representative
+  inputs and flag if the capture is wrong on edge cases.
+- **Multiline input without `re.M` / `re.S` / `re.DOTALL`.** A
+  pattern like `re.sub(r".*pattern.*", "", s)` on a string with
+  newlines will only match single-line content unless `re.DOTALL`
+  is set, or `.*` is rewritten as `[\s\S]*`. Flag as Blocking when
+  the regex is meant to span lines.
+- **Unescaped `(` / `)` in the literal.** A literal like `r".*(.*)"`
+  contains two open parens but only one close — the pattern is
+  unbalanced and the engine errors at runtime, or worse, captures
+  the wrong group when the pattern is silently fixed later.
+- **`re.sub` replacing across newlines without the right flags.**
+  Same as the multiline case above. Audit every `re.sub(r".*...")` for
+  unescaped `.` consuming newlines when the input can contain them.
+
+If the regex is exercised by an existing test, mention the test name
+in the finding body — but still flag, because a single happy-path
+fixture rarely covers the boundary case the regex mishandles. A regex
+that "works on the example in the PR description" is not the same as
+a regex that works on production input.
+
+Suggested approach: rewrite the literal with explicit character
+classes (`[^)]*`, `[\s\S]*?`) or the right `re.X` flag, and add a
+fixture that exercises the previously-broken boundary case.
+
 ---
 
 # Unable to Verify
