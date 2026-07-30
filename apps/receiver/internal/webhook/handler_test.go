@@ -5,6 +5,31 @@ import (
 	"testing"
 )
 
+func TestParseInstallationID(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    int64
+		wantErr bool
+	}{
+		{"12345", 12345, false},
+		{"1", 1, false},
+		{"", 0, true},
+		{"abc", 0, true},
+		{"0", 0, true},
+		{"-1", 0, true},
+	}
+	for _, c := range cases {
+		got, err := parseInstallationID(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("parseInstallationID(%q) err = %v, wantErr = %v", c.in, err, c.wantErr)
+			continue
+		}
+		if !c.wantErr && got != c.want {
+			t.Errorf("parseInstallationID(%q) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
 func TestBuildJobName(t *testing.T) {
 	got := buildJobName("michaelruelas", "homelab-infra", 42, "abc1234567890def")
 	want := "boop-michaelruelas-homelab-infra-42-abc1234"
@@ -38,14 +63,15 @@ func TestDuplicateReviewReply(t *testing.T) {
 
 func TestRenderJobTemplate(t *testing.T) {
 	job, err := renderJobTemplate(jobTemplate, templateVars{
-		Owner:        "michaelruelas",
-		Repo:         "homelab-infra",
-		Number:       "42",
-		SHA:          "abc1234567890",
-		SHA7:         "abc1234",
-		BaseRef:      "main",
-		Image:        "ghcr.io/michaelruelas/boop-runner:dev",
-		ReviewNumber: "2",
+		Owner:          "michaelruelas",
+		Repo:           "homelab-infra",
+		Number:         "42",
+		SHA:            "abc1234567890",
+		SHA7:           "abc1234",
+		BaseRef:        "main",
+		Image:          "ghcr.io/michaelruelas/boop-runner:dev",
+		ReviewNumber:   "2",
+		InstallationID: "987654",
 	})
 	if err != nil {
 		t.Fatalf("renderJobTemplate: %v", err)
@@ -60,15 +86,23 @@ func TestRenderJobTemplate(t *testing.T) {
 		t.Errorf("TTLSecondsAfterFinished = %v", got)
 	}
 
-	// BOOP_REVIEW_NUMBER must be wired into the container env.
-	var gotReview string
+	// BOOP_REVIEW_NUMBER and GITHUB_APP_INSTALLATION_ID must be wired
+	// into the container env — the former from the receiver's review
+	// counter, the latter from the X-GitHub-Installation-ID header.
+	var gotReview, gotInstall string
 	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
 		if e.Name == "BOOP_REVIEW_NUMBER" {
 			gotReview = e.Value
 		}
+		if e.Name == "GITHUB_APP_INSTALLATION_ID" {
+			gotInstall = e.Value
+		}
 	}
 	if gotReview != "2" {
 		t.Errorf("BOOP_REVIEW_NUMBER = %q, want 2", gotReview)
+	}
+	if gotInstall != "987654" {
+		t.Errorf("GITHUB_APP_INSTALLATION_ID = %q, want 987654", gotInstall)
 	}
 
 	if !strings.Contains(job.Spec.Template.Spec.NodeSelector["kubernetes.io/os"], "linux") && job.Spec.Template.Spec.NodeSelector != nil {

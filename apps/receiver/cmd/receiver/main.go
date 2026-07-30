@@ -29,11 +29,6 @@ func main() {
 		logger.Error("GITHUB_APP_ID is required and must be a non-zero integer", "err", err)
 		os.Exit(1)
 	}
-	installID, err := parseInt64(getenv("GITHUB_APP_INSTALLATION_ID", "0"))
-	if err != nil || installID == 0 {
-		logger.Error("GITHUB_APP_INSTALLATION_ID is required and must be a non-zero integer", "err", err)
-		os.Exit(1)
-	}
 	privKeyPEM := os.Getenv("GITHUB_APP_PRIVATE_KEY")
 	if privKeyPEM == "" {
 		logger.Error("GITHUB_APP_PRIVATE_KEY is required")
@@ -58,13 +53,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	ghClient := boopgithub.NewClient(boopgithub.AppConfig{
-		AppID:          appID,
-		InstallationID: installID,
-		PrivateKey:     privKey,
+	mgr := boopgithub.NewManager(boopgithub.AppConfig{
+		AppID:      appID,
+		PrivateKey: privKey,
 	})
 
-	h, err := webhook.NewHandler(cfg, ghClient, logger)
+	h, err := webhook.NewHandler(cfg, mgr, logger)
 	if err != nil {
 		logger.Error("init handler", "err", err)
 		os.Exit(1)

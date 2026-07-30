@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,10 +82,10 @@ type Handler struct {
 	cfg      Config
 	logger   *slog.Logger
 	kube     kubernetes.Interface
-	ghClient *boopgithub.Client
+	ghClient *boopgithub.Manager
 }
 
-func NewHandler(cfg Config, ghClient *boopgithub.Client, logger *slog.Logger) (*Handler, error) {
+func NewHandler(cfg Config, ghClient *boopgithub.Manager, logger *slog.Logger) (*Handler, error) {
 	kube, err := newInClusterClient()
 	if err != nil {
 		return nil, fmt.Errorf("kube client: %w", err)
@@ -117,18 +118,25 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	installationID, err := parseInstallationID(r.Header.Get("X-GitHub-Installation-ID"))
+	if err != nil {
+		h.logger.Warn("invalid installation header", "delivery", deliveryID, "err", err)
+		http.Error(w, "invalid installation id", http.StatusBadRequest)
+		return
+	}
+
 	switch event {
 	case "pull_request":
-		h.handlePullRequest(ctx, w, deliveryID, body)
+		h.handlePullRequest(ctx, w, deliveryID, installationID, body)
 	case "issue_comment":
-		h.handleIssueComment(ctx, w, deliveryID, body)
+		h.handleIssueComment(ctx, w, deliveryID, installationID, body)
 	default:
 		h.logger.Debug("ignored event", "delivery", deliveryID, "event", event)
 		writeAck(w, "ignored", "event not handled", deliveryID)
 	}
 }
 
-func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, delivery string, body []byte) {
+func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, delivery string, installationID int64, body []byte) {
 	pr, err := parsePullRequest(body)
 	if err != nil {
 		h.logger.Warn("parse pull_request", "delivery", delivery, "err", err)
@@ -140,13 +148,14 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 		writeAck(w, "ignored", "action not reviewable", delivery)
 		return
 	}
+	client := h.ghClient.ClientFor(installationID)
 	// Check for duplicate before posting a status comment — otherwise a
 	// re-delivery of the same head SHA leaves a stranded "👀" comment
 	// that no runner will update.
 	if claimed, _ := h.claimJobSlot(ctx, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, w); !claimed {
 		return
 	}
-	reviewNumber, err := h.computeReviewNumber(ctx, pr.Owner, pr.Repo, pr.Number)
+	reviewNumber, err := h.computeReviewNumber(ctx, client, pr.Owner, pr.Repo, pr.Number)
 	if err != nil {
 		h.logger.Warn("count prior reviews", "delivery", delivery, "err", err)
 		// Non-fatal — fall back to 1; the runner still runs.
@@ -154,15 +163,15 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 	}
 	// No trigger comment to react to for plain PR events. Post a fresh
 	// status comment and pass its id to the Job.
-	statusID, err := h.postStatus(ctx, pr.Owner, pr.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, "", reviewNumber))
+	statusID, err := h.postStatus(ctx, client, pr.Owner, pr.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, "", reviewNumber))
 	if err != nil {
 		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
 		// Non-fatal — the Job still runs.
 	}
-	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("pull_request.%s", pr.Action), 0, statusID, reviewNumber)
+	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("pull_request.%s", pr.Action), 0, statusID, installationID, reviewNumber)
 }
 
-func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter, delivery string, body []byte) {
+func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter, delivery string, installationID int64, body []byte) {
 	ic, err := parseIssueComment(body)
 	if err != nil {
 		h.logger.Warn("parse issue_comment", "delivery", delivery, "err", err)
@@ -190,7 +199,8 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
-	pr, err := h.ghClient.FetchPullRequest(ctx, ic.Owner, ic.Repo, ic.IssueNumber)
+	client := h.ghClient.ClientFor(installationID)
+	pr, err := client.FetchPullRequest(ctx, ic.Owner, ic.Repo, ic.IssueNumber)
 	if err != nil {
 		h.logger.Error("fetch pull request", "delivery", delivery, "pr", fmt.Sprintf("%s/%s#%d", ic.Owner, ic.Repo, ic.IssueNumber), "err", err)
 		http.Error(w, "fetch pr", http.StatusBadGateway)
@@ -203,38 +213,38 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 	claimed, dupeStatus := h.claimJobSlot(ctx, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, w)
 	if !claimed {
 		if dupeStatus == "active" || dupeStatus == "succeeded" {
-			h.replyDuplicateReview(ctx, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, dupeStatus)
+			h.replyDuplicateReview(ctx, client, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, dupeStatus)
 		}
 		return
 	}
 
 	// React only after we know a run will start, so no-ops do not look
 	// like work is underway.
-	if err := h.ghClient.AddCommentReaction(ctx, ic.Owner, ic.Repo, ic.CommentID, "eyes"); err != nil {
+	if err := client.AddCommentReaction(ctx, ic.Owner, ic.Repo, ic.CommentID, "eyes"); err != nil {
 		h.logger.Warn("add reaction", "delivery", delivery, "err", err)
 	}
 
-	reviewNumber, err := h.computeReviewNumber(ctx, ic.Owner, ic.Repo, pr.Number)
+	reviewNumber, err := h.computeReviewNumber(ctx, client, ic.Owner, ic.Repo, pr.Number)
 	if err != nil {
 		h.logger.Warn("count prior reviews", "delivery", delivery, "err", err)
 		reviewNumber = 1
 	}
 
 	// Post a status comment the runner will PATCH as it progresses.
-	statusID, err := h.postStatus(ctx, ic.Owner, ic.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, ic.SenderLogin, reviewNumber))
+	statusID, err := h.postStatus(ctx, client, ic.Owner, ic.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, ic.SenderLogin, reviewNumber))
 	if err != nil {
 		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
 	}
 
-	h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, statusID, reviewNumber)
+	h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, statusID, installationID, reviewNumber)
 }
 
 // computeReviewNumber returns the 1-based index of the review this
 // run will produce. Counts existing Boop summary comments on the PR
 // and adds one. Falls back to 1 on error so a transient GitHub
 // hiccup never blocks a review.
-func (h *Handler) computeReviewNumber(ctx context.Context, owner, repo string, number int) (int, error) {
-	n, err := h.ghClient.CountPriorReviews(ctx, owner, repo, number)
+func (h *Handler) computeReviewNumber(ctx context.Context, client *boopgithub.Client, owner, repo string, number int) (int, error) {
+	n, err := client.CountPriorReviews(ctx, owner, repo, number)
 	if err != nil {
 		return 0, err
 	}
@@ -290,8 +300,8 @@ func renderStatusBody(stage, sha, by string, reviewNumber int) string {
 	return fmt.Sprintf("boop status: %s", stage)
 }
 
-func (h *Handler) postStatus(ctx context.Context, owner, repo string, number int, body string) (int64, error) {
-	return h.ghClient.PostIssueComment(ctx, owner, repo, number, body)
+func (h *Handler) postStatus(ctx context.Context, client *boopgithub.Client, owner, repo string, number int, body string) (int64, error) {
+	return client.PostIssueComment(ctx, owner, repo, number, body)
 }
 
 // claimJobSlot checks whether a Job already exists for this head SHA.
@@ -330,12 +340,12 @@ func (h *Handler) claimJobSlot(ctx context.Context, delivery, owner, repo string
 
 // replyDuplicateReview posts a short PR comment explaining why a same-SHA
 // `@BoopPr review` request was a no-op. Non-fatal on API errors.
-func (h *Handler) replyDuplicateReview(ctx context.Context, delivery, owner, repo string, number int, headSHA, status string) {
+func (h *Handler) replyDuplicateReview(ctx context.Context, client *boopgithub.Client, delivery, owner, repo string, number int, headSHA, status string) {
 	body := duplicateReviewReply(status, headSHA)
 	if body == "" {
 		return
 	}
-	if _, err := h.ghClient.PostIssueComment(ctx, owner, repo, number, body); err != nil {
+	if _, err := client.PostIssueComment(ctx, owner, repo, number, body); err != nil {
 		h.logger.Warn("post duplicate-review reply", "delivery", delivery, "err", err)
 	}
 }
@@ -360,7 +370,7 @@ func duplicateReviewReply(status, headSHA string) string {
 	}
 }
 
-func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, reason string, reactionCommentID, statusCommentID int64, reviewNumber int) {
+func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, reason string, reactionCommentID, statusCommentID, installationID int64, reviewNumber int) {
 	jobName := buildJobName(owner, repo, number, headSHA)
 
 	job, err := renderJobTemplate(jobTemplate, templateVars{
@@ -374,6 +384,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		StatusCommentID:   fmt.Sprintf("%d", statusCommentID),
 		ReactionCommentID: fmt.Sprintf("%d", reactionCommentID),
 		ReviewNumber:      fmt.Sprintf("%d", reviewNumber),
+		InstallationID:    fmt.Sprintf("%d", installationID),
 	})
 	if err != nil {
 		h.logger.Error("render job", "delivery", delivery, "err", err)
@@ -393,6 +404,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		"pr", fmt.Sprintf("%s/%s#%d", owner, repo, number),
 		"sha", headSHA,
 		"reason", reason,
+		"installation_id", installationID,
 		"status_comment_id", statusCommentID,
 		"reaction_comment_id", reactionCommentID,
 		"review_number", reviewNumber,
@@ -411,6 +423,7 @@ type templateVars struct {
 	StatusCommentID   string // GitHub comment id for live status updates (empty if none)
 	ReactionCommentID string // GitHub comment id that received the trigger reaction (empty if none)
 	ReviewNumber      string // 1-based review number for this run; runner uses it for headers
+	InstallationID    string // GitHub App installation ID, sourced from the webhook header
 }
 
 func renderJobTemplate(tpl string, v templateVars) (*batchv1.Job, error) {
@@ -426,6 +439,7 @@ func renderJobTemplate(tpl string, v templateVars) (*batchv1.Job, error) {
 		{"__STATUS_COMMENT_ID__", v.StatusCommentID},
 		{"__REACTION_COMMENT_ID__", v.ReactionCommentID},
 		{"__REVIEW_NUMBER__", v.ReviewNumber},
+		{"__INSTALLATION_ID__", v.InstallationID},
 	} {
 		rendered = strings.ReplaceAll(rendered, p.old, p.new)
 	}
@@ -444,6 +458,24 @@ type prMeta struct {
 	Number  int
 	HeadSHA string
 	BaseRef string
+}
+
+// parseInstallationID reads the X-GitHub-Installation-ID header and
+// returns the installation ID. Returns an error if the header is
+// missing or unparseable — the receiver must not act on a webhook
+// without knowing which installation fired it.
+func parseInstallationID(s string) (int64, error) {
+	if s == "" {
+		return 0, errors.New("X-GitHub-Installation-ID header missing")
+	}
+	id, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid X-GitHub-Installation-ID %q: %w", s, err)
+	}
+	if id <= 0 {
+		return 0, fmt.Errorf("invalid X-GitHub-Installation-ID %q: must be positive", s)
+	}
+	return id, nil
 }
 
 func parsePullRequest(body []byte) (prMeta, error) {

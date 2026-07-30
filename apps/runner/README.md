@@ -32,7 +32,7 @@ docker buildx build --platform linux/arm64 \
 | Var | Source |
 |---|---|
 | `GITHUB_APP_ID` | `boop-secrets` |
-| `GITHUB_APP_INSTALLATION_ID` | `boop-secrets` |
+| `GITHUB_APP_INSTALLATION_ID` | Job template (`__INSTALLATION_ID__` from `X-GitHub-Installation-ID` header) |
 | `GITHUB_APP_PRIVATE_KEY` | `boop-secrets` |
 | `PR_OWNER`, `PR_REPO`, `PR_NUMBER` | Job template |
 | `PR_HEAD_SHA`, `PR_BASE_REF` | Job template |

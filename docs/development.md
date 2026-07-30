@@ -37,7 +37,6 @@ require an in-cluster client.
 ```
 export WEBHOOK_SECRET=$(openssl rand -hex 32)
 export GITHUB_APP_ID=...
-export GITHUB_APP_INSTALLATION_ID=...
 export GITHUB_APP_PRIVATE_KEY="$(cat /path/to/key.pem)"
 export KUBECONFIG=~/.kube/config
 make run            # ./bin/receiver on :8080
@@ -88,7 +87,6 @@ locally, set them by hand:
 
 ```
 export GITHUB_APP_ID=...
-export GITHUB_APP_INSTALLATION_ID=...
 export GITHUB_APP_PRIVATE_KEY="$(cat /path/to/key.pem)"
 export PR_OWNER=qubitquilt
 export PR_REPO=homelab-infra
