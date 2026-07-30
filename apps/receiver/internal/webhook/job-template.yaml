@@ -77,6 +77,8 @@ spec:
               value: __REACTION_COMMENT_ID__
             - name: BOOP_REVIEW_NUMBER
               value: __REVIEW_NUMBER__
+            - name: BOOP_BOT_LOGIN
+              value: "__BOT_LOGIN__"
             - name: BOOP_SKIP_SKILL
               value: "0"
           resources:

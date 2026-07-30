@@ -64,6 +64,7 @@ Required env vars (provided by the Job template, see [receiver.md](./receiver.md
 | `BOOP_STATUS_COMMENT_ID` | Job template | Status comment to PATCH (empty if none; runner falls back to posting fresh) |
 | `BOOP_REACTION_COMMENT_ID` | Job template | Comment to react on failure (usually the trigger comment) |
 | `BOOP_REVIEW_NUMBER` | Job template | 1-based index of this review; used for the `re-review #N` header |
+| `BOOP_BOT_LOGIN` | `BOT_LOGIN` on receiver | GitHub login of the bot App (e.g. `booppr[bot]`). When set on a re-review, the runner resolves outdated Boop review threads and minimizes prior Boop issue comments. |
 | `BOOP_SKIP_SKILL` | Job template | `1` for a minimal-prompt smoke test (debug only) |
 
 The runner exits 1 if any required env var is missing. The Job template

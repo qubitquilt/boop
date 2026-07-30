@@ -391,6 +391,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		ReactionCommentID: fmt.Sprintf("%d", reactionCommentID),
 		ReviewNumber:      fmt.Sprintf("%d", reviewNumber),
 		InstallationID:    fmt.Sprintf("%d", installationID),
+		BotLogin:          h.cfg.BotLogin,
 	})
 	if err != nil {
 		h.logger.Error("render job", "delivery", delivery, "err", err)
@@ -432,6 +433,7 @@ type templateVars struct {
 	ReactionCommentID string // GitHub comment id that received the trigger reaction (empty if none)
 	ReviewNumber      string // 1-based review number for this run; runner uses it for headers
 	InstallationID    string // GitHub App installation ID, sourced from the webhook header
+	BotLogin          string // GitHub login of the bot App (e.g. "booppr[bot]"); used to identify prior review artifacts for cleanup
 }
 
 func renderJobTemplate(tpl string, v templateVars) (*batchv1.Job, error) {
@@ -449,6 +451,7 @@ func renderJobTemplate(tpl string, v templateVars) (*batchv1.Job, error) {
 		{"__REACTION_COMMENT_ID__", v.ReactionCommentID},
 		{"__REVIEW_NUMBER__", v.ReviewNumber},
 		{"__INSTALLATION_ID__", v.InstallationID},
+		{"__BOT_LOGIN__", v.BotLogin},
 	} {
 		rendered = strings.ReplaceAll(rendered, p.old, p.new)
 	}
