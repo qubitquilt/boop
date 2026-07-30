@@ -128,15 +128,16 @@ func TestDuplicateReviewReply(t *testing.T) {
 
 func TestRenderJobTemplate(t *testing.T) {
 	job, err := renderJobTemplate(jobTemplate, templateVars{
-		Owner:          "michaelruelas",
-		Repo:           "homelab-infra",
-		Number:         "42",
-		SHA:            "abc1234567890",
-		SHA7:           "abc1234",
-		BaseRef:        "main",
-		Image:          "ghcr.io/michaelruelas/boop-runner:dev",
-		ReviewNumber:   "2",
-		InstallationID: "987654",
+		Owner:           "michaelruelas",
+		Repo:            "homelab-infra",
+		Number:          "42",
+		SHA:             "abc1234567890",
+		SHA7:            "abc1234",
+		BaseRef:         "main",
+		PreviousHeadSHA: "20cd521abcdef0123456789abcdef0123456789", // 40 hex chars
+		Image:           "ghcr.io/michaelruelas/boop-runner:dev",
+		ReviewNumber:    "2",
+		InstallationID:  "987654",
 	})
 	if err != nil {
 		t.Fatalf("renderJobTemplate: %v", err)
@@ -151,16 +152,20 @@ func TestRenderJobTemplate(t *testing.T) {
 		t.Errorf("TTLSecondsAfterFinished = %v", got)
 	}
 
-	// BOOP_REVIEW_NUMBER and GITHUB_APP_INSTALLATION_ID must be wired
-	// into the container env — the former from the receiver's review
-	// counter, the latter from the X-GitHub-Installation-ID header.
-	var gotReview, gotInstall string
+	// BOOP_REVIEW_NUMBER, GITHUB_APP_INSTALLATION_ID, and
+	// PR_PREVIOUS_HEAD_SHA must be wired into the container env so
+	// the runner can label this run and diff only the delta from
+	// the previously reviewed commit.
+	var gotReview, gotInstall, gotPrev string
 	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
 		if e.Name == "BOOP_REVIEW_NUMBER" {
 			gotReview = e.Value
 		}
 		if e.Name == "GITHUB_APP_INSTALLATION_ID" {
 			gotInstall = e.Value
+		}
+		if e.Name == "PR_PREVIOUS_HEAD_SHA" {
+			gotPrev = e.Value
 		}
 	}
 	if gotReview != "2" {
@@ -169,8 +174,12 @@ func TestRenderJobTemplate(t *testing.T) {
 	if gotInstall != "987654" {
 		t.Errorf("GITHUB_APP_INSTALLATION_ID = %q, want 987654", gotInstall)
 	}
-
-	if !strings.Contains(job.Spec.Template.Spec.NodeSelector["kubernetes.io/os"], "linux") && job.Spec.Template.Spec.NodeSelector != nil {
-		// no-op, just here to silence unused import warning in case
+	if gotPrev != "20cd521abcdef0123456789abcdef0123456789" {
+		t.Errorf("PR_PREVIOUS_HEAD_SHA = %q, want prior SHA", gotPrev)
+	}
+	// Same value must be on the Job annotation so it's discoverable
+	// for debugging without grepping the env.
+	if got := job.Annotations["boop/previous-head-sha"]; got != "20cd521abcdef0123456789abcdef0123456789" {
+		t.Errorf("boop/previous-head-sha annotation = %q, want prior SHA", got)
 	}
 }

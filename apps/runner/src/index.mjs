@@ -32,6 +32,7 @@ const {
   PR_NUMBER,
   PR_HEAD_SHA,
   PR_BASE_REF,
+  PR_PREVIOUS_HEAD_SHA,
   OPENROUTER_API_KEY,
   BOOP_STATUS_COMMENT_ID,
   BOOP_REACTION_COMMENT_ID,
@@ -104,6 +105,7 @@ let statusCommentId = null;     // id of the comment we PATCH
 let statusBy = "";              // who triggered (if known)
 let reactableCommentId = null;  // id of the comment to react on failure
 let reviewNumber = 1;           // 1-based index of this review run
+let previousHeadSHA = null;     // head SHA of the most recent prior Boop summary; null when absent
 
 async function main() {
   for (const [name, v] of [
@@ -128,11 +130,15 @@ async function main() {
       reviewNumber = parsed;
     }
   }
+  if (PR_PREVIOUS_HEAD_SHA && /^[0-9a-f]{7,40}$/.test(PR_PREVIOUS_HEAD_SHA)) {
+    previousHeadSHA = PR_PREVIOUS_HEAD_SHA;
+  }
 
   log("start", "boop runner starting", {
     status_comment_id: statusCommentId,
     reaction_comment_id: reactableCommentId,
     review_number: reviewNumber,
+    previous_head_sha: previousHeadSHA,
   });
 
   // Mint installation token first; we need it for the status API too.
@@ -260,9 +266,16 @@ async function cloneRepo(token) {
   await execFileAsync("git", ["clone", "--depth", "50", url, REPO_DIR], {
     timeout: 5 * 60 * 1000,
   });
+  // Fetch every ref the prompt or the LLM might want to `git diff`
+  // against. On a re-review with a known prior head, that ref must
+  // be present locally so the LLM can run `git diff <prior>...<head>`.
+  const fetchRefs = [PR_BASE_REF, PR_HEAD_SHA];
+  if (previousHeadSHA && previousHeadSHA !== PR_HEAD_SHA) {
+    fetchRefs.push(previousHeadSHA);
+  }
   await execFileAsync(
     "git",
-    ["fetch", "--depth", "200", "origin", PR_BASE_REF, PR_HEAD_SHA],
+    ["fetch", "--depth", "200", "origin", ...fetchRefs],
     { cwd: REPO_DIR, timeout: 5 * 60 * 1000 },
   );
   await execFileAsync("git", ["checkout", PR_HEAD_SHA], { cwd: REPO_DIR });
@@ -443,6 +456,20 @@ async function buildBoopPrompt() {
     }
   }
 
+  // Pick the diff range. On the first review, base..head covers the
+  // whole PR. On a re-review with a known prior head, diff the delta
+  // from the previously reviewed commit so we don't re-review lines
+  // the author already addressed. If the prior SHA is missing (e.g.
+  // summaries posted before this feature landed), fall back to the
+  // full diff vs base — same as a first review.
+  const isReReview = reviewNumber > 1 && previousHeadSHA;
+  const diffRange = isReReview
+    ? `${previousHeadSHA}...${PR_HEAD_SHA}`
+    : `${PR_BASE_REF}...${PR_HEAD_SHA}`;
+  const diffHint = isReReview
+    ? `Re-review #${reviewNumber}: diff only the delta from the previously reviewed commit ${previousHeadSHA} to ${PR_HEAD_SHA} (do NOT re-review lines from earlier commits — the author has already seen those).`
+    : `Compare ${PR_BASE_REF}...${PR_HEAD_SHA} to identify what changed.`;
+
   return [
     "You are running inside a Kubernetes Job triggered by a GitHub App. " +
       "Review the pull request at the current working directory and produce a " +
@@ -467,10 +494,10 @@ async function buildBoopPrompt() {
       "A nitpick on every line is noise; surface 3-8 of the most important " +
       "findings.",
     "- line numbers refer to the line in the FILE AS IT APPEARS AFTER the " +
-      "diff is applied (the right-hand side in GitHub's diff view). " +
-      "Use `git diff <BASE>...<HEAD> -- <file>` to identify them.",
-    "- Comments must be on lines that were ADDED or MODIFIED in this PR. " +
-      "Don't comment on unchanged code.",
+      `diff is applied (the right-hand side in GitHub's diff view). ` +
+      `Use \`git diff ${diffRange} -- <file>\` to identify them.`,
+    `- Comments must be on lines that were ADDED or MODIFIED in the diff ` +
+      `range \`${diffRange}\`. Don't comment on unchanged code.`,
     "- Don't include empty SUMMARY or INLINE COMMENTS sections.",
     "",
     "## Skill: boop (orchestrator)",
@@ -485,9 +512,11 @@ async function buildBoopPrompt() {
     `- Owner/repo: ${PR_OWNER}/${PR_REPO}`,
     `- PR number: ${PR_NUMBER}`,
     `- Head SHA: ${PR_HEAD_SHA}`,
-    `- Base ref: ${PR_BASE_REF}`,
+    isReReview
+      ? `- Previous review head SHA: ${previousHeadSHA} (re-review #${reviewNumber} — diff against this, not the base)`
+      : `- Base ref: ${PR_BASE_REF}`,
     `- Working directory (already cloned): ${REPO_DIR}`,
-    `- Compare ${PR_BASE_REF}...${PR_HEAD_SHA} to identify what changed.`,
+    `- ${diffHint}`,
     "",
     "Use the orchestrator and the lenses above to do the actual review. " +
       "When done, emit the SUMMARY / INLINE COMMENTS / END block as the LAST " +
@@ -586,6 +615,12 @@ async function postReview(octokit, body, reviewNumber) {
   const cleaned = body.replace(/\n{3,}/g, "\n\n").trim();
   const trimmed = cleaned.length > max ? cleaned.slice(0, max - 50) + "\n\n…(truncated)" : cleaned;
   const reviewTag = reviewNumber > 1 ? ` · review #${reviewNumber}` : "";
+  // Hidden marker carrying the full head SHA so the next re-review
+  // can diff the delta from this commit. The receiver parses this
+  // (see priorReviewHeadSHARegex in client.go). GitHub renders HTML
+  // comments as nothing in the markdown view, so it's invisible to
+  // human readers.
+  const headMarker = `<!-- boop-head-sha: ${PR_HEAD_SHA} -->`;
   await octokit.rest.issues.createComment({
     owner: PR_OWNER,
     repo: PR_REPO,
@@ -593,7 +628,8 @@ async function postReview(octokit, body, reviewNumber) {
     body:
       `${reviewHeader(reviewNumber)}\n\n` +
       trimmed +
-      `\n\n<sub>Posted by [BoopPr](https://github.com/michaelruelas/homelab-infra) · PR \`${shortSha(PR_HEAD_SHA)}\`${reviewTag} · good boy powered</sub>`,
+      `\n\n<sub>Posted by [BoopPr](https://github.com/michaelruelas/homelab-infra) · PR \`${shortSha(PR_HEAD_SHA)}\`${reviewTag} · good boy powered</sub>` +
+      `\n${headMarker}`,
   });
 }
 

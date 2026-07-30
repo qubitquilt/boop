@@ -122,6 +122,15 @@ func (c *Client) PostIssueComment(ctx context.Context, owner, repo string, issue
 //	## 🐾 Boop's re-review #2
 var priorReviewHeaderRegex = regexp.MustCompile(`(?m)^##\s+🐾\s+Boop's\s+(?:re-)?review(?:\s+#\d+)?\b`)
 
+// priorReviewHeadSHARegex matches the hidden SHA marker the runner
+// appends to every summary comment. Carries the full head SHA so
+// re-reviews can diff the delta from the previously reviewed commit
+// instead of the full main..head range. Must stay in lockstep with
+// the footer emitted in apps/runner/src/index.mjs:postReview.
+//
+//	<!-- boop-head-sha: 87bcc09...full 40-char sha... -->
+var priorReviewHeadSHARegex = regexp.MustCompile(`<!--\s*boop-head-sha:\s*([0-9a-f]{7,40})\s*-->`)
+
 // ReviewSummaryHeader is the H2 the runner posts at the top of each
 // summary comment. n is 1-based; n <= 1 is the first review.
 // Keep identical to apps/runner/src/review-header.mjs.
@@ -138,28 +147,51 @@ func IsBoopReviewSummary(body string) bool {
 	return priorReviewHeaderRegex.MatchString(body)
 }
 
+// extractPriorReviewSHA returns the head SHA hidden in a Boop
+// summary comment, or "" if the marker is absent (older summaries
+// posted before the marker existed, or comments that aren't Boop
+// summaries — the caller should pre-check via IsBoopReviewSummary).
+func extractPriorReviewSHA(body string) string {
+	m := priorReviewHeadSHARegex.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
 // CountPriorReviews returns the number of Boop summary comments
-// already on the issue/PR. The next review's number is this + 1.
+// already on the issue/PR, plus the head SHA of the MOST RECENT one
+// (empty if no SHA marker was present). The next review's number is
+// count + 1; lastReviewedSHA lets the next run diff only the delta
+// from that commit instead of the full main..head range.
 //
 // Paginates with a large page size; PRs rarely carry more than a
 // handful of reviews, so the cost is negligible.
-func (c *Client) CountPriorReviews(ctx context.Context, owner, repo string, issueNumber int) (int, error) {
+func (c *Client) CountPriorReviews(ctx context.Context, owner, repo string, issueNumber int) (int, string, error) {
 	client, err := c.installationClient(ctx)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	opts := &github.IssueListCommentsOptions{
 		ListOptions: github.ListOptions{PerPage: 100},
 	}
 	count := 0
+	lastSHA := ""
 	for {
 		comments, resp, err := client.Issues.ListComments(ctx, owner, repo, issueNumber, opts)
 		if err != nil {
-			return 0, fmt.Errorf("list comments: %w", err)
+			return 0, "", fmt.Errorf("list comments: %w", err)
 		}
+		// GitHub returns comments oldest-first; the last Boop summary
+		// we see is the most recent prior review.
 		for _, comment := range comments {
-			if IsBoopReviewSummary(comment.GetBody()) {
-				count++
+			body := comment.GetBody()
+			if !IsBoopReviewSummary(body) {
+				continue
+			}
+			count++
+			if sha := extractPriorReviewSHA(body); sha != "" {
+				lastSHA = sha
 			}
 		}
 		if resp.NextPage == 0 {
@@ -167,7 +199,7 @@ func (c *Client) CountPriorReviews(ctx context.Context, owner, repo string, issu
 		}
 		opts.Page = resp.NextPage
 	}
-	return count, nil
+	return count, lastSHA, nil
 }
 
 // UpdateIssueComment edits an existing issue/PR comment in place.

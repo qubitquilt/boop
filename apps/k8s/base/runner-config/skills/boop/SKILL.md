@@ -67,11 +67,19 @@ Boop runs all seven lenses in a single call. The orchestrator
 
 ### Step 1 — Read the diff
 
-- Identify every file changed.
+- The runner tells Boop the diff range in the prompt's PR context.
+  First review: `BASE...HEAD` (e.g. `main...<head>`).
+  Re-review: `PREVIOUS_HEAD_SHA...HEAD` (the delta from the
+  previously reviewed commit, not the full PR).
+- Identify every file changed in the diff range.
 - For each file, identify the lines that were added or modified.
 - Note the diff `base` and `head` SHAs; line numbers in the output refer
   to the file *after* the diff is applied (right-hand side of GitHub's
   diff view).
+- On a re-review, do NOT re-review lines from earlier commits. The
+  author has already seen them. If the only thing this re-review
+  found is "looks good to me", say so plainly in the summary and
+  post zero inline comments.
 
 ### Step 2 — Walk each lens
 

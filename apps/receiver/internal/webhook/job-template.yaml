@@ -20,6 +20,7 @@ metadata:
     boop/number: "__NUMBER__"
     boop/sha: "__SHA__"
     boop/base-ref: "__BASE_REF__"
+    boop/previous-head-sha: "__PREVIOUS_HEAD_SHA__"
 spec:
   ttlSecondsAfterFinished: 3600
   backoffLimit: 1
@@ -51,6 +52,8 @@ spec:
               value: "__SHA__"
             - name: PR_BASE_REF
               value: "__BASE_REF__"
+            - name: PR_PREVIOUS_HEAD_SHA
+              value: "__PREVIOUS_HEAD_SHA__"
             - name: GITHUB_APP_ID
               valueFrom:
                 secretKeyRef:
