@@ -40,10 +40,9 @@ jobs:
           # docker buildx imagetools — the runner may not be able to
           # authenticate against ghcr.io without an explicit login,
           # and the API works for any runner with packages:read.
-          echo "Versions response (raw):"
+          echo "Versions response (raw, first item only):"
           gh api /orgs/qubitquilt/packages/container/boop-receiver/versions \
-            --jq 'map({id: .id, name: .name, tags: .metadata.container.tags})' 2>&1 \
-            | head -100 || true
+            --jq '.[0]' 2>&1 || true
           echo "--- end raw ---"
           VERSION_ID="$(
             gh api /orgs/qubitquilt/packages/container/boop-receiver/versions \
