@@ -39,11 +39,11 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=semver,pattern=v{{version}},enable={{is_tag}}
-            type=semver,pattern={{major}}.{{minor}},enable={{is_tag}}
-            type=semver,pattern={{major}},enable={{is_tag}}
-            type=raw,value=stable,enable={{is_tag}}
+            type=raw,value=latest
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=stable
           flavor: latest=auto
 
       - name: Build
