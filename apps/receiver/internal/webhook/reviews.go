@@ -14,20 +14,20 @@ import (
 // Review is one row in the /api/reviews response. Fields are JSON-tagged so
 // the JSON shape is stable and decoupled from the K8s API types.
 type Review struct {
-	Name           string  `json:"name"`
-	Namespace      string  `json:"namespace"`
-	Owner          string  `json:"owner,omitempty"`
-	Repo           string  `json:"repo,omitempty"`
-	PR             int     `json:"pr,omitempty"`
-	Commit         string  `json:"commit,omitempty"`
-	BaseRef        string  `json:"baseRef,omitempty"`
-	StartTime      string  `json:"startTime,omitempty"`
-	CompletionTime string  `json:"completionTime,omitempty"`
-	Duration       string  `json:"duration,omitempty"`
-	Status         string  `json:"status"`
-	Active         int32   `json:"active"`
-	Succeeded      int32   `json:"succeeded"`
-	Failed         int32   `json:"failed"`
+	Name           string `json:"name"`
+	Namespace      string `json:"namespace"`
+	Owner          string `json:"owner,omitempty"`
+	Repo           string `json:"repo,omitempty"`
+	PR             int    `json:"pr,omitempty"`
+	Commit         string `json:"commit,omitempty"`
+	BaseRef        string `json:"baseRef,omitempty"`
+	StartTime      string `json:"startTime,omitempty"`
+	CompletionTime string `json:"completionTime,omitempty"`
+	Duration       string `json:"duration,omitempty"`
+	Status         string `json:"status"`
+	Active         int32  `json:"active"`
+	Succeeded      int32  `json:"succeeded"`
+	Failed         int32  `json:"failed"`
 }
 
 // ReviewsResponse is the body of GET /api/reviews. The three slices are

@@ -1,17 +1,29 @@
 name: sync-image-digests
 
-# After a successful build, query the registry for the current :latest
-# digest of each image and open a PR that updates the kustomize overlay
-# so the next ArgoCD sync pins the Deployment to the bytes that were
-# just built. Without this, K8s never rolls the Deployment on a
-# registry-only image change (the :latest tag is the same string in
-# git). The PR is opened instead of pushing directly to main so the
-# repo's "changes must be made through a pull request" branch
-# protection rule is satisfied. The squash merge produces a commit on
-# main signed by the human merger, which satisfies the
+# After a successful build, query the registry for the current :stable
+# digest of each image and open a PR that updates the kustomize
+# overlay and the runner-image ConfigMap so the next ArgoCD sync
+# pins the Deployment / Job template to the bytes that were just
+# built. Without this, K8s never rolls the Deployment on a
+# registry-only image change (the :stable tag is the same string
+# in git). The PR is opened instead of pushing directly to main so
+# the repo's "changes must be made through a pull request" branch
+# protection rule is satisfied. The squash merge produces a commit
+# on main signed by the human merger, which satisfies the
 # required_signatures rule; the bot's intermediate commit on the
-# feature branch is not signed (debugging bot-side SSH signing produced
-# inconsistent signatures and was abandoned in favor of this flow).
+# feature branch is not signed (debugging bot-side SSH signing
+# produced inconsistent signatures and was abandoned in favor of
+# this flow).
+#
+# C2 (security review): the receiver image is already
+# digest-pinned via the kustomize `images:` block, but the runner
+# image lived in the boop-config ConfigMap as a mutable :stable
+# tag. A compromised `packages: write` could re-tag :stable and
+# the next Job would run attacker code with the GitHub App's
+# installation token and the OpenRouter API key. The runner block
+# below resolves :stable -> sha256:... and writes the digest into
+# the ConfigMap's JOB_IMAGE value, then opens a PR to commit the
+# pin.
 
 on:
   workflow_run:
@@ -33,7 +45,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve current receiver digest
+      - name: Resolve current receiver + runner digests
         id: digests
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -43,28 +55,31 @@ jobs:
           # docker buildx imagetools — the runner may not be able to
           # authenticate against ghcr.io without an explicit login,
           # and the API works for any runner with packages:read.
-          VERSION_ID="$(
-            gh api /orgs/qubitquilt/packages/container/boop-receiver/versions \
-              --jq '.[] | select(.metadata.container.tags[]? == "latest") | .id' \
-              | head -1
-          )"
-          if [ -z "${VERSION_ID}" ]; then
-            echo "::error::No :latest version found for boop-receiver"
-            exit 1
-          fi
-          DIGEST="$(
-            gh api "/orgs/qubitquilt/packages/container/boop-receiver/versions/${VERSION_ID}" \
-              --jq '.name'
-          )"
-          if [ -z "${DIGEST}" ]; then
-            echo "::error::No digest returned for version ${VERSION_ID}"
-            exit 1
-          fi
-          echo "boop-receiver=${DIGEST}" >> "${GITHUB_OUTPUT}"
+          for IMAGE_NAME in boop-receiver boop-runner; do
+            VERSION_ID="$(
+              gh api "/orgs/qubitquilt/packages/container/${IMAGE_NAME}/versions" \
+                --jq '.[] | select(.metadata.container.tags[]? == "stable") | .id' \
+                | head -1
+            )"
+            if [ -z "${VERSION_ID}" ]; then
+              echo "::error::No :stable version found for ${IMAGE_NAME}"
+              exit 1
+            fi
+            DIGEST="$(
+              gh api "/orgs/qubitquilt/packages/container/${IMAGE_NAME}/versions/${VERSION_ID}" \
+                --jq '.name'
+            )"
+            if [ -z "${DIGEST}" ]; then
+              echo "::error::No digest returned for ${IMAGE_NAME} version ${VERSION_ID}"
+              exit 1
+            fi
+            echo "${IMAGE_NAME}=${DIGEST}" >> "${GITHUB_OUTPUT}"
+          done
 
-      - name: Update overlay digest
+      - name: Update overlay + ConfigMap digests
         env:
           RECEIVER_DIGEST: ${{ steps.digests.outputs.boop-receiver }}
+          RUNNER_DIGEST: ${{ steps.digests.outputs.boop-runner }}
         run: |
           set -euo pipefail
           pip install --quiet ruamel.yaml
@@ -84,16 +99,34 @@ jobs:
           yaml.explicit_start = True
           # Long digests would otherwise wrap onto a new line.
           yaml.width = 4096
-          path = "apps/k8s/overlays/pugquilt/kustomization.yaml"
-          with open(path) as f:
-              data = yaml.load(f)
 
+          overlay = "apps/k8s/overlays/pugquilt/kustomization.yaml"
+          with open(overlay) as f:
+              data = yaml.load(f)
           for img in data.get("images", []):
               if img["name"] == "ghcr.io/qubitquilt/boop-receiver":
                   img["digest"] = os.environ["RECEIVER_DIGEST"]
-
-          with open(path, "w") as f:
+          with open(overlay, "w") as f:
               yaml.dump(data, f)
+
+          # The runner image lives in the boop-config ConfigMap, not
+          # in a kustomize image override, so it cannot be pinned
+          # via the same images: block. Rewrite the JOB_IMAGE
+          # value to embed the digest directly in the tag
+          # (image@sha256:... is the canonical immutable ref form).
+          config = "apps/k8s/base/config.yaml"
+          with open(config) as f:
+              cfg = yaml.load(f)
+          runner_digest = os.environ["RUNNER_DIGEST"]
+          # Preserve the existing comment block above JOB_IMAGE.
+          # The receiver reads JOB_IMAGE verbatim and passes it to
+          # the K8s API; K8s accepts both `repo:tag@digest` and
+          # `repo@digest`. We use the latter so the manifest does
+          # not show a stale `:stable` string next to the digest.
+          if "data" in cfg and "JOB_IMAGE" in cfg["data"]:
+              cfg["data"]["JOB_IMAGE"] = f"ghcr.io/qubitquilt/boop-runner@{runner_digest}"
+          with open(config, "w") as f:
+              yaml.dump(cfg, f)
           PY
 
       - name: Open PR with digest update
@@ -101,7 +134,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if git diff --quiet apps/k8s/overlays/pugquilt/kustomization.yaml; then
+          if git diff --quiet apps/k8s/overlays/pugquilt/kustomization.yaml apps/k8s/base/config.yaml; then
             echo "No digest changes; nothing to do."
             exit 0
           fi
@@ -111,7 +144,7 @@ jobs:
 
           git config user.name "qubit-quilt-agent"
           git config user.email "233101448+qubit-quilt-agent@users.noreply.github.com"
-          git add apps/k8s/overlays/pugquilt/kustomization.yaml
+          git add apps/k8s/overlays/pugquilt/kustomization.yaml apps/k8s/base/config.yaml
           git commit -m "chore(deps): update image digests"
           git push --set-upstream origin "${BRANCH}"
 

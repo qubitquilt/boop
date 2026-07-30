@@ -14,7 +14,6 @@ the directory structure is preserved verbatim.
 | `opencode.json` | OpenCode config (model, provider, mcp servers, etc.) |
 | `skills/boop/SKILL.md` | Boop orchestrator: persona, voice contract, output spec |
 | `skills/boop/agents/review-*.md` | Seven review lenses the orchestrator walks |
-| `skills/gh-cli/SKILL.md` | Reference for the `gh` CLI (posting) |
 
 The runner reads `skills/boop/SKILL.md` and inlines the lens files into the
 prompt. Boop walks all seven lenses in a single OpenCode call, then emits a

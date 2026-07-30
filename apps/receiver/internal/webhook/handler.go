@@ -25,9 +25,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/go-github/v68/github"
+	"golang.org/x/time/rate"
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -83,6 +85,76 @@ type Handler struct {
 	logger   *slog.Logger
 	kube     kubernetes.Interface
 	ghClient *boopgithub.Manager
+
+	// dedup is an in-memory LRU keyed by X-GitHub-Delivery
+	// header. GitHub's webhook deliveries are idempotent (the
+	// same delivery ID represents the same physical event), so
+	// a re-delivery should be a no-op. Without dedup, a transient
+	// K8s API error (network blip, RBAC hiccup) could trigger a
+	// second Create that lands while the first one is still
+	// settling, leading to two reviews on the same head SHA.
+	dedup *deliveryDedup
+
+	// limiter caps the inbound webhook rate at the process
+	// level. The exact limit (M4) is intentionally generous —
+	// the receiver is one replica, so the only traffic it sees
+	// is webhooks from GitHub, which are bounded by GitHub's
+	// own delivery rate. The cap exists to stop a misconfigured
+	// proxy (or a future test harness) from queueing tens of
+	// thousands of webhooks against a single receiver.
+	limiter *rate.Limiter
+}
+
+// deliveryDedup is a fixed-size LRU keyed by the GitHub delivery
+// ID. Sized for 4096 entries (well above the practical webhook
+// rate for a single repo) so the dedup window covers a couple of
+// hours of re-deliveries at p99 burst.
+type deliveryDedup struct {
+	mu      sync.Mutex
+	max     int
+	entries map[string]time.Time
+	order   []string // ring of insertion order; oldest first
+}
+
+func newDeliveryDedup(max int) *deliveryDedup {
+	if max <= 0 {
+		max = 4096
+	}
+	return &deliveryDedup{
+		max:     max,
+		entries: make(map[string]time.Time, max),
+		order:   make([]string, 0, max),
+	}
+}
+
+// seen reports whether this delivery ID was previously observed
+// within the TTL. Records it on the first call. TTL is large
+// enough (1 hour) to cover GitHub's re-delivery behaviour: GitHub
+// retries on 5xx for up to ~3 days, but with a 30-min backoff
+// after the first hour, so 1 hour catches the burst without
+// holding entries forever.
+func (d *deliveryDedup) seen(id string) bool {
+	if d == nil || id == "" {
+		return false
+	}
+	now := time.Now()
+	cutoff := now.Add(-time.Hour)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if at, ok := d.entries[id]; ok && at.After(cutoff) {
+		return true
+	}
+	// Evict the oldest entry if at capacity, then insert.
+	if _, exists := d.entries[id]; !exists {
+		if len(d.order) >= d.max {
+			old := d.order[0]
+			d.order = d.order[1:]
+			delete(d.entries, old)
+		}
+		d.order = append(d.order, id)
+	}
+	d.entries[id] = now
+	return false
 }
 
 func NewHandler(cfg Config, ghClient *boopgithub.Manager, logger *slog.Logger) (*Handler, error) {
@@ -90,7 +162,20 @@ func NewHandler(cfg Config, ghClient *boopgithub.Manager, logger *slog.Logger) (
 	if err != nil {
 		return nil, fmt.Errorf("kube client: %w", err)
 	}
-	return &Handler{cfg: cfg, logger: logger, kube: kube, ghClient: ghClient}, nil
+	// 20 req/s sustained, 40 burst. The receiver is one
+	// replica, so a single rate limiter covers the whole
+	// process. The values are sized for a healthy steady state
+	// (one webhook per minute per repo) plus headroom for
+	// bursty re-deliveries.
+	limiter := rate.NewLimiter(rate.Limit(20), 40)
+	return &Handler{
+		cfg:      cfg,
+		logger:   logger,
+		kube:     kube,
+		ghClient: ghClient,
+		dedup:    newDeliveryDedup(4096),
+		limiter:  limiter,
+	}, nil
 }
 
 func (h *Handler) Health(w http.ResponseWriter, _ *http.Request) {
@@ -104,6 +189,19 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	event := r.Header.Get("X-GitHub-Event")
 	sig := r.Header.Get("X-Hub-Signature-256")
 
+	// M4: process-level rate limit. Cheap to check, runs before
+	// any expensive work (HMAC verify, K8s API call). The
+	// limit is per-process; a single replica Deployment makes
+	// that the cluster-wide limit. Returns 429 with
+	// Retry-After so a backoff-aware client (or a future
+	// Traefik middleware) backs off cleanly.
+	if h.limiter != nil && !h.limiter.Allow() {
+		h.logger.Warn("rate limited", "delivery", deliveryID)
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		h.logger.Warn("read body", "delivery", deliveryID, "err", err)
@@ -115,6 +213,19 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 	if !verifySignature(sig, body, h.cfg.WebhookSecret) {
 		h.logger.Warn("invalid signature", "delivery", deliveryID)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
+		return
+	}
+
+	// M3: dedup on X-GitHub-Delivery. GitHub's webhook
+	// deliveries are idempotent: a re-delivery of the same
+	// physical event uses the same delivery ID. Without
+	// dedup, a transient K8s error (network blip, RBAC hiccup)
+	// could trigger a second review on the same head SHA.
+	// We dedup AFTER the HMAC check so an unauthenticated
+	// attacker cannot poison the dedup table.
+	if h.dedup != nil && deliveryID != "" && h.dedup.seen(deliveryID) {
+		h.logger.Info("duplicate delivery", "delivery", deliveryID, "event", event)
+		writeAck(w, "duplicate", "delivery id already processed", deliveryID)
 		return
 	}
 
@@ -194,7 +305,22 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		writeAck(w, "ignored", "comment is on an issue, not a PR", delivery)
 		return
 	}
-	if h.cfg.BotLogin != "" && strings.EqualFold(ic.SenderLogin, h.cfg.BotLogin) {
+	// M5: ask the GitHub API for the App's own login so the
+	// self-mention check uses the canonical answer instead of a
+	// hard-coded BOT_LOGIN env var. The env var is the fallback
+	// when the API call fails (e.g. a network blip at startup, or
+	// an air-gapped install) — the receiver still ships, it just
+	// may mis-attribute one webhook. Failures are logged so a
+	// persistent outage surfaces in the receiver's metrics.
+	botLogin := h.cfg.BotLogin
+	if h.ghClient != nil {
+		if apiLogin, err := h.ghClient.AppBotLogin(ctx, installationID); err == nil {
+			botLogin = apiLogin
+		} else {
+			h.logger.Warn("fetch app bot login, falling back to env", "delivery", delivery, "installation", installationID, "err", err)
+		}
+	}
+	if botLogin != "" && strings.EqualFold(ic.SenderLogin, botLogin) {
 		h.logger.Debug("ignored self-mention", "delivery", delivery, "sender", ic.SenderLogin)
 		writeAck(w, "ignored", "self-mention", delivery)
 		return
@@ -384,7 +510,7 @@ func duplicateReviewReply(status, headSHA string) string {
 func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID, installationID int64, reviewNumber int) {
 	jobName := buildJobName(owner, repo, number, headSHA)
 
-	job, err := renderJobTemplate(jobTemplate, templateVars{
+	job, err := buildJob(templateVars{
 		Owner:             owner,
 		Repo:              repo,
 		Number:            fmt.Sprintf("%d", number),
@@ -400,12 +526,26 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		BotLogin:          h.cfg.BotLogin,
 	})
 	if err != nil {
-		h.logger.Error("render job", "delivery", delivery, "err", err)
-		http.Error(w, "render job", http.StatusInternalServerError)
+		// Base-ref or installation-id validation failure: this is a
+		// 400, not a 500 — the input is a bad request, not a server
+		// error. The webhook ack still goes out (GitHub will retry
+		// idempotently if the head SHA changes), but a 400 tells
+		// any future proxy the request is malformed.
+		h.logger.Warn("build job", "delivery", delivery, "err", err)
+		http.Error(w, "invalid job spec", http.StatusBadRequest)
 		return
 	}
 
 	if err := h.createJob(ctx, job); err != nil {
+		if isAlreadyExists(err) {
+			// Lost a race with another delivery for the same
+			// head SHA (between claimJobSlot and createJob).
+			// Treat as duplicate so the caller can decide
+			// whether to react / reply.
+			h.logger.Info("duplicate job race", "delivery", delivery, "job", jobName, "err", err)
+			writeAck(w, "duplicate", jobName, delivery)
+			return
+		}
 		h.logger.Error("create job", "delivery", delivery, "job", jobName, "err", err)
 		http.Error(w, "create job", http.StatusInternalServerError)
 		return
@@ -440,33 +580,6 @@ type templateVars struct {
 	ReviewNumber      string // 1-based review number for this run; runner uses it for headers
 	InstallationID    string // GitHub App installation ID, sourced from the webhook header
 	BotLogin          string // GitHub login of the bot App (e.g. "booppr[bot]"); used to identify prior review artifacts for cleanup
-}
-
-func renderJobTemplate(tpl string, v templateVars) (*batchv1.Job, error) {
-	rendered := tpl
-	for _, p := range []struct{ old, new string }{
-		{"__OWNER__", v.Owner},
-		{"__REPO__", v.Repo},
-		{"__NUMBER__", v.Number},
-		{"__SHA__", v.SHA},
-		{"__SHA7__", v.SHA7},
-		{"__BASE_REF__", v.BaseRef},
-		{"__PREVIOUS_HEAD_SHA__", v.PreviousHeadSHA},
-		{"__IMAGE__", v.Image},
-		{"__STATUS_COMMENT_ID__", v.StatusCommentID},
-		{"__REACTION_COMMENT_ID__", v.ReactionCommentID},
-		{"__REVIEW_NUMBER__", v.ReviewNumber},
-		{"__INSTALLATION_ID__", v.InstallationID},
-		{"__BOT_LOGIN__", v.BotLogin},
-	} {
-		rendered = strings.ReplaceAll(rendered, p.old, p.new)
-	}
-
-	job := &batchv1.Job{}
-	if err := yamlUnmarshal([]byte(rendered), job); err != nil {
-		return nil, fmt.Errorf("unmarshal job: %w", err)
-	}
-	return job, nil
 }
 
 type prMeta struct {

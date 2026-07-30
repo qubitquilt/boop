@@ -1,0 +1,67 @@
+---
+# Keep the receiver's Go module and the runner's npm dependencies
+# up to date with version-bump PRs. Auto-merge is NOT enabled
+# (see `skip-review` label below): every dependency bump opens a
+# PR that triggers Boop to review the change, which is the point
+# — we want a fresh review on every minor/patch upgrade before it
+# lands on main. Major upgrades still need a human.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /apps/receiver
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: UTC
+    labels:
+      - dependencies
+      - skip-review
+    # Pin major Go upgrades for human review. The K8s and
+    # go-github client libraries routinely introduce breaking
+    # changes between minor versions; a weekly PR is enough
+    # for patches.
+    ignore:
+      - dependency-name: k8s.io/*
+        update-types: ["version-update:semver-major"]
+      - dependency-name: github.com/google/go-github/*
+        update-types: ["version-update:semver-major"]
+      - dependency-name: github.com/golang-jwt/*
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: npm
+    directory: /apps/runner
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:30"
+      timezone: UTC
+    labels:
+      - dependencies
+      - skip-review
+    # opencode-ai is a precompiled binary (H4 in the security
+    # review). Any minor bump is a new binary; require a human
+    # review of the diff before auto-merge.
+    ignore:
+      - dependency-name: opencode-ai
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "08:00"
+      timezone: UTC
+    labels:
+      - dependencies
+      - skip-review
+    groups:
+      # Group all patch + minor Actions updates into a single
+      # PR so the queue stays readable. Pinact still pins each
+      # individual action to its SHA.
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch

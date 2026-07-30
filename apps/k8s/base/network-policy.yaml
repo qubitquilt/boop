@@ -1,0 +1,136 @@
+# H7: default-deny NetworkPolicy for the boop namespace. Without
+# these policies a compromised runner pod can reach:
+#   - the cloud metadata service (169.254.169.254), which on
+#     AWS/GCP/Azure hands out instance-role credentials
+#   - any other pod in the cluster (lateral movement)
+#   - any external host (data exfil to attacker-controlled IPs)
+#
+# The pattern is the standard layered one:
+#   1. default-deny-all       — no ingress, no egress for any pod
+#   2. allow-dns              — every pod can resolve names
+#   3. allow-receiver         — webhook ingress + K8s API egress
+#   4. allow-runner           — egress to GitHub + OpenRouter,
+#                                nothing else (metadata blocked)
+# Pods that don't match any allow-* policy get no traffic at all.
+# This includes the boop-receiver Pod, the Job's review Pod, and
+# any future pod the operator drops into dev-tools.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: dev-tools
+spec:
+  # Empty podSelector matches every pod in the namespace.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# allow-dns: every pod can reach kube-dns (or CoreDNS) in
+# kube-system. Both UDP and TCP/53 are needed — TCP/53 covers
+# responses that exceed the UDP payload size, plus zone
+# transfers. We target kube-system by its well-known label so
+# the rule works regardless of the DNS provider chosen.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: dev-tools
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# allow-receiver: the boop-receiver Deployment is the only pod
+# that needs to listen for webhook traffic. Egress is restricted
+# to the in-cluster API server (port 443 is the standard
+# Kubernetes API port; some clusters also serve 6443). The
+# receiver never calls api.github.com directly — that flow goes
+# through the runner.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-receiver
+  namespace: dev-tools
+spec:
+  podSelector:
+    matchLabels:
+      app: boop-receiver
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - # Traefik runs in its own namespace. The empty
+      # namespaceSelector matches any namespace, which is
+      # correct for a Traefik-fronted service; tighten if
+      # the cluster has a non-Traefik ingress controller.
+      from:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - # K8s API. "namespaceSelector: {}" matches every
+      # namespace, which is right — the API server's
+      # endpoint is in the `default` namespace, and the
+      # control plane is reachable through the cluster
+      # service network regardless of namespace.
+      to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+---
+# allow-runner: the review Job (label app=boop) needs to reach
+# three external services:
+#   1. github.com / api.github.com — `git fetch` and the
+#      GitHub REST/GraphQL API.
+#   2. openrouter.ai — the LLM provider.
+#   3. (Implicit) kube-dns — already allowed by allow-dns.
+#
+# The 0.0.0.0/0 + 169.254.0.0/16 exception is the standard
+# "allow the world but block cloud metadata" pattern. A
+# tighter version would pin specific GitHub and OpenRouter
+# IP ranges, but those change often and the broader CIDR is
+# the pragmatic choice for a single-tenant runner. The
+# metadata exclusion is the one MUST-HAVE: every cloud
+# provider's IMDS listens on a link-local address inside
+# 169.254.0.0/16, and an exfil via IMDS is a 1-step IAM
+# credential theft.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-runner
+  namespace: dev-tools
+spec:
+  podSelector:
+    matchLabels:
+      app: boop
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # RFC 3927 link-local — covers cloud IMDS
+              # (169.254.169.254) on every major provider.
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 80
