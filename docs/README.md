@@ -40,7 +40,7 @@ to the diff. A final status update marks the run ✅ or ❌.
 4. **[receiver.md](./receiver.md)** — Go webhook receiver.
 5. **[runner.md](./runner.md)** — Node PR-review worker.
 6. **[skills.md](./skills.md)** — Boop review skill (orchestrator + seven lenses).
-7. **[deployment.md](./deployment.md)** — K8s overlays, CI, image tags, ArgoCD.
+7. **[deployment.md](./deployment.md)** — K8s overlays, CI, image tags, ArgoCD, release lifecycle.
 8. **[secrets.md](./secrets.md)** — GitHub App credentials, OpenBao secret store.
 9. **[development.md](./development.md)** — local dev, build, test.
 
