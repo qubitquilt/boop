@@ -40,11 +40,14 @@ jobs:
           # docker buildx imagetools — the runner may not be able to
           # authenticate against ghcr.io without an explicit login,
           # and the API works for any runner with packages:read.
-          VERSION_ID="$(
+          RESPONSE="$(
             gh api /orgs/qubitquilt/packages/container/boop-receiver/versions \
               --jq '.[] | select(.metadata.container.tags[]? == "latest") | .id' \
-              | head -1
+              2>&1
           )"
+          RC=$?
+          echo "::debug::API response (rc=${RC}): ${RESPONSE}"
+          VERSION_ID="$(printf '%s' "${RESPONSE}" | head -1)"
           if [ -z "${VERSION_ID}" ]; then
             echo "::error::No :latest version found for boop-receiver"
             exit 1
