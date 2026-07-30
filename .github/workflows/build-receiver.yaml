@@ -46,22 +46,12 @@ jobs:
             type=raw,value=stable
           flavor: latest=auto
 
-      - name: Build
+      - name: Build and Push
         uses: docker/build-push-action@v6
         with:
           context: apps/receiver
           platforms: linux/arm64
-          load: true
+          push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Push
-        if: github.event_name == 'push'
-        uses: docker/build-push-action@v6
-        with:
-          context: apps/receiver
-          platforms: linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
