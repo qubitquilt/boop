@@ -30,25 +30,49 @@ func TestIsReviewableAction(t *testing.T) {
 	}
 }
 
-func TestMentionsBot(t *testing.T) {
+func TestRequestsReview(t *testing.T) {
 	cases := []struct {
 		body   string
 		expect bool
 	}{
-		{"@BoopPr please review", true},
-		{"hey @booppr take a look", true},  // case-insensitive
-		{"@BoopPr.", true},                  // followed by punctuation
-		{"Multi line\n@BoopPr\nreview", true},
-		{"ends with @BoopPr", true},
+		// Bare mentions should NOT trigger — only an explicit request.
+		{"@BoopPr hi", false},
+		{"hey @booppr take a look", false},
+		{"@BoopPr are you awake?", false},
 		{"nothing here", false},
 		{"", false},
-		{"@BoopPr-bot ignore me", false},    // not a whole-token match
-		{"@BoopPrbot hello", false},         // adjacent alnum
-		{"@BoopPr2 hi", false},              // adjacent digit
-		{"@booppr_bot", false},              // adjacent underscore
+		{"@BoopPr-bot review me", false}, // not a whole-token match
+		{"@BoopPrbot review", false},     // adjacent alnum
+		{"@BoopPr2 review", false},       // adjacent digit
+		{"@booppr_bot review", false},    // adjacent underscore
+
+		// Explicit review requests SHOULD trigger.
+		{"@BoopPr review", true},
+		{"@BoopPr, review", true},
+		{"@BoopPr review please", true},
+		{"@BoopPr please review", true},
+		{"@BoopPr, please review", true},
+		{"@BoopPr to review", true},
+		{"@BoopPr can review", true},
+		{"@BoopPr can you review this", true},
+		{"@BoopPr could you review this", true},
+		{"@BoopPr will you review", true},
+		{"@BoopPr may you review", true},
+		{"@BoopPr re-review", true},
+		{"@BoopPr, re-review this", true},
+		{"@BoopPr, can you re-review this", true},
+		{"Multi line\n@BoopPr review\nthanks", true},
+		{"@booppr REVIEW", true}, // case-insensitive
+		{"hey @BoopPr please review", true},
+
+		// References to "review" (not requests) must not trigger.
+		{"@BoopPr look at this code review carefully", false},
+		{"@BoopPr the prior review was great", false},
+		{"@BoopPr I left a review on PR #1 yesterday", false},
+		{"@BoopPr this needs another look first", false},
 	}
 	for _, c := range cases {
-		got := mentionsBot(c.body)
+		got := requestsReview(c.body)
 		if got != c.expect {
 			t.Errorf("body=%q: got=%v want=%v", c.body, got, c.expect)
 		}

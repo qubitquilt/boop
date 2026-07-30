@@ -22,15 +22,30 @@ func TestShortSHA(t *testing.T) {
 	}
 }
 
+func TestDuplicateReviewReply(t *testing.T) {
+	active := duplicateReviewReply("active", "abc1234567890def")
+	if !strings.Contains(active, "`abc1234`") || !strings.Contains(active, "Already on it") {
+		t.Errorf("active reply unexpected: %q", active)
+	}
+	done := duplicateReviewReply("succeeded", "abc1234567890def")
+	if !strings.Contains(done, "`abc1234`") || !strings.Contains(done, "Already sniffed") {
+		t.Errorf("succeeded reply unexpected: %q", done)
+	}
+	if got := duplicateReviewReply("error", "abc"); got != "" {
+		t.Errorf("error reply = %q, want empty", got)
+	}
+}
+
 func TestRenderJobTemplate(t *testing.T) {
 	job, err := renderJobTemplate(jobTemplate, templateVars{
-		Owner:   "michaelruelas",
-		Repo:    "homelab-infra",
-		Number:  "42",
-		SHA:     "abc1234567890",
-		SHA7:    "abc1234",
-		BaseRef: "main",
-		Image:   "ghcr.io/michaelruelas/boop-runner:dev",
+		Owner:        "michaelruelas",
+		Repo:         "homelab-infra",
+		Number:       "42",
+		SHA:          "abc1234567890",
+		SHA7:         "abc1234",
+		BaseRef:      "main",
+		Image:        "ghcr.io/michaelruelas/boop-runner:dev",
+		ReviewNumber: "2",
 	})
 	if err != nil {
 		t.Fatalf("renderJobTemplate: %v", err)
@@ -44,6 +59,18 @@ func TestRenderJobTemplate(t *testing.T) {
 	if got := job.Spec.TTLSecondsAfterFinished; got == nil || *got != 3600 {
 		t.Errorf("TTLSecondsAfterFinished = %v", got)
 	}
+
+	// BOOP_REVIEW_NUMBER must be wired into the container env.
+	var gotReview string
+	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "BOOP_REVIEW_NUMBER" {
+			gotReview = e.Value
+		}
+	}
+	if gotReview != "2" {
+		t.Errorf("BOOP_REVIEW_NUMBER = %q, want 2", gotReview)
+	}
+
 	if !strings.Contains(job.Spec.Template.Spec.NodeSelector["kubernetes.io/os"], "linux") && job.Spec.Template.Spec.NodeSelector != nil {
 		// no-op, just here to silence unused import warning in case
 	}

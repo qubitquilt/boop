@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 
@@ -139,6 +140,67 @@ func (c *Client) PostIssueComment(ctx context.Context, owner, repo string, issue
 		return 0, err
 	}
 	return comment.GetID(), nil
+}
+
+// priorReviewHeaderRegex matches the headers Boop's runner posts on a
+// summary comment, for any review number. Used to count how many
+// reviews have already been posted on a PR so the next run can label
+// itself #N (or "re-review #N" when N > 1).
+//
+// Must stay in lockstep with ReviewSummaryHeader and
+// apps/runner/src/review-header.mjs.
+//
+//	## 🐾 Boop's review
+//	## 🐾 Boop's re-review
+//	## 🐾 Boop's re-review #2
+var priorReviewHeaderRegex = regexp.MustCompile(`(?m)^##\s+🐾\s+Boop's\s+(?:re-)?review(?:\s+#\d+)?\b`)
+
+// ReviewSummaryHeader is the H2 the runner posts at the top of each
+// summary comment. n is 1-based; n <= 1 is the first review.
+// Keep identical to apps/runner/src/review-header.mjs.
+func ReviewSummaryHeader(n int) string {
+	if n <= 1 {
+		return "## 🐾 Boop's review"
+	}
+	return fmt.Sprintf("## 🐾 Boop's re-review #%d", n)
+}
+
+// IsBoopReviewSummary reports whether a comment body is a Boop
+// review summary (matched on its leading H2 header).
+func IsBoopReviewSummary(body string) bool {
+	return priorReviewHeaderRegex.MatchString(body)
+}
+
+// CountPriorReviews returns the number of Boop summary comments
+// already on the issue/PR. The next review's number is this + 1.
+//
+// Paginates with a large page size; PRs rarely carry more than a
+// handful of reviews, so the cost is negligible.
+func (c *Client) CountPriorReviews(ctx context.Context, owner, repo string, issueNumber int) (int, error) {
+	client, err := c.installationClient(ctx)
+	if err != nil {
+		return 0, err
+	}
+	opts := &github.IssueListCommentsOptions{
+		ListOptions: github.ListOptions{PerPage: 100},
+	}
+	count := 0
+	for {
+		comments, resp, err := client.Issues.ListComments(ctx, owner, repo, issueNumber, opts)
+		if err != nil {
+			return 0, fmt.Errorf("list comments: %w", err)
+		}
+		for _, comment := range comments {
+			if IsBoopReviewSummary(comment.GetBody()) {
+				count++
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+	return count, nil
 }
 
 // UpdateIssueComment edits an existing issue/PR comment in place.

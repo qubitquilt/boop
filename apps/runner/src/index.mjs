@@ -19,6 +19,7 @@ import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
+import { reviewHeader } from "./review-header.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -34,6 +35,7 @@ const {
   OPENROUTER_API_KEY,
   BOOP_STATUS_COMMENT_ID,
   BOOP_REACTION_COMMENT_ID,
+  BOOP_REVIEW_NUMBER,
 } = process.env;
 
 const REPO_DIR = "/work/repo";
@@ -101,6 +103,7 @@ let statusClient = null;        // Octokit, lazily initialised
 let statusCommentId = null;     // id of the comment we PATCH
 let statusBy = "";              // who triggered (if known)
 let reactableCommentId = null;  // id of the comment to react on failure
+let reviewNumber = 1;           // 1-based index of this review run
 
 async function main() {
   for (const [name, v] of [
@@ -119,10 +122,17 @@ async function main() {
 
   if (BOOP_STATUS_COMMENT_ID) statusCommentId = Number(BOOP_STATUS_COMMENT_ID);
   if (BOOP_REACTION_COMMENT_ID) reactableCommentId = Number(BOOP_REACTION_COMMENT_ID);
+  if (BOOP_REVIEW_NUMBER) {
+    const parsed = Number(BOOP_REVIEW_NUMBER);
+    if (Number.isInteger(parsed) && parsed >= 1) {
+      reviewNumber = parsed;
+    }
+  }
 
   log("start", "boop runner starting", {
     status_comment_id: statusCommentId,
     reaction_comment_id: reactableCommentId,
+    review_number: reviewNumber,
   });
 
   // Mint installation token first; we need it for the status API too.
@@ -148,8 +158,8 @@ async function main() {
     throw err;
   }
 
-  await postReview(statusClient, review.summary);
-  log("done", "summary comment posted");
+  await postReview(statusClient, review.summary, reviewNumber);
+  log("done", "summary comment posted", { review_number: reviewNumber });
 
   for (const c of review.inlineComments) {
     try {
@@ -571,18 +581,19 @@ function runOpencode(prompt, configContent) {
   });
 }
 
-async function postReview(octokit, body) {
+async function postReview(octokit, body, reviewNumber) {
   const max = 65000;
   const cleaned = body.replace(/\n{3,}/g, "\n\n").trim();
   const trimmed = cleaned.length > max ? cleaned.slice(0, max - 50) + "\n\n…(truncated)" : cleaned;
+  const reviewTag = reviewNumber > 1 ? ` · review #${reviewNumber}` : "";
   await octokit.rest.issues.createComment({
     owner: PR_OWNER,
     repo: PR_REPO,
     issue_number: Number(PR_NUMBER),
     body:
-      `## 🐾 Boop's review\n\n` +
+      `${reviewHeader(reviewNumber)}\n\n` +
       trimmed +
-      `\n\n<sub>Posted by [BoopPr](https://github.com/michaelruelas/homelab-infra) · PR \`${shortSha(PR_HEAD_SHA)}\` · good boy powered</sub>`,
+      `\n\n<sub>Posted by [BoopPr](https://github.com/michaelruelas/homelab-infra) · PR \`${shortSha(PR_HEAD_SHA)}\`${reviewTag} · good boy powered</sub>`,
   });
 }
 

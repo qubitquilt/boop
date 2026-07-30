@@ -1,7 +1,7 @@
 # This template is rendered by the boop-receiver at webhook time.
-# The receiver substitutes __OWNER__, __REPO__, __NUMBER__, __SHA__, __BASE_REF__
-# with values from the pull_request payload, then submits it as a Job.
-# It is NOT applied directly by ArgoCD.
+# The receiver substitutes __OWNER__, __REPO__, __NUMBER__, __SHA__, __BASE_REF__,
+# __REVIEW_NUMBER__ with values from the pull_request payload, then submits it
+# as a Job. It is NOT applied directly by ArgoCD.
 ---
 apiVersion: batch/v1
 kind: Job
@@ -73,6 +73,8 @@ spec:
               value: __STATUS_COMMENT_ID__
             - name: BOOP_REACTION_COMMENT_ID
               value: __REACTION_COMMENT_ID__
+            - name: BOOP_REVIEW_NUMBER
+              value: __REVIEW_NUMBER__
             - name: BOOP_SKIP_SKILL
               value: "0"
           resources:

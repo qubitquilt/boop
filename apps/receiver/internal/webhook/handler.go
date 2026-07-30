@@ -3,9 +3,11 @@
 // Responsibilities:
 //   - Verify the X-Hub-Signature-256 HMAC on every request.
 //   - Filter to pull_request events (opened/reopened/synchronize) and
-//     issue_comment events mentioning @BoopPr.
+//     issue_comment events that ask for a review with `@BoopPr review`.
 //   - Render the Job template and submit it via the in-cluster K8s API.
 //   - Be idempotent: re-deliveries for the same head SHA are no-ops.
+//   - Number every review so re-reviews get their own header instead
+//     of rewriting the original.
 package webhook
 
 import (
@@ -34,14 +36,37 @@ import (
 
 const BotMention = "@BoopPr"
 
-// mentionRegex matches `@BoopPr` only when it is not part of a longer
-// GitHub username (e.g. `@BoopPr-bot`). GitHub usernames may contain
-// `[A-Za-z0-9-]`, so we require the character after `r` (if any) to
-// not be one of those.
-var mentionRegex = regexp.MustCompile(`(?i)@BoopPr(?:$|[^A-Za-z0-9_-])`)
+// reviewRequestRegex matches an explicit request to Boop to review
+// the PR. We accept the literal phrase plus a small set of natural
+// request modifiers so common phrasings work.
+//
+// Matches:
+//
+//	@BoopPr review
+//	@BoopPr, review
+//	@BoopPr review please
+//	@BoopPr please review
+//	@BoopPr to review
+//	@BoopPr can review
+//	@BoopPr can you review
+//	@BoopPr could you review
+//	@BoopPr re-review
+//
+// Does NOT match (a bare mention or a reference, not a request):
+//
+//	@BoopPr hi
+//	@BoopPr look at this code review carefully
+//	@BoopPr the prior review was great
+//	@BoopPr-bot review
+//	@BoopPr2 review
+var reviewRequestRegex = regexp.MustCompile(
+	`(?i)@BoopPr\b,?\s+(?:please\s+|to\s+|can\s+(?:you\s+)?|could\s+(?:you\s+)?|will\s+(?:you\s+)?|may\s+(?:you\s+)?)?(?:re-)?review\b`,
+)
 
-func mentionsBot(body string) bool {
-	return mentionRegex.MatchString(body)
+// requestsReview reports whether the comment body asks Boop to
+// review the PR. Bare mentions like `@BoopPr hi` do not count.
+func requestsReview(body string) bool {
+	return reviewRequestRegex.MatchString(body)
 }
 
 type Config struct {
@@ -118,17 +143,23 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 	// Check for duplicate before posting a status comment — otherwise a
 	// re-delivery of the same head SHA leaves a stranded "👀" comment
 	// that no runner will update.
-	if !h.claimJobSlot(ctx, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, w) {
+	if claimed, _ := h.claimJobSlot(ctx, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, w); !claimed {
 		return
+	}
+	reviewNumber, err := h.computeReviewNumber(ctx, pr.Owner, pr.Repo, pr.Number)
+	if err != nil {
+		h.logger.Warn("count prior reviews", "delivery", delivery, "err", err)
+		// Non-fatal — fall back to 1; the runner still runs.
+		reviewNumber = 1
 	}
 	// No trigger comment to react to for plain PR events. Post a fresh
 	// status comment and pass its id to the Job.
-	statusID, err := h.postStatus(ctx, pr.Owner, pr.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, ""))
+	statusID, err := h.postStatus(ctx, pr.Owner, pr.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, "", reviewNumber))
 	if err != nil {
 		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
 		// Non-fatal — the Job still runs.
 	}
-	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("pull_request.%s", pr.Action), 0, statusID)
+	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("pull_request.%s", pr.Action), 0, statusID, reviewNumber)
 }
 
 func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter, delivery string, body []byte) {
@@ -153,15 +184,10 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		writeAck(w, "ignored", "self-mention", delivery)
 		return
 	}
-	if !mentionsBot(ic.CommentBody) {
-		h.logger.Debug("comment does not mention bot", "delivery", delivery)
-		writeAck(w, "ignored", "no bot mention", delivery)
+	if !requestsReview(ic.CommentBody) {
+		h.logger.Debug("comment does not request review", "delivery", delivery)
+		writeAck(w, "ignored", "no `@BoopPr review` request", delivery)
 		return
-	}
-
-	// React to the trigger comment with 👀 so the user sees we saw it.
-	if err := h.ghClient.AddCommentReaction(ctx, ic.Owner, ic.Repo, ic.CommentID, "eyes"); err != nil {
-		h.logger.Warn("add reaction", "delivery", delivery, "err", err)
 	}
 
 	pr, err := h.ghClient.FetchPullRequest(ctx, ic.Owner, ic.Repo, ic.IssueNumber)
@@ -171,20 +197,48 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
-	// Check for duplicate (active or succeeded) before posting a status
-	// comment — otherwise a duplicate trigger leaves a stranded
-	// "👀 reviewing..." comment that the runner never updates.
-	if !h.claimJobSlot(ctx, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, w) {
+	// Check for duplicate (active or succeeded) before reacting or
+	// posting a status comment — otherwise a same-SHA `@BoopPr review`
+	// leaves 👀 / a stranded "reviewing..." comment with no runner.
+	claimed, dupeStatus := h.claimJobSlot(ctx, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, w)
+	if !claimed {
+		if dupeStatus == "active" || dupeStatus == "succeeded" {
+			h.replyDuplicateReview(ctx, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, dupeStatus)
+		}
 		return
 	}
 
+	// React only after we know a run will start, so no-ops do not look
+	// like work is underway.
+	if err := h.ghClient.AddCommentReaction(ctx, ic.Owner, ic.Repo, ic.CommentID, "eyes"); err != nil {
+		h.logger.Warn("add reaction", "delivery", delivery, "err", err)
+	}
+
+	reviewNumber, err := h.computeReviewNumber(ctx, ic.Owner, ic.Repo, pr.Number)
+	if err != nil {
+		h.logger.Warn("count prior reviews", "delivery", delivery, "err", err)
+		reviewNumber = 1
+	}
+
 	// Post a status comment the runner will PATCH as it progresses.
-	statusID, err := h.postStatus(ctx, ic.Owner, ic.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, ic.SenderLogin))
+	statusID, err := h.postStatus(ctx, ic.Owner, ic.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, ic.SenderLogin, reviewNumber))
 	if err != nil {
 		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
 	}
 
-	h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, statusID)
+	h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, statusID, reviewNumber)
+}
+
+// computeReviewNumber returns the 1-based index of the review this
+// run will produce. Counts existing Boop summary comments on the PR
+// and adds one. Falls back to 1 on error so a transient GitHub
+// hiccup never blocks a review.
+func (h *Handler) computeReviewNumber(ctx context.Context, owner, repo string, number int) (int, error) {
+	n, err := h.ghClient.CountPriorReviews(ctx, owner, repo, number)
+	if err != nil {
+		return 0, err
+	}
+	return n + 1, nil
 }
 
 // Status stages used in renderStatusBody. The runner can refer to the
@@ -196,9 +250,15 @@ const (
 	StatusReview  = "review"
 	StatusDone    = "done"
 	StatusFailed  = "failed"
+
+	// statusTimelineSep is appended to the initial status body so the
+	// runner's PATCH path can stay append-only — it never overwrites
+	// the receiver-supplied header (which carries the review label and
+	// trigger attribution).
+	statusTimelineSep = "<!-- boop-timeline -->"
 )
 
-func renderStatusBody(stage, sha, by string) string {
+func renderStatusBody(stage, sha, by string, reviewNumber int) string {
 	short := sha
 	if len(short) > 7 {
 		short = short[:7]
@@ -207,19 +267,25 @@ func renderStatusBody(stage, sha, by string) string {
 	if by != "" {
 		byLine = fmt.Sprintf("Triggered by @%s\n\n", by)
 	}
+	// reviewLabel disambiguates re-reviews in the status thread so
+	// users can tell at a glance which run produced the comments.
+	reviewLabel := "review"
+	if reviewNumber > 1 {
+		reviewLabel = fmt.Sprintf("re-review #%d", reviewNumber)
+	}
 	switch stage {
 	case StatusInitial:
-		return fmt.Sprintf("👀 **boop is reviewing this PR...**\n\n%sLast commit: `%s`. Updates will appear here.", byLine, short)
+		return fmt.Sprintf("👀 **boop is reviewing this PR...** (%s)\n\n%sLast commit: `%s`. Updates will appear here.\n\n%s", reviewLabel, byLine, short, statusTimelineSep)
 	case StatusAuth:
-		return fmt.Sprintf("🔐 **boop is reviewing this PR** — authenticated with GitHub.\n\n%sLast commit: `%s`.", byLine, short)
+		return fmt.Sprintf("🔐 **boop is reviewing this PR** — authenticated with GitHub. (%s)\n\n%sLast commit: `%s`.", reviewLabel, byLine, short)
 	case StatusClone:
-		return fmt.Sprintf("📥 **boop is reviewing this PR** — cloned the repo at `%s`.\n\n%sChecking out the PR head and starting the multi-lens review.", short, byLine)
+		return fmt.Sprintf("📥 **boop is reviewing this PR** — cloned the repo at `%s`. (%s)\n\n%sChecking out the PR head and starting the multi-lens review.", short, reviewLabel, byLine)
 	case StatusReview:
-		return fmt.Sprintf("🧠 **boop is reviewing this PR** — running the multi-lens review (boop skill) on `%s`.", short)
+		return fmt.Sprintf("🧠 **boop is reviewing this PR** — running the multi-lens review (boop skill) on `%s`. (%s)", short, reviewLabel)
 	case StatusDone:
-		return fmt.Sprintf("✅ **boop review complete.** See the review comment below.")
+		return fmt.Sprintf("✅ **boop %s complete.** See the review comment below.", reviewLabel)
 	case StatusFailed:
-		return fmt.Sprintf("❌ **boop review failed.** Check the Job logs for details.")
+		return fmt.Sprintf("❌ **boop %s failed.** Check the Job logs for details.", reviewLabel)
 	}
 	return fmt.Sprintf("boop status: %s", stage)
 }
@@ -228,52 +294,86 @@ func (h *Handler) postStatus(ctx context.Context, owner, repo string, number int
 	return h.ghClient.PostIssueComment(ctx, owner, repo, number, body)
 }
 
-// claimJobSlot checks whether a Job already exists for this head SHA. If
-// the job is active or already succeeded, it writes the duplicate ack
-// and returns false so the caller skips posting a status comment. If
-// the job is failed, deletes it and returns true so a fresh one is
-// created. If missing, returns true. On kube errors it writes a 500.
-func (h *Handler) claimJobSlot(ctx context.Context, delivery, owner, repo string, number int, headSHA string, w http.ResponseWriter) bool {
+// claimJobSlot checks whether a Job already exists for this head SHA.
+// Returns (true, "") when the caller may create a job.
+// Returns (false, status) when the caller must skip: status is
+// "active", "succeeded", or "error". On "active"/"succeeded" it writes
+// a duplicate ack. On kube errors it writes a 500 and status "error".
+// A failed job is deleted so a fresh one can be created.
+func (h *Handler) claimJobSlot(ctx context.Context, delivery, owner, repo string, number int, headSHA string, w http.ResponseWriter) (bool, string) {
 	jobName := buildJobName(owner, repo, number, headSHA)
-	status, err := h.jobStatus(ctx, jobName)
+	jobStatus, err := h.jobStatus(ctx, jobName)
 	if err != nil {
 		h.logger.Error("check job", "delivery", delivery, "job", jobName, "err", err)
 		http.Error(w, "kube error", http.StatusInternalServerError)
-		return false
+		return false, "error"
 	}
-	switch status {
+	switch jobStatus {
 	case "active":
 		h.logger.Info("duplicate delivery, job still active", "delivery", delivery, "job", jobName)
 		writeAck(w, "duplicate", jobName, delivery)
-		return false
+		return false, "active"
 	case "succeeded":
 		h.logger.Info("duplicate delivery, job already succeeded", "delivery", delivery, "job", jobName)
 		writeAck(w, "duplicate", jobName, delivery)
-		return false
+		return false, "succeeded"
 	case "failed":
 		h.logger.Info("replacing failed job", "delivery", delivery, "job", jobName)
 		if err := h.deleteJob(ctx, jobName); err != nil && !isNotFound(err) {
 			h.logger.Error("delete failed job", "delivery", delivery, "job", jobName, "err", err)
 			http.Error(w, "kube error", http.StatusInternalServerError)
-			return false
+			return false, "error"
 		}
 	}
-	return true
+	return true, ""
 }
 
-func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, reason string, reactionCommentID, statusCommentID int64) {
+// replyDuplicateReview posts a short PR comment explaining why a same-SHA
+// `@BoopPr review` request was a no-op. Non-fatal on API errors.
+func (h *Handler) replyDuplicateReview(ctx context.Context, delivery, owner, repo string, number int, headSHA, status string) {
+	body := duplicateReviewReply(status, headSHA)
+	if body == "" {
+		return
+	}
+	if _, err := h.ghClient.PostIssueComment(ctx, owner, repo, number, body); err != nil {
+		h.logger.Warn("post duplicate-review reply", "delivery", delivery, "err", err)
+	}
+}
+
+// duplicateReviewReply explains a same-SHA no-op in Boop's chrome
+// voice (friendly pug, mascot OK). Findings stay plain; this is status.
+func duplicateReviewReply(status, headSHA string) string {
+	short := shortSHA(headSHA)
+	switch status {
+	case "active":
+		return fmt.Sprintf(
+			"🐾 **Already on it.** I'm still sniffing through `%s`. Hang tight — I'll post when that run finishes.",
+			short,
+		)
+	case "succeeded":
+		return fmt.Sprintf(
+			"🐾 **Already sniffed `%s`.** Push a new commit and I'll take another pass. Want the same SHA again? Delete the Job for this head and ask me to review.",
+			short,
+		)
+	default:
+		return ""
+	}
+}
+
+func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, reason string, reactionCommentID, statusCommentID int64, reviewNumber int) {
 	jobName := buildJobName(owner, repo, number, headSHA)
 
 	job, err := renderJobTemplate(jobTemplate, templateVars{
-		Owner:            owner,
-		Repo:             repo,
-		Number:           fmt.Sprintf("%d", number),
-		SHA:              headSHA,
-		SHA7:             shortSHA(headSHA),
-		BaseRef:          baseRef,
-		Image:            h.cfg.JobImage,
-		StatusCommentID:  fmt.Sprintf("%d", statusCommentID),
+		Owner:             owner,
+		Repo:              repo,
+		Number:            fmt.Sprintf("%d", number),
+		SHA:               headSHA,
+		SHA7:              shortSHA(headSHA),
+		BaseRef:           baseRef,
+		Image:             h.cfg.JobImage,
+		StatusCommentID:   fmt.Sprintf("%d", statusCommentID),
 		ReactionCommentID: fmt.Sprintf("%d", reactionCommentID),
+		ReviewNumber:      fmt.Sprintf("%d", reviewNumber),
 	})
 	if err != nil {
 		h.logger.Error("render job", "delivery", delivery, "err", err)
@@ -295,20 +395,22 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		"reason", reason,
 		"status_comment_id", statusCommentID,
 		"reaction_comment_id", reactionCommentID,
+		"review_number", reviewNumber,
 	)
 	writeAck(w, "accepted", jobName, delivery)
 }
 
 type templateVars struct {
-	Owner            string
-	Repo             string
-	Number           string
-	SHA              string
-	SHA7             string
-	BaseRef          string
-	Image            string
-	StatusCommentID  string // GitHub comment id for live status updates (empty if none)
+	Owner             string
+	Repo              string
+	Number            string
+	SHA               string
+	SHA7              string
+	BaseRef           string
+	Image             string
+	StatusCommentID   string // GitHub comment id for live status updates (empty if none)
 	ReactionCommentID string // GitHub comment id that received the trigger reaction (empty if none)
+	ReviewNumber      string // 1-based review number for this run; runner uses it for headers
 }
 
 func renderJobTemplate(tpl string, v templateVars) (*batchv1.Job, error) {
@@ -323,6 +425,7 @@ func renderJobTemplate(tpl string, v templateVars) (*batchv1.Job, error) {
 		{"__IMAGE__", v.Image},
 		{"__STATUS_COMMENT_ID__", v.StatusCommentID},
 		{"__REACTION_COMMENT_ID__", v.ReactionCommentID},
+		{"__REVIEW_NUMBER__", v.ReviewNumber},
 	} {
 		rendered = strings.ReplaceAll(rendered, p.old, p.new)
 	}
