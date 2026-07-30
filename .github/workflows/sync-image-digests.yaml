@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  packages: read
 
 jobs:
   sync:
@@ -24,16 +25,31 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve current receiver digest from GHCR
+      - name: Resolve current receiver digest
         id: digests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # Resolve the digest via the GitHub packages API rather than
+          # docker buildx imagetools — the runner may not be able to
+          # authenticate against ghcr.io without an explicit login,
+          # and the API works for any runner with packages:read.
+          VERSION_ID="$(
+            gh api /orgs/qubitquilt/packages/container/boop-receiver/versions \
+              --jq '.[] | select(.metadata.container.tags[]? == "latest") | .id' \
+              | head -1
+          )"
+          if [ -z "${VERSION_ID}" ]; then
+            echo "::error::No :latest version found for boop-receiver"
+            exit 1
+          fi
           DIGEST="$(
-            docker buildx imagetools inspect "ghcr.io/qubitquilt/boop-receiver:latest" --raw 2>/dev/null \
-              | jq -r '.manifests[0].digest // empty'
+            gh api "/orgs/qubitquilt/packages/container/boop-receiver/versions/${VERSION_ID}" \
+              --jq '.name'
           )"
           if [ -z "${DIGEST}" ]; then
-            echo "::error::Failed to resolve digest for ghcr.io/qubitquilt/boop-receiver"
+            echo "::error::No digest returned for version ${VERSION_ID}"
             exit 1
           fi
           echo "boop-receiver=${DIGEST}" >> "${GITHUB_OUTPUT}"
