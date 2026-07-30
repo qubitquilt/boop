@@ -1,0 +1,10 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: boop-config
+data:
+  LOG_LEVEL: "info"
+  PORT: "8080"
+  JOB_IMAGE: "ghcr.io/qubitquilt/boop-runner:stable"
+  TARGET_NAMESPACE: "dev-tools"

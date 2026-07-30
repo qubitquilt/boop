@@ -1,0 +1,16 @@
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: boop
+  namespace: dev-tools
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`boop.qubitquilt.dev`) && PathPrefix(`/webhook`)
+      services:
+        - name: boop-receiver
+          port: http
+  tls: {}

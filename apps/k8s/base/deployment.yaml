@@ -1,0 +1,102 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: boop-receiver
+  labels:
+    app: boop-receiver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: boop-receiver
+  template:
+    metadata:
+      labels:
+        app: boop-receiver
+    spec:
+      serviceAccountName: boop-receiver
+      containers:
+        - name: receiver
+          image: ghcr.io/qubitquilt/boop-receiver:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: boop-config
+                  key: LOG_LEVEL
+            - name: PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: boop-config
+                  key: PORT
+            - name: JOB_IMAGE
+              valueFrom:
+                configMapKeyRef:
+                  name: boop-config
+                  key: JOB_IMAGE
+            - name: TARGET_NAMESPACE
+              valueFrom:
+                configMapKeyRef:
+                  name: boop-config
+                  key: TARGET_NAMESPACE
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: boop-secrets
+                  key: WEBHOOK_SECRET
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: boop-secrets
+                  key: GITHUB_APP_ID
+            - name: GITHUB_APP_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: boop-secrets
+                  key: GITHUB_APP_INSTALLATION_ID
+            - name: GITHUB_APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: boop-secrets
+                  key: GITHUB_APP_PRIVATE_KEY
+            - name: BOT_LOGIN
+              value: "BoopPr[bot]"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: boop-receiver
+  labels:
+    app: boop-receiver
+spec:
+  type: ClusterIP
+  selector:
+    app: boop-receiver
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

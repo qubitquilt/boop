@@ -1,0 +1,25 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: boop-receiver
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: boop-receiver
+subjects:
+  - kind: ServiceAccount
+    name: boop-receiver
+    namespace: dev-tools
+roleRef:
+  kind: Role
+  name: boop-receiver
+  apiGroup: rbac.authorization.k8s.io
