@@ -47,6 +47,23 @@ jobs:
           git config --global user.signingkey "${{ secrets.SSH_SIGNING_KEY_PUB }}"
           git config --global commit.gpgsign true
 
+      - name: Debug signing at commit time
+        if: always()
+        run: |
+          echo "DEBUG: HOME=${HOME}"
+          echo "DEBUG: SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-not set}"
+          echo "DEBUG: SSH_AGENT_PID=${SSH_AGENT_PID:-not set}"
+          echo "DEBUG: agent keys now:"
+          ssh-add -l 2>&1 || echo "(no agent reachable)"
+          echo "DEBUG: git config user.signingkey:"
+          git config --global --get user.signingkey | head -1
+          echo "DEBUG: git config gpg.format:"
+          git config --global --get gpg.format
+          echo "DEBUG: test sign a string and extract the key used:"
+          printf 'test' | ssh-keygen -Y sign -n test -f ~/.ssh/id_signing 2>/dev/null && {
+            echo "(test signed ok)"
+          } || echo "(test sign failed — will show actual key used by git)"
+
       - name: Resolve current receiver digest
         id: digests
         env:
@@ -119,6 +136,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          echo "=== DEBUG PRE-COMMIT ==="
+          echo "HOME=${HOME}"
+          echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-not set}"
+          echo "SSH_AGENT_PID=${SSH_AGENT_PID:-not set}"
+          echo "agent keys:"
+          ssh-add -l 2>&1 || echo "(no agent reachable)"
+          echo "git config user.signingkey (first 80 chars):"
+          git config --global --get user.signingkey | cut -c1-80
+          echo "git config gpg.format:"
+          git config --global --get gpg.format
+
           if git diff --quiet apps/k8s/overlays/pugquilt/kustomization.yaml; then
             echo "No digest changes; nothing to do."
             exit 0
