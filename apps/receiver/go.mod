@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-github/v68 v68.0.0
-	golang.org/x/time v0.14.0
+	golang.org/x/time v0.15.0
 	k8s.io/api v0.36.3
 	k8s.io/apimachinery v0.36.3
 	k8s.io/client-go v0.36.3
