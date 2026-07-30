@@ -148,6 +148,11 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 		writeAck(w, "ignored", "action not reviewable", delivery)
 		return
 	}
+	if hasLabel(pr.Labels, skipReviewLabel) {
+		h.logger.Debug("ignored label", "delivery", delivery, "label", skipReviewLabel)
+		writeAck(w, "ignored", "skip-review label present", delivery)
+		return
+	}
 	client := h.ghClient.ClientFor(installationID)
 	// Check for duplicate before posting a status comment — otherwise a
 	// re-delivery of the same head SHA leaves a stranded "👀" comment
@@ -470,6 +475,22 @@ type prMeta struct {
 	Number  int
 	HeadSHA string
 	BaseRef string
+	Labels  []string
+}
+
+// skipReviewLabel is the GitHub label that opts a PR out of Boop
+// review. Auto-generated PRs (image-digest syncs, dep bumps, etc.)
+// carry it so the receiver acks the webhook as ignored and never
+// schedules a review Job.
+const skipReviewLabel = "skip-review"
+
+func hasLabel(labels []string, name string) bool {
+	for _, l := range labels {
+		if strings.EqualFold(l, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // parseInstallationID reads the X-GitHub-Installation-ID header and
@@ -530,6 +551,11 @@ func parsePullRequest(body []byte) (prMeta, error) {
 	out.Number = pr.GetNumber()
 	out.HeadSHA = *pr.PullRequest.Head.SHA
 	out.BaseRef = *pr.PullRequest.Base.Ref
+	for _, l := range pr.PullRequest.Labels {
+		if l != nil && l.Name != nil {
+			out.Labels = append(out.Labels, *l.Name)
+		}
+	}
 	return out, nil
 }
 
