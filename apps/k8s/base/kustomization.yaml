@@ -17,12 +17,13 @@ configMapGenerator:
     files:
       - opencode.json=runner-config/opencode.json
       - skill-boop=runner-config/skills/boop/SKILL.md
-      - skill-boop-agent-pr=runner-config/skills/boop/agents/review-pr.md
       - skill-boop-agent-code-quality=runner-config/skills/boop/agents/review-code-quality.md
       - skill-boop-agent-design-pattern=runner-config/skills/boop/agents/review-design-pattern.md
       - skill-boop-agent-error-handling=runner-config/skills/boop/agents/review-error-handling.md
       - skill-boop-agent-readability=runner-config/skills/boop/agents/review-readability.md
       - skill-boop-agent-solid-principles=runner-config/skills/boop/agents/review-solid-principles.md
+      - skill-boop-agent-test-quality=runner-config/skills/boop/agents/review-test-quality.md
+      - skill-boop-agent-deep=runner-config/skills/boop/agents/review-deep.md
       - skill-gh-cli=runner-config/skills/gh-cli/SKILL.md
     options:
       disableNameSuffixHash: true

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "description": "Boop PR reviewer: clones a PR, runs OpenCode with the boop skill, posts a review",
+  "description": "BoopPr runner: clones a PR, runs the multi-lens review via OpenCode, and posts a friendly summary with inline comments",
   "scripts": {
     "start": "node src/index.mjs"
   },

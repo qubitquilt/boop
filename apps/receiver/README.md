@@ -1,10 +1,11 @@
 # boop-receiver
 
-GitHub webhook receiver for the boop agent. Validates HMAC, filters
-`pull_request` events, and submits a Kubernetes Job per PR.
+The half of BoopPr that listens. GitHub webhook receiver for the
+BoopPr GitHub App: validates HMAC, filters `pull_request` and
+`issue_comment` events, and submits a Kubernetes Job per PR.
 
-The GitHub App posting reviews is named **BoopPr** (the internal project
-is `boop`).
+The GitHub App posting reviews is **BoopPr**; this internal project
+is `boop`. Same pug, different name tag.
 
 ## Build
 

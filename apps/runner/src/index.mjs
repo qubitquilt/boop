@@ -49,12 +49,12 @@ const OPENCODE_TIMEOUT_MS = 25 * 60 * 1000;
 // Status stages. The receiver uses the same vocabulary so the user
 // can correlate GitHub comment updates with runner log lines.
 const STATUS = {
-  initial: "👀 **boop is reviewing this PR...**\n\nLast commit: `{sha}`. Updates will appear here.",
-  auth: "🔐 **boop is reviewing this PR** — authenticated with GitHub.\n\nLast commit: `{sha}`.",
-  clone: "📥 **boop is reviewing this PR** — cloned the repo at `{sha}`. Checking out the PR head and starting the multi-lens review.",
-  review: "🧠 **boop is reviewing this PR** — running the multi-lens review (boop skill) on `{sha}`.",
-  done: "✅ **boop review complete.** See the review comment below.",
-  failed: "❌ **boop review failed.** Check the Job logs for details.",
+  initial: "🐾 **Boop is on the case!** Sniffing through this PR at `{sha}`. Updates will appear here.",
+  auth: "🔐 **Boop has arrived** — authenticated with GitHub at `{sha}`.",
+  clone: "📥 **Boop fetched the repo** at `{sha}`. Checking out the PR head and starting the multi-lens review.",
+  review: "🧠 **Boop is reviewing** — running the multi-lens review on `{sha}`.",
+  done: "✅ **Boop's review is in.** See the comment below.",
+  failed: "❌ **Boop got distracted.** Check the Job logs for details.",
 };
 
 
@@ -62,10 +62,10 @@ const STATUS = {
 // shows the full state; the timeline is a one-line-per-stage log.
 const SHORT = {
   auth: "🔐 authenticated",
-  clone: "📥 cloned",
-  review: "🧠 running review",
-  done: "✅ complete",
-  failed: "❌ failed",
+  clone: "📥 fetched",
+  review: "🧠 reviewing",
+  done: "✅ review in",
+  failed: "❌ distracted",
 };
 function shortSha(s) {
   return s && s.length >= 7 ? s.slice(0, 7) : (s || "");
@@ -353,15 +353,38 @@ function stripAnsi(s) {
     .replace(/[\x00-\x08\x0b-\x1f]/g, "");
 }
 
-// buildBoopPrompt reads the boop skill directly from the read-only
-// ConfigMap mount (CONFIG_SRC) and inlines it into the prompt.
-// opencode-ai's skill discovery doesn't pick up user skills from
-// the ConfigMap in this runner setup (only its own built-in
-// `customize-opencode` skill loads), so we pre-load the skill
-// content into the prompt itself. We deliberately read from the
-// source mount, not from the writable copy — cp -rL on the
-// `..data` symlink can pull huge amounts of data and OOM the
-// container.
+// buildBoopPrompt reads the boop skill (SKILL.md + every agents/review-*.md)
+// directly from the read-only ConfigMap mount (CONFIG_SRC) and inlines them
+// into the prompt. opencode-ai's skill discovery doesn't pick up user skills
+// from the ConfigMap in this runner setup (only its own built-in
+// `customize-opencode` skill loads), so we pre-load the skill content into
+// the prompt itself. We deliberately read from the source mount, not from
+// the writable copy — cp -rL on the `..data` symlink can pull huge amounts
+// of data and OOM the container.
+const LENS_FILES = [
+  "agents/review-code-quality.md",
+  "agents/review-design-pattern.md",
+  "agents/review-error-handling.md",
+  "agents/review-readability.md",
+  "agents/review-solid-principles.md",
+  "agents/review-test-quality.md",
+  "agents/review-deep.md",
+];
+
+async function readWithRetry(path, attempts = 5) {
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fs.readFile(path, "utf8");
+    } catch (err) {
+      lastErr = err;
+      if (attempt < attempts) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      }
+    }
+  }
+  throw lastErr;
+}
 async function buildBoopPrompt() {
   // Read from the ConfigMap mount directly. The mount uses
   // `..data -> ..2026_...` indirection that can be transiently
@@ -390,6 +413,25 @@ async function buildBoopPrompt() {
   // Strip the frontmatter so the model sees a clean system-prompt-ish
   // block instead of duplicate yaml keys.
   const bodyNoFrontmatter = skillBody.replace(/^---[\s\S]*?---\n*/, "");
+
+  // Inline every lens file. The orchestrator (SKILL.md) tells the model to
+  // "walk" each lens, but it can't read files in this single-call flow —
+  // we have to deliver the content. Order matches LENS_FILES.
+  const lensBlocks = [];
+  for (const rel of LENS_FILES) {
+    const path = `${CONFIG_SRC}/skills/boop/${rel}`;
+    try {
+      const body = await readWithRetry(path);
+      log("skill", "loaded lens", { rel, bytes: body.length });
+      const cleaned = body.replace(/^---[\s\S]*?---\n*/, "").trim();
+      const label = rel.split("/").pop().replace(/\.md$/, "");
+      lensBlocks.push(`### Lens: ${label}\n\n${cleaned}`);
+    } catch (err) {
+      log("skill", `failed to load lens ${rel}`, {
+        err: String(err?.message ?? err),
+      });
+    }
+  }
 
   return [
     "You are running inside a Kubernetes Job triggered by a GitHub App. " +
@@ -421,9 +463,13 @@ async function buildBoopPrompt() {
       "Don't comment on unchanged code.",
     "- Don't include empty SUMMARY or INLINE COMMENTS sections.",
     "",
-    "## Skill: boop",
+    "## Skill: boop (orchestrator)",
     "",
     bodyNoFrontmatter.trim(),
+    "",
+    "## Lenses (read each, apply the checklist, capture findings)",
+    "",
+    lensBlocks.join("\n\n---\n\n"),
     "",
     "## PR context",
     `- Owner/repo: ${PR_OWNER}/${PR_REPO}`,
@@ -433,9 +479,9 @@ async function buildBoopPrompt() {
     `- Working directory (already cloned): ${REPO_DIR}`,
     `- Compare ${PR_BASE_REF}...${PR_HEAD_SHA} to identify what changed.`,
     "",
-    "Use the boop skill above to do the actual review. When done, emit " +
-      "the SUMMARY / INLINE COMMENTS / END block as the LAST thing in your " +
-      "response.",
+    "Use the orchestrator and the lenses above to do the actual review. " +
+      "When done, emit the SUMMARY / INLINE COMMENTS / END block as the LAST " +
+      "thing in your response.",
   ].join("\n");
 }
 
@@ -534,9 +580,9 @@ async function postReview(octokit, body) {
     repo: PR_REPO,
     issue_number: Number(PR_NUMBER),
     body:
-      `## boop review\n\n` +
+      `## 🐾 Boop's review\n\n` +
       trimmed +
-      `\n\n<sub>Posted by [boop](https://github.com/michaelruelas/homelab-infra) from PR \`${shortSha(PR_HEAD_SHA)}\`</sub>`,
+      `\n\n<sub>Posted by [BoopPr](https://github.com/michaelruelas/homelab-infra) · PR \`${shortSha(PR_HEAD_SHA)}\` · good boy powered</sub>`,
   });
 }
 

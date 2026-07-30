@@ -1,8 +1,8 @@
 # boop-runner
 
-One-shot runner that reviews a PR. Invoked as a Kubernetes Job by the
-boop-receiver when a `pull_request` or `issue_comment` event with
-`@BoopPr` arrives.
+The half of BoopPr that does the work. One-shot runner that reviews a
+PR. Invoked as a Kubernetes Job by the boop-receiver when a
+`pull_request` or `issue_comment` event with `@BoopPr` arrives.
 
 ## What it does
 
