@@ -14,16 +14,31 @@ The internal project here is `boop`. The GitHub App on the wire is
 ## What Boop does
 
 - **Multi-lens review** — runs a configurable set of reviewer lenses
-  (code quality, error handling, design patterns, readability, SOLID)
-  against every PR head.
+  (code quality, design patterns, error handling, readability, SOLID,
+  test quality, deep) against every PR head.
 - **Line-specific inline comments** — actionable feedback pinned to
   the diff, not a wall of prose in a summary.
 - **Single summary post** — one short comment per PR with the headline
   findings.
-- **At-mention re-review** — drop `@BoopPr` on any PR comment to
-  re-trigger him.
+- **At-mention re-review** — drop `@BoopPr review` on any PR comment
+  to re-trigger him.
 - **Friendly status updates** — a "Boop is reviewing…" comment is
   posted up front and patched as the review progresses.
+
+## Documentation
+
+Full documentation lives in [`docs/`](./docs/README.md):
+
+- [docs/README.md](./docs/README.md) — top-level map, one-screen overview.
+- [docs/product.md](./docs/product.md) — public perspective, what the PR author sees.
+- [docs/architecture.md](./docs/architecture.md) — system flow, components, failure modes.
+- [docs/webhook-contract.md](./docs/webhook-contract.md) — events, dedup, status thread, output format.
+- [docs/receiver.md](./docs/receiver.md) — Go webhook receiver (scoped).
+- [docs/runner.md](./docs/runner.md) — Node PR-review worker (scoped).
+- [docs/skills.md](./docs/skills.md) — the boop review skill + seven lenses.
+- [docs/deployment.md](./docs/deployment.md) — K8s overlays, CI, image tags, ArgoCD.
+- [docs/secrets.md](./docs/secrets.md) — GitHub App + OpenBao wiring.
+- [docs/development.md](./docs/development.md) — local dev, build, test, debug.
 
 ## How it works
 
@@ -51,8 +66,8 @@ GitHub Actions on push to `main` or a `v*` tag:
 - Push to `main` → builds and pushes `:latest` to `ghcr.io/qubitquilt/boop-{receiver,runner}`
 - Push tag `vX.Y.Z` → builds and pushes `:stable`, `:vX.Y.Z`, `:X.Y`, `:X`
 
-The default overlay pins `:stable`. Bump to a specific tag (`:v0.1.0`)
-for reproducible rollouts.
+The default overlay pins `:latest`. Bump to `:stable` or a specific tag
+(`:v0.1.0`) for reproducible rollouts.
 
 ## Local dev
 
