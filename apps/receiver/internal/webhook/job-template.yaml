@@ -1,7 +1,8 @@
 # This template is rendered by the boop-receiver at webhook time.
 # The receiver substitutes __OWNER__, __REPO__, __NUMBER__, __SHA__, __BASE_REF__,
-# __REVIEW_NUMBER__ with values from the pull_request payload, then submits it
-# as a Job. It is NOT applied directly by ArgoCD.
+# __REVIEW_NUMBER__, __INSTALLATION_ID__ with values from the webhook payload
+# (the installation id is taken from the X-GitHub-Installation-ID header), then
+# submits it as a Job. It is NOT applied directly by ArgoCD.
 ---
 apiVersion: batch/v1
 kind: Job
@@ -55,10 +56,7 @@ spec:
                   name: boop-secrets
                   key: GITHUB_APP_ID
             - name: GITHUB_APP_INSTALLATION_ID
-              valueFrom:
-                secretKeyRef:
-                  name: boop-secrets
-                  key: GITHUB_APP_INSTALLATION_ID
+              value: "__INSTALLATION_ID__"
             - name: GITHUB_APP_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:

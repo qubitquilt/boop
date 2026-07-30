@@ -30,8 +30,9 @@ apps/receiver/
 │   │   ├── handler_test.go       # buildJobName, shortSHA, renderJobTemplate, dup reply
 │   │   └── verify_test.go        # HMAC verify, isReviewableAction, requestsReview regex
 │   └── github/
-│       ├── client.go             # App JWT, installation-token cache, PR fetch,
-│       │                         #   post/edit comment, react, count prior reviews
+│       ├── manager.go             # App creds, per-installation Client cache, App JWT mint
+│       ├── client.go              # Per-installation Client, installation-token cache,
+│       │                         #   PR fetch, post/edit comment, react, count prior reviews
 │       └── review_header_test.go # ReviewSummaryHeader + IsBoopReviewSummary regex
 ├── go.mod                        # go 1.23
 ├── Dockerfile                    # distroless/static, CGO=0
@@ -73,7 +74,6 @@ Read from env vars at startup. All required. See
 |---|---|---|---|
 | `WEBHOOK_SECRET` | yes | — | HMAC secret for `X-Hub-Signature-256`. Must match the GitHub App webhook config. |
 | `GITHUB_APP_ID` | yes | — | App ID (integer). |
-| `GITHUB_APP_INSTALLATION_ID` | yes | — | Installation ID (integer) for the target org. |
 | `GITHUB_APP_PRIVATE_KEY` | yes | — | PEM-encoded PKCS#1 RSA key. |
 | `PORT` | no | `8080` | HTTP listen port. |
 | `JOB_IMAGE` | no | `ghcr.io/michaelruelas/boop-runner:latest` | Image the receiver submits in Job pods. In-cluster the `apps/k8s/base/config.yaml` overrides to `ghcr.io/qubitquilt/boop-runner:stable`. |
