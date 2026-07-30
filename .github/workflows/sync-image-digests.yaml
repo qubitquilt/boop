@@ -39,6 +39,14 @@ jobs:
           chmod 644 ~/.ssh/id_signing.pub
           eval "$(ssh-agent -s)"
           ssh-add ~/.ssh/id_signing
+          # Persist SSH_AUTH_SOCK to subsequent steps. Without this, the
+          # "Open PR" step's commit can't find the agent, and git falls
+          # back to an unknown signing path that produces unverified
+          # signatures with a phantom public key.
+          {
+            echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}"
+            echo "SSH_AGENT_PID=${SSH_AGENT_PID}"
+          } >> "$GITHUB_ENV"
           echo "DEBUG: key fingerprint in agent:"
           ssh-add -l
           echo "DEBUG: SHA256 of public key file (compare to local: shasum -a 256 ~/.ssh/boop-ci-signing.pub):"
