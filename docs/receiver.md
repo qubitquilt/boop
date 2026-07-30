@@ -24,10 +24,12 @@ apps/receiver/
 ├── internal/
 │   ├── webhook/
 │   │   ├── handler.go            # HTTP handler, event dispatch, dedup, Job submit
+│   │   ├── reviews.go            # GET /api/reviews: list + group + JSON
 │   │   ├── kube.go               # in-cluster / KUBECONFIG client
 │   │   ├── template.go           # //go:embed wrapper for the Job template
 │   │   ├── job-template.yaml     # the embedded template (live, used at runtime)
 │   │   ├── handler_test.go       # buildJobName, shortSHA, renderJobTemplate, dup reply
+│   │   ├── reviews_test.go       # collectReviews, reviewFromJob, ListReviews (fake clientset)
 │   │   └── verify_test.go        # HMAC verify, isReviewableAction, requestsReview regex
 │   └── github/
 │       ├── client.go             # App JWT, installation-token cache, PR fetch,
@@ -44,10 +46,11 @@ live template the receiver renders is the embedded one
 
 ## HTTP API
 
-| Method | Path        | Purpose                                                                |
-|--------|-------------|------------------------------------------------------------------------|
-| POST   | `/webhook`  | GitHub webhook entry point. Always returns 202 (ack) or 4xx/5xx.        |
-| GET    | `/health`   | Liveness/readiness. Returns `200 ok`. Used by the K8s probes.           |
+| Method | Path            | Purpose                                                                |
+|--------|-----------------|------------------------------------------------------------------------|
+| POST   | `/webhook`      | GitHub webhook entry point. Always returns 202 (ack) or 4xx/5xx.        |
+| GET    | `/health`       | Liveness/readiness. Returns `200 ok`. Used by the K8s probes.           |
+| GET    | `/api/reviews`  | Snapshot of boop review Jobs in `TARGET_NAMESPACE`. See below.         |
 
 Ack body shape (always JSON, status 202):
 
@@ -63,6 +66,59 @@ Ack body shape (always JSON, status 202):
 `status` is one of: `accepted`, `duplicate`, `ignored`. The
 `X-GitHub-Delivery` ID is logged for every event so GitHub's redelivery
 tool can be cross-referenced.
+
+### `/api/reviews`
+
+Read-only snapshot of review Jobs for dashboards and ad-hoc inspection.
+Lists Jobs in `TARGET_NAMESPACE` with label `app=boop`, groups them by
+state, and returns the result as JSON. The K8s API call is filtered
+server-side via `LabelSelector=app=boop`, so non-boop Jobs in the
+namespace do not pay a serialization cost.
+
+Bucketing rules:
+
+- `active` — `Status.Active > 0`, or has `StartTime` and no
+  `CompletionTime` and no `Failed` condition. Includes the moment
+  between backoffLimit-exceeded and the Failed condition being written.
+- `recent` — `Status.Succeeded > 0` and `CompletionTime` within the
+  last 24h.
+- `failed` — has a `Failed` condition, or `Status.Failed > 0`, and the
+  run started within the last 7d. Older failures age out so the
+  dashboard stays focused.
+
+Each list is sorted newest-first by `startTime`. A Job appears in
+exactly one bucket.
+
+Response shape:
+
+```json
+{
+  "active": [
+    {
+      "name": "boop-qubitquilt-boop-2-b147629",
+      "namespace": "dev-tools",
+      "owner": "qubitquilt",
+      "repo": "boop",
+      "pr": 2,
+      "commit": "b147629deadbeefcafebabe...",
+      "baseRef": "main",
+      "startTime": "2026-07-29T11:54:00Z",
+      "status": "Running",
+      "active": 1,
+      "succeeded": 0,
+      "failed": 0
+    }
+  ],
+  "recent": [ /* same shape, status "Complete" */ ],
+  "failed": [ /* same shape, status "Failed", duration set */ ]
+}
+```
+
+The endpoint is unauthenticated. It is intended to be reachable only
+from inside the cluster (e.g., via `kubectl port-forward`); if exposed
+beyond the cluster, front it with an `IngressRoute` + basic auth or a
+Tailscale-only entrypoint. It reveals Job metadata only — no PR
+content, no secrets.
 
 ## Configuration
 
@@ -204,6 +260,10 @@ Coverage by file:
 - `internal/webhook/handler_test.go` — `buildJobName`, `shortSHA`,
   `duplicateReviewReply`, full `renderJobTemplate` round-trip including
   the new `BOOP_REVIEW_NUMBER` wiring.
+- `internal/webhook/reviews_test.go` — `collectReviews` grouping +
+  windowing, `reviewFromJob` with full and sparse labels,
+  `humanStatus` table, end-to-end `ListReviews` via a fake clientset
+  (label selector excludes non-boop Jobs), 503 path on K8s List error.
 - `internal/github/review_header_test.go` — `ReviewSummaryHeader(n)` for
   `n=0,1,2,3,10`; `IsBoopReviewSummary` for the live format plus tolerant
   historical forms.

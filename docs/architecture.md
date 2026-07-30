@@ -46,7 +46,8 @@ all state lives in the K8s API and the GitHub API.
 - **Image:** `ghcr.io/qubitquilt/boop-receiver` (Go 1.23, distroless).
 - **Replicas:** 1 (eventually consistent — duplicates are deduped by head
   SHA, not by receiver instance).
-- **Endpoints:** `POST /webhook`, `GET /health`.
+- **Endpoints:** `POST /webhook`, `GET /health`, `GET /api/reviews` (the
+  latter for dashboards; see [receiver.md](./receiver.md#apireviews)).
 - **Cluster scope:** namespace `dev-tools`. Creates Jobs in the same
   namespace.
 - **GitHub App auth:** uses the App creds to post the "reviewing…"
