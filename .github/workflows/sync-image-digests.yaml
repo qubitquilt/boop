@@ -123,8 +123,8 @@ jobs:
           BRANCH="chore/sync-image-digests-${{ github.run_id }}"
           git checkout -b "${BRANCH}"
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "qubit-quilt-agent"
+          git config user.email "233101448+qubit-quilt-agent@users.noreply.github.com"
           git add apps/k8s/overlays/pugquilt/kustomization.yaml
           git commit -m "chore(deps): update image digests"
           git push --set-upstream origin "${BRANCH}"
