@@ -34,27 +34,16 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_SIGNING_KEY }}" > ~/.ssh/id_signing
-          printf '%s\n' "${{ secrets.SSH_SIGNING_KEY_PUB }}" > ~/.ssh/id_signing.pub
-          chmod 600 ~/.ssh/id_signing
-          chmod 644 ~/.ssh/id_signing.pub
           eval "$(ssh-agent -s)"
           ssh-add ~/.ssh/id_signing
-          # Persist SSH_AUTH_SOCK to subsequent steps. Without this, the
-          # "Open PR" step's commit can't find the agent, and git falls
-          # back to an unknown signing path that produces unverified
-          # signatures with a phantom public key.
           {
             echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}"
             echo "SSH_AGENT_PID=${SSH_AGENT_PID}"
           } >> "$GITHUB_ENV"
-          echo "DEBUG: key fingerprint in agent:"
+          echo "DEBUG: agent fingerprint:"
           ssh-add -l
-          echo "DEBUG: SHA256 of public key file (compare to local: shasum -a 256 ~/.ssh/boop-ci-signing.pub):"
-          shasum -a 256 ~/.ssh/id_signing.pub
-          echo "DEBUG: SHA256 of private key file (compare to local: shasum -a 256 ~/.ssh/boop-ci-signing):"
-          shasum -a 256 ~/.ssh/id_signing
           git config --global gpg.format ssh
-          git config --global user.signingkey ~/.ssh/id_signing.pub
+          git config --global user.signingkey "${{ secrets.SSH_SIGNING_KEY_PUB }}"
           git config --global commit.gpgsign true
 
       - name: Resolve current receiver digest
