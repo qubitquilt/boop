@@ -66,7 +66,7 @@ human-in-the-loop edit. The voice contract enforces:
 - **The pug voice.** Warmth in openings, in positives, in "I think"
   instead of "this is wrong." Not in the technical content.
 - **STE-flavored prose rules.** ASD-STE100-inspired:
-  - One idea per sentence, ≤25 words for descriptive prose.
+  - One idea per sentence, ≤20 words. Hard cap, no exceptions.
   - Active voice.
   - Plain verbs: "start" (not "begin"), "use" (not "utilize"), "make
     sure" (not "ensure"), "before" (not "prior to"), "get" (not

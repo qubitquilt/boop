@@ -128,7 +128,7 @@ edit step. The voice contract enforces:
 - **American spelling.**
 - **No emoji in finding bodies.** The 🐾 lives in the chrome — headers,
   status comments, footer. Findings stay unadorned so they read as serious.
-- **One idea per sentence.** ≤25 words.
+- **One idea per sentence.** ≤20 words, hard cap, no exceptions.
 - **No "Observation / Impact / Suggestion" formula.** Real prose, varied
   openers, sometimes one sentence.
 - **No "definitely will break."** "Probably…" is right; "definitely…"

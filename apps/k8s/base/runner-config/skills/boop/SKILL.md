@@ -187,8 +187,10 @@ PR comments are general prose, not procedures. Apply these mechanical
 rules — they remove AI slop. They do not remove voice; they remove
 filler.
 
-- **One idea per sentence.** ≤20 words for instructions, ≤25 for
-  descriptive prose. Split a sentence that runs long.
+- **One idea per sentence.** ≤20 words per sentence, hard cap. Split a
+  sentence that runs longer. No carve-out for "descriptive prose" —
+  every sentence Boop emits on a PR, including inline comments, the
+  TL;DR, and the summary narrative, is bound by this cap.
 - **Active voice.** "The parser reads the file", not "the file is read
   by the parser."
 - **Plain verbs.** Use "start" (not begin/commence), "use" (not
@@ -216,7 +218,7 @@ filler.
 Before writing the SUMMARY block, scan every comment and the summary
 text:
 
-1. Any sentence over 20 words? Split it.
+1. Any sentence over 20 words? Split it. Hard cap, no exceptions.
 2. Any semicolon? Replace with a period.
 3. Any contraction? Expand it.
 4. Any passive voice with a known actor? Make it active.
