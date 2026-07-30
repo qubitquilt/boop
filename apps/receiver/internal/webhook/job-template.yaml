@@ -95,8 +95,6 @@ spec:
                 path: opencode.json
               - key: skill-boop
                 path: skills/boop/SKILL.md
-              - key: skill-boop-agent-pr
-                path: skills/boop/agents/review-pr.md
               - key: skill-boop-agent-code-quality
                 path: skills/boop/agents/review-code-quality.md
               - key: skill-boop-agent-design-pattern
@@ -107,5 +105,9 @@ spec:
                 path: skills/boop/agents/review-readability.md
               - key: skill-boop-agent-solid-principles
                 path: skills/boop/agents/review-solid-principles.md
+              - key: skill-boop-agent-test-quality
+                path: skills/boop/agents/review-test-quality.md
+              - key: skill-boop-agent-deep
+                path: skills/boop/agents/review-deep.md
               - key: skill-gh-cli
                 path: skills/gh-cli/SKILL.md
