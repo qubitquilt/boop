@@ -8,6 +8,7 @@ resources:
   - namespace.yaml
   - serviceaccount.yaml
   - role.yaml
+  - network-policy.yaml
   - deployment.yaml
   - config.yaml
 
@@ -23,6 +24,5 @@ configMapGenerator:
       - skill-boop-agent-solid-principles=runner-config/skills/boop/agents/review-solid-principles.md
       - skill-boop-agent-test-quality=runner-config/skills/boop/agents/review-test-quality.md
       - skill-boop-agent-deep=runner-config/skills/boop/agents/review-deep.md
-      - skill-gh-cli=runner-config/skills/gh-cli/SKILL.md
     options:
       disableNameSuffixHash: true

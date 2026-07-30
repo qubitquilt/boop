@@ -3,7 +3,7 @@ IMAGE ?= ghcr.io/michaelruelas/boop-runner:latest
 .PHONY: install build docker-build docker-push clean
 
 install:
-	npm install
+	npm ci
 
 build:
 	node --check src/index.mjs

@@ -3,6 +3,8 @@ package webhook
 import (
 	"strings"
 	"testing"
+
+	corev1 "k8s.io/api/core/v1"
 )
 
 // TestRenderStatusBody locks the initial status comment template the
@@ -163,8 +165,8 @@ func TestDuplicateReviewReply(t *testing.T) {
 	}
 }
 
-func TestRenderJobTemplate(t *testing.T) {
-	job, err := renderJobTemplate(jobTemplate, templateVars{
+func TestBuildJob(t *testing.T) {
+	job, err := buildJob(templateVars{
 		Owner:           "michaelruelas",
 		Repo:            "homelab-infra",
 		Number:          "42",
@@ -178,16 +180,97 @@ func TestRenderJobTemplate(t *testing.T) {
 		BotLogin:        "booppr[bot]",
 	})
 	if err != nil {
-		t.Fatalf("renderJobTemplate: %v", err)
+		t.Fatalf("buildJob: %v", err)
 	}
 	if job.Name != "boop-michaelruelas-homelab-infra-42-abc1234" {
 		t.Errorf("job.Name = %q", job.Name)
 	}
-	if job.Spec.Template.Spec.Containers[0].Image != "ghcr.io/michaelruelas/boop-runner:dev" {
-		t.Errorf("image = %q", job.Spec.Template.Spec.Containers[0].Image)
+	if got := job.Namespace; got != "dev-tools" {
+		t.Errorf("job.Namespace = %q, want dev-tools", got)
+	}
+	cont := job.Spec.Template.Spec.Containers[0]
+	if cont.Image != "ghcr.io/michaelruelas/boop-runner:dev" {
+		t.Errorf("image = %q", cont.Image)
+	}
+	if got := cont.ImagePullPolicy; got != "IfNotPresent" {
+		t.Errorf("imagePullPolicy = %q, want IfNotPresent", got)
 	}
 	if got := job.Spec.TTLSecondsAfterFinished; got == nil || *got != 3600 {
 		t.Errorf("TTLSecondsAfterFinished = %v", got)
+	}
+	if got := job.Spec.ActiveDeadlineSeconds; got == nil || *got != 1800 {
+		t.Errorf("ActiveDeadlineSeconds = %v, want 1800", got)
+	}
+	if got := job.Spec.BackoffLimit; got == nil || *got != 1 {
+		t.Errorf("BackoffLimit = %v, want 1", got)
+	}
+	if got := job.Spec.Template.Spec.RestartPolicy; got != "Never" {
+		t.Errorf("restartPolicy = %q, want Never", got)
+	}
+	if got := job.Spec.Template.Spec.ServiceAccountName; got != "boop-job" {
+		t.Errorf("serviceAccountName = %q, want boop-job", got)
+	}
+
+	// H2: read-only root FS + capability drop + seccomp must be
+	// applied so a code-exec bug in the runner cannot persist.
+	if cont.SecurityContext == nil {
+		t.Fatal("container securityContext is nil")
+	}
+	if cont.SecurityContext.ReadOnlyRootFilesystem == nil || !*cont.SecurityContext.ReadOnlyRootFilesystem {
+		t.Errorf("readOnlyRootFilesystem = %v, want true", cont.SecurityContext.ReadOnlyRootFilesystem)
+	}
+	if cont.SecurityContext.AllowPrivilegeEscalation == nil || *cont.SecurityContext.AllowPrivilegeEscalation {
+		t.Errorf("allowPrivilegeEscalation = %v, want false", cont.SecurityContext.AllowPrivilegeEscalation)
+	}
+	if cont.SecurityContext.SeccompProfile == nil || cont.SecurityContext.SeccompProfile.Type != "RuntimeDefault" {
+		t.Errorf("container seccompProfile = %+v, want RuntimeDefault", cont.SecurityContext.SeccompProfile)
+	}
+	if cont.SecurityContext.Capabilities == nil {
+		t.Fatal("container capabilities is nil")
+	}
+	drops := map[corev1.Capability]bool{}
+	for _, c := range cont.SecurityContext.Capabilities.Drop {
+		drops[c] = true
+	}
+	if !drops["ALL"] {
+		t.Errorf("capabilities.drop must include ALL, got %v", cont.SecurityContext.Capabilities.Drop)
+	}
+	if podSC := job.Spec.Template.Spec.SecurityContext; podSC == nil || podSC.SeccompProfile == nil || podSC.SeccompProfile.Type != "RuntimeDefault" {
+		t.Errorf("pod seccompProfile = %+v, want RuntimeDefault", podSC)
+	}
+	if podSC := job.Spec.Template.Spec.SecurityContext; podSC == nil || podSC.RunAsNonRoot == nil || !*podSC.RunAsNonRoot {
+		t.Errorf("pod runAsNonRoot must be true")
+	}
+
+	// /work and /tmp must be mounted as emptyDir so the runner has
+	// a writable scratch space with readOnlyRootFilesystem=true.
+	mounts := map[string]bool{}
+	for _, m := range cont.VolumeMounts {
+		mounts[m.MountPath] = true
+	}
+	if !mounts["/work"] {
+		t.Errorf("/work must be mounted (emptyDir)")
+	}
+	if !mounts["/tmp"] {
+		t.Errorf("/tmp must be mounted (emptyDir)")
+	}
+	if !mounts["/secrets/github-app-private-key"] {
+		t.Errorf("private-key mount missing")
+	}
+	if !mounts["/secrets/openrouter-api-key"] {
+		t.Errorf("openrouter-key mount missing")
+	}
+
+	// H6/L8: GITHUB_APP_PRIVATE_KEY and OPENROUTER_API_KEY must NOT
+	// be exposed as env. A prompt-injected LLM can read them via
+	// /proc/self/environ. The runner now reads the mounted file.
+	for _, e := range cont.Env {
+		if e.Name == "GITHUB_APP_PRIVATE_KEY" {
+			t.Errorf("GITHUB_APP_PRIVATE_KEY must NOT be in container env")
+		}
+		if e.Name == "OPENROUTER_API_KEY" {
+			t.Errorf("OPENROUTER_API_KEY must NOT be in container env")
+		}
 	}
 
 	// BOOP_REVIEW_NUMBER, GITHUB_APP_INSTALLATION_ID,
@@ -196,17 +279,15 @@ func TestRenderJobTemplate(t *testing.T) {
 	// only the delta; the last lets the runner identify its own
 	// prior comments on a re-review and resolve/minimize them.
 	var gotReview, gotInstall, gotPrev, gotLogin string
-	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
-		if e.Name == "BOOP_REVIEW_NUMBER" {
+	for _, e := range cont.Env {
+		switch e.Name {
+		case "BOOP_REVIEW_NUMBER":
 			gotReview = e.Value
-		}
-		if e.Name == "GITHUB_APP_INSTALLATION_ID" {
+		case "GITHUB_APP_INSTALLATION_ID":
 			gotInstall = e.Value
-		}
-		if e.Name == "PR_PREVIOUS_HEAD_SHA" {
+		case "PR_PREVIOUS_HEAD_SHA":
 			gotPrev = e.Value
-		}
-		if e.Name == "BOOP_BOT_LOGIN" {
+		case "BOOP_BOT_LOGIN":
 			gotLogin = e.Value
 		}
 	}
@@ -226,5 +307,116 @@ func TestRenderJobTemplate(t *testing.T) {
 	// for debugging without grepping the env.
 	if got := job.Annotations["boop/previous-head-sha"]; got != "20cd521abcdef0123456789abcdef0123456789" {
 		t.Errorf("boop/previous-head-sha annotation = %q, want prior SHA", got)
+	}
+}
+
+func TestBuildJob_RejectsUnsafeBaseRef(t *testing.T) {
+	// C1: a base ref with YAML-significant characters must be
+	// rejected at the boundary, not silently rendered into the
+	// Job spec. Each case picks a payload that would have broken
+	// the old strings.ReplaceAll + yaml.Unmarshal pipeline.
+	cases := []struct {
+		name string
+		ref  string
+	}{
+		{"empty", ""},
+		{"yaml-string-break", `main" - env: [X]`},
+		{"yaml-newline", "main\n  - evil: payload"},
+		{"yaml-flow-mapping", "main} extra"},
+		{"shell-arg", "--upload-pack=evil"},
+		{"starts-with-slash", "/main"},
+		{"ends-with-slash", "main/"},
+		{"double-dot", "main..branch"},
+		{"ends-with-dotlock", "main.lock"},
+		{"control-chars", "main\x00branch"},
+		{"space", "main branch"},
+		{"colon", "main:ref"},
+		{"asterisk", "main*"},
+		{"backtick", "main`evil`"},
+		{"too-long", "a" + strings.Repeat("b", 300)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := buildJob(templateVars{
+				Owner:          "o",
+				Repo:           "r",
+				Number:         "1",
+				SHA:            "abc1234567890",
+				SHA7:           "abc1234",
+				BaseRef:        c.ref,
+				Image:          "ghcr.io/example/boop-runner:stable",
+				ReviewNumber:   "1",
+				InstallationID: "1234",
+				BotLogin:       "booppr[bot]",
+			})
+			if err == nil {
+				t.Errorf("buildJob accepted unsafe base ref %q", c.ref)
+			}
+		})
+	}
+}
+
+func TestBuildJob_RejectsBadInstallationID(t *testing.T) {
+	// M2: the formatted InstallationID must be a positive integer
+	// before it lands in the Job. parseInstallationID already
+	// gates the header; buildJob gates the value that ends up in
+	// the container env.
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{"empty", ""},
+		{"zero", "0"},
+		{"negative", "-1"},
+		{"non-numeric", "not-a-number"},
+		{"hex", "0x10"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := buildJob(templateVars{
+				Owner:          "o",
+				Repo:           "r",
+				Number:         "1",
+				SHA:            "abc1234567890",
+				SHA7:           "abc1234",
+				BaseRef:        "main",
+				Image:          "ghcr.io/example/boop-runner:stable",
+				ReviewNumber:   "1",
+				InstallationID: c.id,
+				BotLogin:       "booppr[bot]",
+			})
+			if err == nil {
+				t.Errorf("buildJob accepted installation id %q", c.id)
+			}
+		})
+	}
+}
+
+func TestBuildJob_RejectsBadPreviousHeadSHA(t *testing.T) {
+	cases := []string{
+		"not-a-sha",
+		"20cd521abcdef0123456789abcdef01234567890z", // non-hex
+		"../etc/passwd",
+		"main",
+	}
+	for _, ref := range cases {
+		t.Run(ref, func(t *testing.T) {
+			_, err := buildJob(templateVars{
+				Owner:           "o",
+				Repo:            "r",
+				Number:          "1",
+				SHA:             "abc1234567890",
+				SHA7:            "abc1234",
+				BaseRef:         "main",
+				PreviousHeadSHA: ref,
+				Image:           "ghcr.io/example/boop-runner:stable",
+				ReviewNumber:    "1",
+				InstallationID:  "1234",
+				BotLogin:        "booppr[bot]",
+			})
+			if err == nil {
+				t.Errorf("buildJob accepted previous head SHA %q", ref)
+			}
+		})
 	}
 }

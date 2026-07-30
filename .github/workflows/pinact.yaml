@@ -1,0 +1,37 @@
+name: pinact
+
+# CI guard: every GitHub Actions reference must be pinned to a
+# full commit SHA, not a tag or branch. Tags are mutable: an
+# attacker who compromises an action's tag namespace can swap the
+# bytes behind the tag without changing the manifest. SHAs are
+# immutable by definition.
+#
+# pinact (`rhysd/pinact`) reads every workflow under
+# .github/workflows/ and fails the run if any `uses:` line is
+# not pinned to a 40-character SHA. The fix is mechanical —
+# `pinact run` rewrites the file in place — and well-tested in
+# other repos, so we run it on every PR that touches a workflow.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+jobs:
+  pinact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Run pinact
+        uses: rhysd/pinact-action@27bb84ac9af3887c9b75e2a37af3a59c838ec1cd # v1.5.0
+        with:
+          args: --skip-pr
+          # skip-pr means we don't have pinact open its own
+          # auto-PR; the comment-on-failure flow is enough.

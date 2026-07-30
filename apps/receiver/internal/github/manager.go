@@ -1,8 +1,11 @@
 package github
 
 import (
+	"context"
 	"crypto/rsa"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -25,18 +28,32 @@ type Manager struct {
 	cfg      AppConfig
 	baseHTTP *http.Client
 
-	mu      sync.Mutex
-	clients map[int64]*Client
+	mu            sync.Mutex
+	clients       map[int64]*Client
+	botLoginCache map[int64]botLoginCacheEntry
 }
+
+// botLoginCacheEntry stores the bot login for one installation,
+// plus the time it was resolved. A short TTL catches the case
+// where the App is reinstalled under a new login (rare, but
+// possible during a bot migration); the receiver will pick up
+// the new login within one TTL.
+type botLoginCacheEntry struct {
+	login string
+	at    time.Time
+}
+
+const botLoginCacheTTL = 24 * time.Hour
 
 // NewManager returns a Manager that can hand out per-installation
 // Clients on demand. Each Client mints its own installation token
 // (cached) the first time it's used.
 func NewManager(cfg AppConfig) *Manager {
 	return &Manager{
-		cfg:      cfg,
-		baseHTTP: &http.Client{Timeout: httpTimeout},
-		clients:  make(map[int64]*Client),
+		cfg:           cfg,
+		baseHTTP:      &http.Client{Timeout: httpTimeout},
+		clients:       make(map[int64]*Client),
+		botLoginCache: make(map[int64]botLoginCacheEntry),
 	}
 }
 
@@ -67,6 +84,92 @@ func (m *Manager) appJWT(now time.Time) (string, error) {
 		ExpiresAt: jwt.NewNumericDate(now.Add(appJWTTTL)),
 	})
 	return tok.SignedString(m.cfg.PrivateKey)
+}
+
+// AppBotLogin returns the GitHub login of the App for the given
+// installation (e.g. "BoopPr[bot]"). The receiver uses this to
+// recognise self-comments on issue_comment events so it doesn't
+// trigger a review in response to its own prior messages. The
+// hard-coded BOT_LOGIN env var (passed in via main.go) is the
+// fallback for air-gapped setups where the App cannot reach
+// api.github.com at startup; this call is the canonical answer
+// and is cached per-installation.
+//
+// Reaches the GitHub API as the App (using an app JWT, not an
+// installation token) because the App's own login is the same
+// for every installation. Endpoints:
+//
+//	GET /app/installations/{installation_id}
+//	  -> { "account": { "login": "BoopPr[bot]" } }
+//
+// M5: previously the receiver trusted a hard-coded
+// BOT_LOGIN env var. Drift between env and the App's actual
+// login (after a bot rename, a key rotation that changes the
+// bot's slug, or a misconfigured Helm values file) would
+// either silence the self-mention check (every comment
+// retriggers a review) or block it (the receiver never
+// recognises its own replies). Asking the API for the
+// canonical login closes that drift.
+func (m *Manager) AppBotLogin(ctx context.Context, installationID int64) (string, error) {
+	if installationID <= 0 {
+		return "", fmt.Errorf("invalid installation id: %d", installationID)
+	}
+	m.mu.Lock()
+	if entry, ok := m.botLoginCache[installationID]; ok {
+		if time.Since(entry.at) < botLoginCacheTTL && entry.login != "" {
+			m.mu.Unlock()
+			return entry.login, nil
+		}
+	}
+	m.mu.Unlock()
+
+	now := time.Now()
+	jwtStr, err := m.appJWT(now)
+	if err != nil {
+		return "", fmt.Errorf("mint app jwt: %w", err)
+	}
+
+	url := fmt.Sprintf("https://api.github.com/app/installations/%d", installationID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+jwtStr)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("User-Agent", "boop-receiver")
+
+	res, err := m.baseHTTP.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch installation: %w", err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("read installation body: %w", err)
+	}
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fetch installation %d: %s", res.StatusCode, string(body))
+	}
+
+	var probe struct {
+		Account *struct {
+			Login string `json:"login"`
+		} `json:"account"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return "", fmt.Errorf("decode installation body: %w", err)
+	}
+	if probe.Account == nil || probe.Account.Login == "" {
+		return "", fmt.Errorf("installation %d has no account.login in response", installationID)
+	}
+	login := probe.Account.Login
+
+	m.mu.Lock()
+	m.botLoginCache[installationID] = botLoginCacheEntry{login: login, at: now}
+	m.mu.Unlock()
+
+	return login, nil
 }
 
 const (

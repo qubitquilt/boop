@@ -10,7 +10,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"sigs.k8s.io/yaml"
 )
 
 func newInClusterClient() (kubernetes.Interface, error) {
@@ -36,8 +35,18 @@ func isNotFound(err error) bool {
 	return apierrors.IsNotFound(err)
 }
 
-func yamlUnmarshal(data []byte, out any) error {
-	return yaml.Unmarshal(data, out)
+// isAlreadyExists reports whether err is the Kubernetes
+// "already exists" error returned when a Create collides with a
+// resource of the same name. Used to close the TOCTOU window
+// between claimJobSlot and createJob (see L1 in the security
+// review): two simultaneous deliveries for the same head SHA both
+// see the slot as free, then race to Create. The loser gets
+// AlreadyExists and is treated as a duplicate.
+func isAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	return apierrors.IsAlreadyExists(err)
 }
 
 func loadKubeconfig(path string) (*rest.Config, error) {

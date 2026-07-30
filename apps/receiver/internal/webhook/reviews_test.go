@@ -235,8 +235,8 @@ func TestListReviews_KubeError(t *testing.T) {
 	})
 
 	h := &Handler{
-		cfg: Config{TargetNamespace: "dev-tools"},
-		kube: client,
+		cfg:    Config{TargetNamespace: "dev-tools"},
+		kube:   client,
 		logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
 	}
 	req := httptest.NewRequest("GET", "/api/reviews", nil)

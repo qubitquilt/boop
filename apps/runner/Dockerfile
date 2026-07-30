@@ -18,8 +18,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY package.json ./
-RUN npm install --os=linux --cpu=arm64
+# Copy both manifest and lockfile so `npm ci` can resolve the
+# exact versions the repo tested against. Without the lockfile
+# `npm ci` refuses to run; using `npm install` instead would let
+# a new caret-range patch drift the opencode-ai precompiled
+# binary on every build (H4 in the security review).
+COPY package.json package-lock.json ./
+RUN npm ci --os=linux --cpu=arm64
 
 # Symlink the opencode binary into /usr/local/bin so the runner can
 # find it (it shells out to `opencode run` under the hood).

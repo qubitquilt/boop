@@ -43,7 +43,7 @@ func main() {
 	cfg := webhook.Config{
 		Port:            getenv("PORT", "8080"),
 		WebhookSecret:   os.Getenv("WEBHOOK_SECRET"),
-		JobImage:        getenv("JOB_IMAGE", "ghcr.io/michaelruelas/boop-runner:latest"),
+		JobImage:        getenv("JOB_IMAGE", "ghcr.io/qubitquilt/boop-runner:stable"),
 		TargetNamespace: getenv("TARGET_NAMESPACE", "dev-tools"),
 		BotLogin:        os.Getenv("BOT_LOGIN"), // optional; if empty, the receiver ignores all issue_comment events with sender == self check
 	}
