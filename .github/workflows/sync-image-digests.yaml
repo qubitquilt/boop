@@ -36,6 +36,10 @@ permissions:
   packages: read
   pull-requests: write
 
+concurrency:
+  group: sync-image-digests
+  cancel-in-progress: true
+
 jobs:
   sync:
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
@@ -136,6 +140,12 @@ jobs:
           set -euo pipefail
           if git diff --quiet apps/k8s/overlays/pugquilt/kustomization.yaml apps/k8s/base/config.yaml; then
             echo "No digest changes; nothing to do."
+            exit 0
+          fi
+
+          EXISTING="$(gh pr list --label skip-review --state open --json number --jq '.[0].number // empty')"
+          if [ -n "${EXISTING}" ]; then
+            echo "Open digest PR #${EXISTING} already exists; skipping."
             exit 0
           fi
 
