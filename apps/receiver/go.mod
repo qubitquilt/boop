@@ -1,11 +1,11 @@
 module github.com/michaelruelas/boop-receiver
 
-go 1.23
+go 1.25.0
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-github/v68 v68.0.0
-	golang.org/x/time v0.3.0
+	golang.org/x/time v0.15.0
 	k8s.io/api v0.31.2
 	k8s.io/apimachinery v0.31.2
 	k8s.io/client-go v0.31.2
