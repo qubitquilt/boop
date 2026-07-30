@@ -48,3 +48,27 @@ func TestIsBoopReviewSummary(t *testing.T) {
 		}
 	}
 }
+
+func TestExtractPriorReviewSHA(t *testing.T) {
+	const fullSHA = "87bcc09abcdef0123456789abcdef0123456789" // 40 hex chars
+	// Full 40-char SHA (what the runner emits today).
+	body := ReviewSummaryHeader(2) + "\n\nbody\n\n" +
+		"<sub>Posted by BoopPr · PR `87bcc09` · review #2 · good boy powered</sub>\n" +
+		"<!-- boop-head-sha: " + fullSHA + " -->"
+	if got := extractPriorReviewSHA(body); got != fullSHA {
+		t.Errorf("full-SHA extract = %q, want %q", got, fullSHA)
+	}
+	// Short (7-char) SHA still extracts — older clients may emit this.
+	bodyShort := "## 🐾 Boop's review\n\nbody\n<!-- boop-head-sha: 87bcc09 -->"
+	if got := extractPriorReviewSHA(bodyShort); got != "87bcc09" {
+		t.Errorf("short-SHA extract = %q, want 87bcc09", got)
+	}
+	// No marker present — older summaries, before the marker existed.
+	if got := extractPriorReviewSHA("## 🐾 Boop's review\n\nno marker here"); got != "" {
+		t.Errorf("absent-marker extract = %q, want empty", got)
+	}
+	// Malformed marker (non-hex chars between the colons).
+	if got := extractPriorReviewSHA("## 🐾 Boop's review\n\n<!-- boop-head-sha: not-a-sha -->"); got != "" {
+		t.Errorf("malformed-marker extract = %q, want empty", got)
+	}
+}

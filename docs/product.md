@@ -89,7 +89,7 @@ before merging.]
 
 A footer (added by the runner, not by the skill) reads:
 
-> <sub>Posted by [BoopPr](https://github.com/michaelruelas/homelab-infra) ·
+> <sub>Posted by [BoopPr](https://github.com/qubitquilt/boop) ·
 > PR `a1b2c3d` · review #2 · good boy powered</sub>
 
 ### 3. Inline comments (line-specific)
@@ -158,6 +158,15 @@ is a fresh run. Findings get a new review number (`review #2`,
 - Counts as a new `## 🐾 Boop's re-review #N` summary.
 - Posts its own status comment with a "re-review #N" label.
 - Does not edit or delete prior reviews.
+- Diffs the **delta from the previously reviewed commit**, not the
+  full PR. The receiver pulls the head SHA of the most recent prior
+  Boop summary (a hidden `<!-- boop-head-sha: … -->` marker in the
+  comment footer) and passes it to the runner as `PR_PREVIOUS_HEAD_SHA`.
+  The runner then tells the LLM to `git diff <previous>...<head>` so
+  it reviews only what changed since the last review — no re-reviewing
+  lines the author already addressed. Summaries posted before this
+  feature shipped carry no marker, so the first re-review after
+  upgrade still diffs vs the base ref; subsequent ones get the delta.
 - Is deduped at the head-SHA level — pushing the same SHA twice
   (`@BoopPr review` on a SHA that already has a `succeeded` Job) gets a
   short "Already sniffed `a1b2c3d`" reply instead of a new run.

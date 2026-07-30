@@ -179,6 +179,9 @@ rollouts.
    `## 🐾 Boop's review` summary appears with findings and inline
    comments.
 4. Push another commit. The status label should be `re-review #2`.
+   The summary should review only the diff from the previous head
+   (look for the `Previous review head SHA: …` line in the opencode
+   logs), not the full `main..<head>` range.
 5. Comment `@BoopPr review` on a third push. The status should show
    `Triggered by @<your-handle>`.
 6. Comment `@BoopPr review` again on the same head SHA. The runner

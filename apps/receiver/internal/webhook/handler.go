@@ -155,11 +155,12 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 	if claimed, _ := h.claimJobSlot(ctx, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, w); !claimed {
 		return
 	}
-	reviewNumber, err := h.computeReviewNumber(ctx, client, pr.Owner, pr.Repo, pr.Number)
+	reviewNumber, previousHeadSHA, err := h.computeReviewNumber(ctx, client, pr.Owner, pr.Repo, pr.Number)
 	if err != nil {
 		h.logger.Warn("count prior reviews", "delivery", delivery, "err", err)
 		// Non-fatal — fall back to 1; the runner still runs.
 		reviewNumber = 1
+		previousHeadSHA = ""
 	}
 	// No trigger comment to react to for plain PR events. Post a fresh
 	// status comment and pass its id to the Job.
@@ -168,7 +169,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
 		// Non-fatal — the Job still runs.
 	}
-	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("pull_request.%s", pr.Action), 0, statusID, installationID, reviewNumber)
+	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("pull_request.%s", pr.Action), 0, statusID, installationID, reviewNumber)
 }
 
 func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter, delivery string, installationID int64, body []byte) {
@@ -224,10 +225,11 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		h.logger.Warn("add reaction", "delivery", delivery, "err", err)
 	}
 
-	reviewNumber, err := h.computeReviewNumber(ctx, client, ic.Owner, ic.Repo, pr.Number)
+	reviewNumber, previousHeadSHA, err := h.computeReviewNumber(ctx, client, ic.Owner, ic.Repo, pr.Number)
 	if err != nil {
 		h.logger.Warn("count prior reviews", "delivery", delivery, "err", err)
 		reviewNumber = 1
+		previousHeadSHA = ""
 	}
 
 	// Post a status comment the runner will PATCH as it progresses.
@@ -236,19 +238,22 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
 	}
 
-	h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, statusID, installationID, reviewNumber)
+	h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, statusID, installationID, reviewNumber)
 }
 
 // computeReviewNumber returns the 1-based index of the review this
-// run will produce. Counts existing Boop summary comments on the PR
-// and adds one. Falls back to 1 on error so a transient GitHub
-// hiccup never blocks a review.
-func (h *Handler) computeReviewNumber(ctx context.Context, client *boopgithub.Client, owner, repo string, number int) (int, error) {
-	n, err := client.CountPriorReviews(ctx, owner, repo, number)
+// run will produce, plus the head SHA of the most recent prior Boop
+// summary (empty if no marker was found). The next run labels
+// itself #N and — when previousHeadSHA is set — diffs only the delta
+// from that commit instead of the full main..head range. Falls
+// back to (1, "", nil) on error so a transient GitHub hiccup never
+// blocks a review.
+func (h *Handler) computeReviewNumber(ctx context.Context, client *boopgithub.Client, owner, repo string, number int) (int, string, error) {
+	n, lastSHA, err := client.CountPriorReviews(ctx, owner, repo, number)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return n + 1, nil
+	return n + 1, lastSHA, nil
 }
 
 // Status stages used in renderStatusBody. The runner can refer to the
@@ -370,7 +375,7 @@ func duplicateReviewReply(status, headSHA string) string {
 	}
 }
 
-func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, reason string, reactionCommentID, statusCommentID, installationID int64, reviewNumber int) {
+func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID, installationID int64, reviewNumber int) {
 	jobName := buildJobName(owner, repo, number, headSHA)
 
 	job, err := renderJobTemplate(jobTemplate, templateVars{
@@ -380,6 +385,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		SHA:               headSHA,
 		SHA7:              shortSHA(headSHA),
 		BaseRef:           baseRef,
+		PreviousHeadSHA:   previousHeadSHA,
 		Image:             h.cfg.JobImage,
 		StatusCommentID:   fmt.Sprintf("%d", statusCommentID),
 		ReactionCommentID: fmt.Sprintf("%d", reactionCommentID),
@@ -403,6 +409,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		"job", jobName,
 		"pr", fmt.Sprintf("%s/%s#%d", owner, repo, number),
 		"sha", headSHA,
+		"previous_head_sha", previousHeadSHA,
 		"reason", reason,
 		"installation_id", installationID,
 		"status_comment_id", statusCommentID,
@@ -419,6 +426,7 @@ type templateVars struct {
 	SHA               string
 	SHA7              string
 	BaseRef           string
+	PreviousHeadSHA   string // head SHA of the most recent prior Boop summary; empty on first review
 	Image             string
 	StatusCommentID   string // GitHub comment id for live status updates (empty if none)
 	ReactionCommentID string // GitHub comment id that received the trigger reaction (empty if none)
@@ -435,6 +443,7 @@ func renderJobTemplate(tpl string, v templateVars) (*batchv1.Job, error) {
 		{"__SHA__", v.SHA},
 		{"__SHA7__", v.SHA7},
 		{"__BASE_REF__", v.BaseRef},
+		{"__PREVIOUS_HEAD_SHA__", v.PreviousHeadSHA},
 		{"__IMAGE__", v.Image},
 		{"__STATUS_COMMENT_ID__", v.StatusCommentID},
 		{"__REACTION_COMMENT_ID__", v.ReactionCommentID},

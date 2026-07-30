@@ -59,6 +59,7 @@ Required env vars (provided by the Job template, see [receiver.md](./receiver.md
 | `PR_NUMBER` | Job template | PR number (string) |
 | `PR_HEAD_SHA` | Job template | Head SHA to check out |
 | `PR_BASE_REF` | Job template | Base ref (e.g. `main`) for the diff context |
+| `PR_PREVIOUS_HEAD_SHA` | Job template | Head SHA of the most recent prior Boop summary; empty on first review. When set, the prompt tells the LLM to diff `PREVIOUS_HEAD_SHA...HEAD_SHA` instead of `BASE...HEAD`. |
 | `OPENROUTER_API_KEY` | `boop-secrets` | LLM API key |
 | `BOOP_STATUS_COMMENT_ID` | Job template | Status comment to PATCH (empty if none; runner falls back to posting fresh) |
 | `BOOP_REACTION_COMMENT_ID` | Job template | Comment to react on failure (usually the trigger comment) |
