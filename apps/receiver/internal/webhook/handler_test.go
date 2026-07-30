@@ -30,6 +30,71 @@ func TestParseInstallationID(t *testing.T) {
 	}
 }
 
+func TestResolveInstallationID(t *testing.T) {
+	cases := []struct {
+		name      string
+		headerVal string
+		body      string
+		want      int64
+		wantErr   bool
+	}{
+		{
+			name:      "header wins when valid",
+			headerVal: "42",
+			body:      `{"installation":{"id":999}}`,
+			want:      42,
+		},
+		{
+			name:      "falls back to payload when header missing",
+			headerVal: "",
+			body:      `{"installation":{"id":7777}}`,
+			want:      7777,
+		},
+		{
+			name:      "falls back to payload when header is invalid",
+			headerVal: "not-a-number",
+			body:      `{"installation":{"id":1234}}`,
+			want:      1234,
+		},
+		{
+			name:      "errors when payload has no installation",
+			headerVal: "",
+			body:      `{"action":"opened"}`,
+			wantErr:   true,
+		},
+		{
+			name:      "errors when body is malformed and header missing",
+			headerVal: "",
+			body:      `{`,
+			wantErr:   true,
+		},
+		{
+			name:      "errors when both are missing",
+			headerVal: "",
+			body:      `{}`,
+			wantErr:   true,
+		},
+		{
+			name:      "errors when installation.id is zero",
+			headerVal: "",
+			body:      `{"installation":{"id":0}}`,
+			wantErr:   true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := resolveInstallationID(c.headerVal, []byte(c.body))
+			if (err != nil) != c.wantErr {
+				t.Errorf("resolveInstallationID(%q, %q) err = %v, wantErr = %v", c.headerVal, c.body, err, c.wantErr)
+				return
+			}
+			if !c.wantErr && got != c.want {
+				t.Errorf("resolveInstallationID(%q, %q) = %d, want %d", c.headerVal, c.body, got, c.want)
+			}
+		})
+	}
+}
+
 func TestBuildJobName(t *testing.T) {
 	got := buildJobName("michaelruelas", "homelab-infra", 42, "abc1234567890def")
 	want := "boop-michaelruelas-homelab-infra-42-abc1234"

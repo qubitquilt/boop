@@ -118,9 +118,9 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	installationID, err := parseInstallationID(r.Header.Get("X-GitHub-Installation-ID"))
+	installationID, err := resolveInstallationID(r.Header.Get("X-GitHub-Installation-ID"), body)
 	if err != nil {
-		h.logger.Warn("invalid installation header", "delivery", deliveryID, "err", err)
+		h.logger.Warn("invalid installation id", "delivery", deliveryID, "err", err)
 		http.Error(w, "invalid installation id", http.StatusBadRequest)
 		return
 	}
@@ -462,8 +462,7 @@ type prMeta struct {
 
 // parseInstallationID reads the X-GitHub-Installation-ID header and
 // returns the installation ID. Returns an error if the header is
-// missing or unparseable — the receiver must not act on a webhook
-// without knowing which installation fired it.
+// missing or unparseable.
 func parseInstallationID(s string) (int64, error) {
 	if s == "" {
 		return 0, errors.New("X-GitHub-Installation-ID header missing")
@@ -476,6 +475,27 @@ func parseInstallationID(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid X-GitHub-Installation-ID %q: must be positive", s)
 	}
 	return id, nil
+}
+
+// resolveInstallationID returns the installation ID for a webhook delivery.
+// Tries the X-GitHub-Installation-ID header first (a proxy may inject it
+// for routing), then falls back to installation.id in the JSON payload,
+// which is the canonical location for GitHub App webhooks. Returns an
+// error only if neither source is present — the receiver must not act
+// on a webhook without knowing which installation fired it.
+func resolveInstallationID(headerVal string, body []byte) (int64, error) {
+	if id, err := parseInstallationID(headerVal); err == nil {
+		return id, nil
+	}
+	var probe struct {
+		Installation *struct {
+			ID int64 `json:"id"`
+		} `json:"installation"`
+	}
+	if err := json.Unmarshal(body, &probe); err == nil && probe.Installation != nil && probe.Installation.ID > 0 {
+		return probe.Installation.ID, nil
+	}
+	return 0, errors.New("installation id not present in header or payload")
 }
 
 func parsePullRequest(body []byte) (prMeta, error) {

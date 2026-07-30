@@ -11,8 +11,9 @@ import (
 )
 
 // AppConfig holds the static credentials of the GitHub App. The
-// installation is identified per-webhook from the
-// X-GitHub-Installation-ID header; it is NOT pinned here.
+// installation is identified per-webhook, first from the
+// X-GitHub-Installation-ID header (if a proxy injects it) and then
+// from installation.id in the JSON payload; it is NOT pinned here.
 type AppConfig struct {
 	AppID      int64
 	PrivateKey *rsa.PrivateKey

@@ -1,8 +1,9 @@
 # This template is rendered by the boop-receiver at webhook time.
 # The receiver substitutes __OWNER__, __REPO__, __NUMBER__, __SHA__, __BASE_REF__,
 # __REVIEW_NUMBER__, __INSTALLATION_ID__ with values from the webhook payload
-# (the installation id is taken from the X-GitHub-Installation-ID header), then
-# submits it as a Job. It is NOT applied directly by ArgoCD.
+# (the installation id is resolved from the X-GitHub-Installation-ID header
+# if present, otherwise from installation.id in the payload), then submits
+# it as a Job. It is NOT applied directly by ArgoCD.
 ---
 apiVersion: batch/v1
 kind: Job
