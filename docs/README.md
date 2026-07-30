@@ -18,7 +18,7 @@ GitHub App "BoopPr"
 │  - HMAC verify   │                 │  - clone PR      │
 │  - filter events │                 │  - run boop skill│
 │  - dedupe by SHA │                 │  - parse output  │
-│  - post 👀       │                 │  - post summary  │
+│  - post 🐾       │                 │  - post summary  │
 │  - submit Job    │                 │  - post inlines  │
 └──────────────────┘                 └──────────────────┘
         │                                     │
@@ -27,8 +27,8 @@ GitHub App "BoopPr"
                                           OpenRouter (LLM)
 ```
 
-A reviewer (or the system) opens a PR. Within seconds BoopPr posts a 👀
-"reviewing this PR…" comment. 1-3 minutes later, a summary comment with the
+A reviewer (or the system) opens a PR. Within seconds BoopPr posts a 🐾
+"Boop's on the case!" status comment. 1-3 minutes later, a summary comment with the
 findings table arrives, followed by 0-8 line-specific inline comments pinned
 to the diff. A final status update marks the run ✅ or ❌.
 

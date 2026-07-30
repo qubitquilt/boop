@@ -22,7 +22,7 @@ End-to-end view of how a webhook becomes a PR review.
 │  - HMAC verify   │                │  - clone PR  │
 │  - filter events │                │  - run skill │
 │  - dedupe by SHA │                │  - post 📝   │
-│  - post 👀       │                │  - post 📌   │
+│  - post 🐾       │                │  - post 📌   │
 │  - mint comments │                │              │
 └────────▲─────────┘                └───────▲──────┘
          │                                  │
@@ -106,19 +106,19 @@ See [skills.md](./skills.md).
 T+0s   GitHub delivers a pull_request webhook to /webhook
 T+0s   Receiver verifies X-Hub-Signature-256 (HMAC-SHA256, constant-time)
 T+0s   Receiver parses, filters, dedupes by Job name (= head SHA)
-T+0s   Receiver posts 👀 status comment (and PATCHes in trigger attribution
+T+0s   Receiver posts 🐾 status comment (and PATCHes in trigger attribution
        + review label for issue_comment triggers)
 T+0s   Receiver renders Job template, submits Job
 T+1s   Job pod starts; runner mints installation token
-T+1s   runner PATCHes status → 🔐 authenticated
+T+1s   runner PATCHes status → 🤝 paw-shaken in
 T+2s   runner clones PR (`git clone --depth 50` + `fetch --depth 200`)
-T+5s   runner PATCHes status → 📥 fetched
+T+5s   runner PATCHes status → 🥎 fetched
 T+5s   runner builds prompt (orchestrator + 7 lenses inlined) and calls
        `opencode run` (with PTY via `script -qfc`)
-T+5s   runner PATCHes status → 🧠 reviewing
+T+5s   runner PATCHes status → 👃 sniffing
 T+60s..120s   opencode returns; runner strips ANSI, parses output
-T+60s..120s   runner PATCHes status → ✅ review in (after summary + inlines)
-T+fail   on any error: PATCH status → ❌ distracted (with details)
+T+60s..120s   runner PATCHes status → 💤 napped (after summary + inlines)
+T+fail   on any error: PATCH status → 🔄 chased tail (with details)
 ```
 
 Total wall-clock for a typical PR: 1-3 minutes. Dominated by the LLM

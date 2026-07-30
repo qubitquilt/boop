@@ -150,8 +150,8 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 	}
 	client := h.ghClient.ClientFor(installationID)
 	// Check for duplicate before posting a status comment — otherwise a
-	// re-delivery of the same head SHA leaves a stranded "👀" comment
-	// that no runner will update.
+	// re-delivery of the same head SHA leaves a stranded "🐾" status
+	// comment that no runner will update.
 	if claimed, _ := h.claimJobSlot(ctx, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, w); !claimed {
 		return
 	}
@@ -210,7 +210,8 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 
 	// Check for duplicate (active or succeeded) before reacting or
 	// posting a status comment — otherwise a same-SHA `@BoopPr review`
-	// leaves 👀 / a stranded "reviewing..." comment with no runner.
+	// leaves a stranded 👀 reaction / "Boop's on the case!" status
+	// comment with no runner to update it.
 	claimed, dupeStatus := h.claimJobSlot(ctx, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, w)
 	if !claimed {
 		if dupeStatus == "active" || dupeStatus == "succeeded" {
@@ -290,17 +291,17 @@ func renderStatusBody(stage, sha, by string, reviewNumber int) string {
 	}
 	switch stage {
 	case StatusInitial:
-		return fmt.Sprintf("👀 **boop is reviewing this PR...** (%s)\n\n%sLast commit: `%s`. Updates will appear here.\n\n%s", reviewLabel, byLine, short, statusTimelineSep)
+		return fmt.Sprintf("🐾 **Boop's on the case!** (%s)\n\n%sLast commit: `%s`. Digging in now — updates will appear here.\n\n%s", reviewLabel, byLine, short, statusTimelineSep)
 	case StatusAuth:
-		return fmt.Sprintf("🔐 **boop is reviewing this PR** — authenticated with GitHub. (%s)\n\n%sLast commit: `%s`.", reviewLabel, byLine, short)
+		return fmt.Sprintf("🤝 **Paw-shaken in** — authenticated with GitHub. (%s)\n\n%sLast commit: `%s`.", reviewLabel, byLine, short)
 	case StatusClone:
-		return fmt.Sprintf("📥 **boop is reviewing this PR** — cloned the repo at `%s`. (%s)\n\n%sChecking out the PR head and starting the multi-lens review.", short, reviewLabel, byLine)
+		return fmt.Sprintf("🥎 **Boop fetched the repo** at `%s`. (%s)\n\n%sTrotting to the PR head and starting the multi-lens review.", short, reviewLabel, byLine)
 	case StatusReview:
-		return fmt.Sprintf("🧠 **boop is reviewing this PR** — running the multi-lens review (boop skill) on `%s`. (%s)", short, reviewLabel)
+		return fmt.Sprintf("👃 **Boop is sniffing** — running the multi-lens review on `%s`. (%s)", short, reviewLabel)
 	case StatusDone:
-		return fmt.Sprintf("✅ **boop %s complete.** See the review comment below.", reviewLabel)
+		return "💤 **Boop napped.** See the comment below."
 	case StatusFailed:
-		return fmt.Sprintf("❌ **boop %s failed.** Check the Job logs for details.", reviewLabel)
+		return fmt.Sprintf("🔄 **Boop chased his tail.** Check the Job logs for details. (%s)", reviewLabel)
 	}
 	return fmt.Sprintf("boop status: %s", stage)
 }

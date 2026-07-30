@@ -236,7 +236,7 @@ text:
 7. Same opener three times in a row? Vary it.
 8. Any "definitely will break" or "guaranteed to fail"? Soften to
    "probably."
-9. Any 🐾 / 🧠 / ✅ / 👃 emoji in a comment body? Strip it.
+9. Any 🐾 / 🤝 / 🥎 / 👃 / 🔄 / 💤 emoji in a comment body? Strip it.
 10. Any "this violates X" / "this is an antipattern" / "this is wrong"?
     Rewrite as an observation about the code.
 

@@ -30,23 +30,23 @@ A typical review produces three things on the PR's conversation tab, in order:
 Posted up front by the receiver. PATCHed by the runner at each stage. Looks
 like:
 
-> 👀 **boop is reviewing this PR...** (review)
+> 🐾 **Boop's on the case!** (review)
 >
-> Last commit: `a1b2c3d`. Updates will appear here.
+> Last commit: `a1b2c3d`. Digging in now — updates will appear here.
 >
 > <!-- boop-timeline -->
-> - 🔐 authenticated
-> - 📥 fetched
-> - 🧠 reviewing
-> - ✅ review in
+> - 🤝 paw-shaken in
+> - 🥎 fetched
+> - 👃 sniffing
+> - 💤 napped
 
 A re-review (second-or-later run on the same PR) shows up as:
 
-> 👀 **boop is reviewing this PR...** (re-review #2)
+> 🐾 **Boop's on the case!** (re-review #2)
 >
 > Triggered by @alice
 >
-> Last commit: `d4e5f6a`. Updates will appear here.
+> Last commit: `d4e5f6a`. Sniffing now — updates will appear here.
 
 The header carries the review label so users can tell at a glance which
 run produced which comments. Each re-review gets its own status thread.
@@ -217,10 +217,12 @@ you review this`, `@BoopPr re-review`, `@BoopPr to review`.
 
 ## If something goes wrong
 
-- **No 👀 comment appeared.** Boop is not installed, the webhook is
-  misconfigured, or the receiver is down. Check the receiver logs.
-- **👀 but no review.** The Job is queued, running, or failed. Read the
-  Job's pod logs (`kubectl logs -n dev-tools -l app=boop,pr-number=N`).
+- **No 🐾 status comment appeared.** Boop is not installed, the
+  webhook is misconfigured, or the receiver is down. Check the
+  receiver logs.
+- **🐾 status but no review.** The Job is queued, running, or failed.
+  Read the Job's pod logs
+  (`kubectl logs -n dev-tools -l app=boop,pr-number=N`).
 - **Review is wrong / overclaims / rude.** File an issue. The voice
   contract and tier definitions in
   [`apps/k8s/base/runner-config/skills/boop/SKILL.md`](../apps/k8s/base/runner-config/skills/boop/SKILL.md)

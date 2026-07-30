@@ -26,9 +26,9 @@ Body is read up to 1 MiB (`1<<20`); over that → 400.
 
 | Event | Action filter | Effect |
 |---|---|---|
-| `pull_request` | `opened`, `reopened`, `synchronize`, `ready_for_review` | Submit a Job, post 👀 |
+| `pull_request` | `opened`, `reopened`, `synchronize`, `ready_for_review` | Submit a Job, post 🐾 |
 | `pull_request` | any other (`closed`, `edited`, `assigned`, `labeled`, `unlabeled`, `review_requested`, `review_request_removed`, …) | Ack `ignored`, no Job |
-| `issue_comment` | `created` on a PR (`issue.pull_request` set) + comment body matches the request grammar | Submit a Job, react 👀, post 👀 |
+| `issue_comment` | `created` on a PR (`issue.pull_request` set) + comment body matches the request grammar | Submit a Job, react 👀, post 🐾 |
 | `issue_comment` | `created` on a plain issue | Ack `ignored` |
 | `issue_comment` | `created` from a sender matching `BOT_LOGIN` (when set) | Ack `ignored` (self-mention) |
 | `issue_comment` | `created` on a PR but body does not match the request grammar | Ack `ignored` |
@@ -110,7 +110,7 @@ head":
 | failed | Delete the failed Job (background propagation), submit a new one. |
 
 This runs **before** any external side effect (status comment, reaction,
-PR reply) so a duplicate delivery cannot leave stranded 👀 emojis or
+PR reply) so a duplicate delivery cannot leave stranded 🐾 comments or
 orphaned status threads.
 
 ## Status thread
@@ -118,9 +118,9 @@ orphaned status threads.
 The receiver pre-creates the status comment with a header that encodes
 who triggered and which review this is:
 
-> 👀 **boop is reviewing this PR...** (review)
+> 🐾 **Boop's on the case!** (review)
 >
-> Last commit: `a1b2c3d`. Updates will appear here.
+> Last commit: `a1b2c3d`. Sniffing now — updates will appear here.
 >
 > <!-- boop-timeline -->
 
@@ -137,15 +137,15 @@ Stages and emojis (must match across receiver and runner):
 
 | Stage | Emoji | Short label | Source of body |
 |---|---|---|---|
-| `auth` | 🔐 | `🔐 authenticated` | receiver `renderStatusBody(StatusAuth, …)` |
-| `clone` | 📥 | `📥 fetched` | receiver `renderStatusBody(StatusClone, …)` |
-| `review` | 🧠 | `🧠 reviewing` | receiver `renderStatusBody(StatusReview, …)` |
-| `done` | ✅ | `✅ review in` | runner `STATUS.done` (PATCH after summary posted) |
-| `failed` | ❌ | `❌ distracted` | runner `STATUS.failed` (with a `<details>` block carrying the error tail) |
+| `auth` | 🤝 | `🤝 paw-shaken in` | receiver `renderStatusBody(StatusAuth, …)` |
+| `clone` | 🥎 | `🥎 fetched` | receiver `renderStatusBody(StatusClone, …)` |
+| `review` | 👃 | `👃 sniffing` | receiver `renderStatusBody(StatusReview, …)` |
+| `done` | 💤 | `💤 napped` | runner `STATUS.done` (PATCH after summary posted) |
+| `failed` | 🔄 | `🔄 chased tail` | runner `STATUS.failed` (with a `<details>` block carrying the error tail) |
 
 The receiver's `StatusInitial` is the body the comment is created with
 (no timeline yet). The runner's first PATCH (`auth`) appends
-`- 🔐 authenticated` after the separator. The final PATCH (`done` or
+`- 🤝 paw-shaken in` after the separator. The final PATCH (`done` or
 `failed`) appends the closing stage.
 
 Body trim: the runner keeps the combined body under 60 KB. If the
@@ -251,8 +251,8 @@ Rules:
 
 If `BOT_LOGIN` is set in the receiver's env, `issue_comment` events
 from a sender matching that login are dropped at the receiver. This
-prevents Boop reacting to its own 👀 comment when a human (or the
-runner, via Octokit) posts back to the PR.
+prevents Boop reacting to its own 🐾 status comment when a human (or
+the runner, via Octokit) posts back to the PR.
 
 Default `BOT_LOGIN` in `apps/k8s/base/deployment.yaml` is `BoopPr[bot]`,
 the GitHub App's bot identity.

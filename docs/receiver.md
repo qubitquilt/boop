@@ -11,7 +11,7 @@ See also: [README](../apps/receiver/README.md), [architecture](./architecture.md
 2. Filter to `pull_request` events with reviewable actions and to
    `issue_comment` events that ask for a review with `@BoopPr review`.
 3. Dedupe by head SHA — re-deliveries for the same head are no-ops.
-4. Post a 👀 status comment on the PR (PATCHed later by the runner).
+4. Post a 🐾 status comment on the PR (PATCHed later by the runner).
 5. Submit a K8s Job that runs `boop-runner` against the PR head.
 6. Number every review (`#1`, `#2`, …) so re-reviews get their own header
    instead of rewriting the original.

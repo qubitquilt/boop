@@ -53,23 +53,23 @@ const OPENCODE_TIMEOUT_MS = 25 * 60 * 1000;
 // Status stages. The receiver uses the same vocabulary so the user
 // can correlate GitHub comment updates with runner log lines.
 const STATUS = {
-  initial: "🐾 **Boop is on the case!** Sniffing through this PR at `{sha}`. Updates will appear here.",
-  auth: "🔐 **Boop has arrived** — authenticated with GitHub at `{sha}`.",
-  clone: "📥 **Boop fetched the repo** at `{sha}`. Checking out the PR head and starting the multi-lens review.",
-  review: "🧠 **Boop is reviewing** — running the multi-lens review on `{sha}`.",
-  done: "✅ **Boop's review is in.** See the comment below.",
-  failed: "❌ **Boop got distracted.** Check the Job logs for details.",
+  initial: "🐾 **Boop's on the case!** Digging in at `{sha}`. Updates will appear here.",
+  auth: "🤝 **Paw-shaken in** — authenticated with GitHub at `{sha}`.",
+  clone: "🥎 **Boop fetched the repo** at `{sha}`. Checking out the PR head and starting the multi-lens review.",
+  review: "👃 **Boop is sniffing** — running the multi-lens review on `{sha}`.",
+  done: "💤 **Boop napped.** See the comment below.",
+  failed: "🔄 **Boop chased his tail.** Check the Job logs for details.",
 };
 
 
 // Short labels used in the timeline. The header above always
 // shows the full state; the timeline is a one-line-per-stage log.
 const SHORT = {
-  auth: "🔐 authenticated",
-  clone: "📥 fetched",
-  review: "🧠 reviewing",
-  done: "✅ review in",
-  failed: "❌ distracted",
+  auth: "🤝 paw-shaken in",
+  clone: "🥎 fetched",
+  review: "👃 sniffing",
+  done: "💤 napped",
+  failed: "🔄 chased tail",
 };
 function shortSha(s) {
   return s && s.length >= 7 ? s.slice(0, 7) : (s || "");

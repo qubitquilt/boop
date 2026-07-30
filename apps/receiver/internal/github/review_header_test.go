@@ -35,7 +35,7 @@ func TestIsBoopReviewSummary(t *testing.T) {
 		{"## 🐾 Boop's re-review\n\nold form without number", true},
 		{"##  🐾  Boop's review\n\nextra spaces", true},
 		// Non-summaries must not count (status threads, quotes, wrong level).
-		{"👀 **boop is reviewing this PR...** (re-review #2)", false},
+		{"🐾 **Boop's on the case!** (re-review #2)", false},
 		{"> ## 🐾 Boop's review\n\nquoted", false},
 		{"# 🐾 Boop's review", false},
 		{"## 🐾 Boop’s review", false}, // curly apostrophe

@@ -5,6 +5,43 @@ import (
 	"testing"
 )
 
+// TestRenderStatusBody locks the initial status comment template the
+// receiver posts before the runner takes over. The runner's PATCH path
+// depends on the rendered body containing `<!-- boop-timeline -->`
+// exactly once and on the (review) / (re-review #N) review label
+// staying inside the parentheses. Voice changes are welcome, but the
+// separator, the commit line, and the label placement must hold.
+func TestRenderStatusBody(t *testing.T) {
+	const sha = "87bcc09abcdef0123456789abcdef0123456789"
+	body := renderStatusBody(StatusInitial, sha, "", 1)
+	if !strings.HasPrefix(body, "🐾 **Boop's on the case!** (review)") {
+		t.Errorf("initial header = %q, want 🐾 **Boop's on the case!** (review) prefix", body)
+	}
+	if !strings.Contains(body, "Last commit: `87bcc09`") {
+		t.Errorf("initial body missing short SHA line: %q", body)
+	}
+	if strings.Count(body, statusTimelineSep) != 1 {
+		t.Errorf("initial body must contain %s exactly once, got %d matches: %q", statusTimelineSep, strings.Count(body, statusTimelineSep), body)
+	}
+	// Re-review labels land in the same parentheses slot.
+	body2 := renderStatusBody(StatusInitial, sha, "alice", 3)
+	if !strings.HasPrefix(body2, "🐾 **Boop's on the case!** (re-review #3)") {
+		t.Errorf("re-review header = %q, want re-review #3 prefix", body2)
+	}
+	if !strings.Contains(body2, "Triggered by @alice") {
+		t.Errorf("re-review body missing trigger attribution: %q", body2)
+	}
+	// Done and Failed stages keep the brand mascot and the merge signal.
+	done := renderStatusBody(StatusDone, sha, "", 2)
+	if !strings.Contains(done, "💤 **Boop napped") || !strings.Contains(done, "See the comment below") {
+		t.Errorf("done body off-brand: %q", done)
+	}
+	failed := renderStatusBody(StatusFailed, sha, "", 1)
+	if !strings.Contains(failed, "🔄 **Boop chased his tail") {
+		t.Errorf("failed body off-brand: %q", failed)
+	}
+}
+
 func TestParseInstallationID(t *testing.T) {
 	cases := []struct {
 		in      string

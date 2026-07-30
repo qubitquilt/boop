@@ -175,7 +175,7 @@ rollouts.
 1. Pick a test PR in the `qubitquilt` org (or any repo the App is
    installed on).
 2. Push a commit to the PR's branch.
-3. Within a few seconds, a 👀 comment appears. Within 1-3 minutes, a
+3. Within a few seconds, a 🐾 status comment appears. Within 1-3 minutes, a
    `## 🐾 Boop's review` summary appears with findings and inline
    comments.
 4. Push another commit. The status label should be `re-review #2`.
