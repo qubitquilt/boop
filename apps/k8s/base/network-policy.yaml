@@ -81,13 +81,13 @@ spec:
         - protocol: TCP
           port: 8080
   egress:
-    - # K8s API. "namespaceSelector: {}" matches every
-      # namespace, which is right — the API server's
-      # endpoint is in the `default` namespace, and the
-      # control plane is reachable through the cluster
-      # service network regardless of namespace.
+    - # K8s API. Both selectors are required: namespaceSelector
+      # covers in-cluster pods; ipBlock covers the host-networked
+      # API server, which no pod selector can match.
       to:
         - namespaceSelector: {}
+        - ipBlock:
+            cidr: 192.168.50.0/24
       ports:
         - protocol: TCP
           port: 443
