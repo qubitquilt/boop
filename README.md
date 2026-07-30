@@ -36,7 +36,7 @@ Full documentation lives in [`docs/`](./docs/README.md):
 - [docs/receiver.md](./docs/receiver.md) — Go webhook receiver (scoped).
 - [docs/runner.md](./docs/runner.md) — Node PR-review worker (scoped).
 - [docs/skills.md](./docs/skills.md) — the boop review skill + seven lenses.
-- [docs/deployment.md](./docs/deployment.md) — K8s overlays, CI, image tags, ArgoCD.
+- [docs/deployment.md](./docs/deployment.md) — K8s overlays, CI, image tags, ArgoCD, release lifecycle.
 - [docs/secrets.md](./docs/secrets.md) — GitHub App + OpenBao wiring.
 - [docs/development.md](./docs/development.md) — local dev, build, test, debug.
 

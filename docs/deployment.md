@@ -23,11 +23,16 @@ push to main / v* tag
 │    boop-receiver:tag       │
 │    boop-runner:tag         │
 └──────────────┬─────────────┘
-               │
-               │ (ArgoCD watches the cluster repo)
+               │ workflow_run (on success)
                ▼
 ┌────────────────────────────┐
-│  ArgoCD Application        │  points at apps/k8s/overlays/<cluster>
+│  sync-image-digests.yaml   │  resolves :stable → sha256:...
+│  opens a PR against main   │  human squash-merges
+└──────────────┬─────────────┘
+               │ git push to main
+               ▼
+┌────────────────────────────┐
+│  ArgoCD Application        │  polls main, syncs the overlay
 │  cluster repo             │
 └──────────────┬─────────────┘
                │
@@ -43,17 +48,149 @@ push to main / v* tag
    └────────────┘
 ```
 
+## Deployment lifecycle
+
+End-to-end, a commit to `main` (or a `v*` tag) becomes a running pod.
+Three systems are involved: GitHub Actions (build + push), a follow-up
+GitHub Action (digest sync via PR), and ArgoCD (apply). Each owns one
+stage of the chain.
+
+### Workflow triggers
+
+| Workflow | Trigger | Pushes image? | Runs when |
+|---|---|---|---|
+| `build-receiver` | `push` to `main` | yes | every commit that touches receiver code |
+| `build-receiver` | `push` to `v*` tag | yes | each release tag |
+| `build-receiver` | `pull_request` to `main` | no | PR builds; fork PRs skipped |
+| `build-runner` | same shape as `build-receiver` | same | scoped to `apps/runner` |
+| `sync-image-digests` | `workflow_run` of either build, on `success` | n/a | runs after every successful build |
+| `sync-image-digests` | `workflow_dispatch` | n/a | manual re-run from the Actions tab |
+
+The two build workflows share a `paths-ignore` list:
+
+- `apps/k8s/overlays/**` — overlay edits do not rebuild the image
+- `.github/workflows/sync-image-digests.yaml` — workflow-file edits do not rebuild the image
+- `docs/**` — doc edits do not rebuild the image
+
+Editing any of those paths alone produces no build. The build step
+also has the guard:
+
+```yaml
+if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+```
+
+Fork PRs cannot use `packages: write`; the guard short-circuits the
+build before `docker login` would fail.
+
+### Main commit: build to rollout
+
+1. Commit lands on `main` (direct push or PR merge).
+2. `build-receiver` and `build-runner` run in parallel on the
+   `boop-runner-set` Actions runner. Each calls
+   `docker/metadata-action` for tags, builds `linux/arm64` with
+   buildx, logs in to `ghcr.io`, and pushes on `push` events. On
+   `pull_request` events, `push: ${{ github.event_name == 'push' }}`
+   is false; the build is local, no push.
+3. On `success`, the `workflow_run` event fires
+   `sync-image-digests`.
+4. `sync-image-digests` calls the GitHub packages API for the
+   current `:stable` digest of each image, rewrites the digest in
+   `apps/k8s/overlays/pugquilt/kustomization.yaml` (receiver) and in
+   the `JOB_IMAGE` field of `apps/k8s/base/config.yaml` (runner).
+5. The workflow opens a PR with the `skip-review` label and tries
+   `--auto --squash`. If auto-merge is enabled, the PR merges
+   itself. If not, a human squash-merges.
+6. The merge commit lands on `main`. ArgoCD's Application is
+   configured with `targetRevision: main` and polls every 3 minutes
+   by default.
+7. ArgoCD sees the digest change in the overlay, syncs the
+   `boop-pugquilt` Application. The Deployment's pod template
+   changes; K8s rolls pods. Old pods terminate; new pods pull the
+   pinned digest and pass readiness probes.
+
+Concurrency: `sync-image-digests` declares
+`concurrency: { group: sync-image-digests, cancel-in-progress: true }`.
+A second build finishing during an in-flight digest sync cancels
+the first. The workflow also checks for an open digest PR before
+opening a new one, so two simultaneous digest PRs cannot stack up.
+
+### Release tag: from `vX.Y.Z` to running
+
+1. Tag and push:
+   ```
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+2. The `push` event matches `tags: ['v*']`. Both build workflows
+   run. `docker/metadata-action` produces:
+   - `:stable`
+   - `:v0.2.0` (from `type=semver,pattern=v{{version}}`)
+   - `:0.2` (from `pattern={{major}}.{{minor}}`)
+   - `:0` (from `pattern={{major}}`)
+   - `:latest`, but only if `v0.2.0` is the highest semver seen
+     (flavor `latest=auto`)
+
+   Lowering `:latest` to a non-head commit never happens; `:latest`
+   is always the most recent semver tag if one exists, otherwise the
+   most recent `main` build.
+3. The same `workflow_run` → `sync-image-digests` chain runs.
+4. The same human merge and ArgoCD rollout.
+
+To release without bumping `:latest` (e.g. a backport), tag it and
+the digest sync still pins the overlay to the new bytes. `:latest`
+keeps pointing at the previous highest semver until a higher one is
+tagged.
+
+### Why a PR for digest sync
+
+The sync workflow could push directly to `main`. It opens a PR
+instead so the repo's "changes must be made through a pull request"
+branch protection rule is satisfied. The squash merge produces a
+commit on `main` signed by the human merger, which satisfies the
+`required_signatures` branch protection rule. The bot's
+intermediate commit on the feature branch is not signed; debugging
+bot-side SSH signing produced inconsistent signatures and was
+abandoned in favor of this flow. The `skip-review` label bypasses
+CODEOWNERS review; the human merger is the only required check.
+
+### Rollback
+
+Two paths, both end with ArgoCD syncing the new git state.
+
+Pin a known-good digest directly:
+
+```
+# Resolve the digest for a known-good tag
+DIGEST=$(docker buildx imagetools inspect ghcr.io/qubitquilt/boop-receiver:v0.1.0 --raw | jq -r .manifests[0].digest)
+
+# Edit apps/k8s/overlays/pugquilt/kustomization.yaml:
+#   - name: ghcr.io/qubitquilt/boop-receiver
+#     digest: $DIGEST
+git commit -am "pin receiver to v0.1.0"
+git push
+# ArgoCD syncs
+```
+
+Pin the runner:
+
+```
+# Edit apps/k8s/base/config.yaml JOB_IMAGE to point at the desired tag
+git commit -am "bump runner to 0.1.0"
+git push
+# ArgoCD syncs; next Job pulls the pinned image
+```
+
+The receiver rolls on the next sync. The runner is consumed on the
+next Job submit (Jobs are not owned by ArgoCD, so there is nothing
+to roll).
+
 ## Image publishing
 
-Two GitHub Actions workflows, one per image. Each:
-
-- Triggers on `push` to `main` or any `v*` tag, and on `pull_request` to
-  `main`.
-- Runs on the `boop-runner-set` Actions runner (Kubernetes driver,
-  buildx-builder namespace, sticky load balance).
-- Builds `linux/arm64` only.
-- On `push` events, computes tags via `docker/metadata-action` and
-  pushes; on `pull_request` events, builds without pushing.
+Two GitHub Actions workflows, one per image. Each runs on the
+`boop-runner-set` Actions runner (Kubernetes driver, `buildx-builder`
+namespace, sticky load balance) and builds `linux/arm64` only. See
+[Deployment lifecycle](#deployment-lifecycle) for the full trigger
+table and the order of operations.
 
 Tags produced (`boop-receiver` and `boop-runner`):
 
@@ -81,7 +218,7 @@ images:
 
 The `sync-image-digests` workflow (`.github/workflows/sync-image-digests.yaml`)
 runs after every successful `build-receiver` or `build-runner` run, queries
-GHCR for the current `:latest` digest of each image, and updates the
+GHCR for the current `:stable` digest of each image, and updates the
 overlay. This is what makes the K8s Deployment roll on a registry-only
 image change: ArgoCD tracks the git manifest, the manifest changes, K8s
 sees a diff in the pod template, the Deployment rolls.
@@ -96,8 +233,8 @@ pin to a known-good build), edit the overlay by hand:
 ```
 
 Or trigger `sync-image-digests` from the Actions tab with
-`workflow_dispatch` — it will resolve whichever tag the GHCR `:latest`
-currently points to.
+`workflow_dispatch` — it will resolve the digest of whichever tag the
+GHCR `:stable` currently points to.
 
 ## Kustomize layout
 
@@ -216,13 +353,27 @@ ServiceAccounts + Role, the Traefik IngressRoute, and the
 
 ## Rollout
 
-Image updates are automatic. Push a commit to `main` (or open a PR
-against it) and the image CI rebuilds the affected image, pushes to
-GHCR, the `sync-image-digests` workflow updates the digest in the
-overlay, ArgoCD syncs, the Deployment rolls.
+The full automated flow is documented in
+[Deployment lifecycle](#deployment-lifecycle). This section covers the
+manual paths: pushing a custom build and pinning by digest.
 
-For a manual rollout (e.g. pinning a specific tag for a hotfix or
-rollback):
+### Pushing a custom build
+
+Build and push from a checkout:
+
+```
+cd apps/receiver
+make docker-build docker-push IMAGE=ghcr.io/qubitquilt/boop-receiver:0.2.0
+cd ../runner
+make docker-build docker-push IMAGE=ghcr.io/qubitquilt/boop-runner:0.2.0
+```
+
+Then either wait for the next digest-sync workflow run, or trigger
+`sync-image-digests` from the Actions tab to pick up the new tags
+immediately. To pin the runner without re-tagging, edit
+`apps/k8s/base/config.yaml` `JOB_IMAGE` to the new tag and push.
+
+### Pinning a specific digest
 
 ```
 DIGEST=$(docker buildx imagetools inspect ghcr.io/qubitquilt/boop-receiver:v0.2.0 --raw | jq -r .manifests[0].digest)
@@ -231,17 +382,6 @@ DIGEST=$(docker buildx imagetools inspect ghcr.io/qubitquilt/boop-receiver:v0.2.
 #     digest: $DIGEST
 git commit -am "pin receiver to v0.2.0"
 git push   # ArgoCD syncs
-```
-
-Runner:
-
-```
-cd apps/runner
-make docker-build docker-push IMAGE=ghcr.io/qubitquilt/boop-runner:0.2.0
-# edit apps/k8s/base/config.yaml JOB_IMAGE to point at the new tag
-# (or override per-cluster)
-git commit -am "bump runner to 0.2.0"
-git push
 ```
 
 The receiver is restarted by the Deployment rollout; the runner image
