@@ -93,6 +93,18 @@ spec:
           port: 443
         - protocol: TCP
           port: 6443
+    - # GitHub API. The receiver mints installation tokens and
+      # fetches PR metadata via api.github.com. Ranges from
+      # https://api.github.com/meta (hooks + api blocks).
+      # Refresh when GitHub publishes new ranges.
+      to:
+        - ipBlock:
+            cidr: 140.82.112.0/20
+        - ipBlock:
+            cidr: 192.30.252.0/22
+      ports:
+        - protocol: TCP
+          port: 443
 ---
 # allow-runner: the review Job (label app=boop) needs to reach
 # three external services:
