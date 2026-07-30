@@ -75,10 +75,10 @@ const OPENCODE_TIMEOUT_MS = 25 * 60 * 1000;
 // `.lock`) are enforced by assertSafeRef itself; the regex
 // catches everything else.
 const safeRefCharsRegex = /^[A-Za-z0-9._/-]+$/;
-// Hex SHA, exactly 7 or 40 chars. Git short SHAs are 7+ hex chars
-// but the receiver always emits a full 40; we accept both forms
-// for compatibility with older comments.
-const safeShaRegex = /^([0-9a-f]{40}|[0-9a-f]{7})$/;
+// Hex SHA, 7 to 40 chars. Mirrors the receiver's
+// validatePreviousHeadSHA so a SHA in the 8-39 char range (legal
+// git short SHAs) does not pass the receiver and fail the runner.
+const safeShaRegex = /^[0-9a-f]{7,40}$/;
 
 // Status stages. The receiver uses the same vocabulary so the user
 // can correlate GitHub comment updates with runner log lines.

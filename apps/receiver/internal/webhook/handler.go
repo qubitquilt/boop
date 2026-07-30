@@ -105,10 +105,13 @@ type Handler struct {
 	limiter *rate.Limiter
 }
 
-// deliveryDedup is a fixed-size LRU keyed by the GitHub delivery
-// ID. Sized for 4096 entries (well above the practical webhook
-// rate for a single repo) so the dedup window covers a couple of
-// hours of re-deliveries at p99 burst.
+// deliveryDedup is a fixed-size FIFO ring keyed by the GitHub
+// delivery ID. Sized for 4096 entries (well above the practical
+// webhook rate for a single repo) so the dedup window covers a
+// couple of hours of re-deliveries at p99 burst. The on-access
+// order is not updated, so a hot entry can be evicted by newer
+// deliveries once the ring fills — acceptable here because
+// re-deliveries from GitHub are time-bounded and bursty.
 type deliveryDedup struct {
 	mu      sync.Mutex
 	max     int

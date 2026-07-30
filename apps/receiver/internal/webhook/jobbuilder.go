@@ -156,6 +156,14 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 	if err := validatePreviousHeadSHA(v.PreviousHeadSHA); err != nil {
 		return nil, err
 	}
+	// Defense-in-depth: the K8s API serialises v.SHA safely today,
+	// but the SHA also lands in the Job name and the runner's
+	// assertSafeSha. Validating here closes the gap so a future
+	// caller that reads the SHA from a less-typed source cannot
+	// bypass the check.
+	if err := validatePreviousHeadSHA(v.SHA); err != nil {
+		return nil, fmt.Errorf("head SHA: %w", err)
+	}
 	number, err := strconv.Atoi(v.Number)
 	if err != nil || number <= 0 {
 		return nil, fmt.Errorf("pr number is not a positive integer: %q", v.Number)

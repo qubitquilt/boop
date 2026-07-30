@@ -45,8 +45,11 @@ func TestDeliveryDedup_EvictsAtCapacity(t *testing.T) {
 	d.seen("d")
 	// 'a' is now evicted; re-seeing it should look like a fresh
 	// delivery. We can't observe the eviction directly without
-	// inspecting internal state, but we can verify the LRU
+	// inspecting internal state, but we can verify the FIFO
 	// contract: 'a' is no longer remembered, 'd' is.
+	if d.seen("a") {
+		t.Errorf("evicted id should report not seen")
+	}
 	if !d.seen("d") {
 		t.Errorf("recently-inserted id should be remembered")
 	}
