@@ -138,6 +138,7 @@ func TestRenderJobTemplate(t *testing.T) {
 		Image:           "ghcr.io/michaelruelas/boop-runner:dev",
 		ReviewNumber:    "2",
 		InstallationID:  "987654",
+		BotLogin:        "booppr[bot]",
 	})
 	if err != nil {
 		t.Fatalf("renderJobTemplate: %v", err)
@@ -152,11 +153,12 @@ func TestRenderJobTemplate(t *testing.T) {
 		t.Errorf("TTLSecondsAfterFinished = %v", got)
 	}
 
-	// BOOP_REVIEW_NUMBER, GITHUB_APP_INSTALLATION_ID, and
-	// PR_PREVIOUS_HEAD_SHA must be wired into the container env so
-	// the runner can label this run and diff only the delta from
-	// the previously reviewed commit.
-	var gotReview, gotInstall, gotPrev string
+	// BOOP_REVIEW_NUMBER, GITHUB_APP_INSTALLATION_ID,
+	// PR_PREVIOUS_HEAD_SHA, and BOOP_BOT_LOGIN must be wired into
+	// the container env. The first three label this run and diff
+	// only the delta; the last lets the runner identify its own
+	// prior comments on a re-review and resolve/minimize them.
+	var gotReview, gotInstall, gotPrev, gotLogin string
 	for _, e := range job.Spec.Template.Spec.Containers[0].Env {
 		if e.Name == "BOOP_REVIEW_NUMBER" {
 			gotReview = e.Value
@@ -167,6 +169,9 @@ func TestRenderJobTemplate(t *testing.T) {
 		if e.Name == "PR_PREVIOUS_HEAD_SHA" {
 			gotPrev = e.Value
 		}
+		if e.Name == "BOOP_BOT_LOGIN" {
+			gotLogin = e.Value
+		}
 	}
 	if gotReview != "2" {
 		t.Errorf("BOOP_REVIEW_NUMBER = %q, want 2", gotReview)
@@ -176,6 +181,9 @@ func TestRenderJobTemplate(t *testing.T) {
 	}
 	if gotPrev != "20cd521abcdef0123456789abcdef0123456789" {
 		t.Errorf("PR_PREVIOUS_HEAD_SHA = %q, want prior SHA", gotPrev)
+	}
+	if gotLogin != "booppr[bot]" {
+		t.Errorf("BOOP_BOT_LOGIN = %q, want booppr[bot]", gotLogin)
 	}
 	// Same value must be on the Job annotation so it's discoverable
 	// for debugging without grepping the env.

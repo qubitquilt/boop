@@ -37,6 +37,7 @@ const {
   BOOP_STATUS_COMMENT_ID,
   BOOP_REACTION_COMMENT_ID,
   BOOP_REVIEW_NUMBER,
+  BOOP_BOT_LOGIN,
 } = process.env;
 
 const REPO_DIR = "/work/repo";
@@ -106,6 +107,7 @@ let statusBy = "";              // who triggered (if known)
 let reactableCommentId = null;  // id of the comment to react on failure
 let reviewNumber = 1;           // 1-based index of this review run
 let previousHeadSHA = null;     // head SHA of the most recent prior Boop summary; null when absent
+let botLogin = null;            // GitHub login of the bot App (e.g. "booppr[bot]"); null disables cleanup
 
 async function main() {
   for (const [name, v] of [
@@ -133,12 +135,14 @@ async function main() {
   if (PR_PREVIOUS_HEAD_SHA && /^[0-9a-f]{7,40}$/.test(PR_PREVIOUS_HEAD_SHA)) {
     previousHeadSHA = PR_PREVIOUS_HEAD_SHA;
   }
+  if (BOOP_BOT_LOGIN) botLogin = BOOP_BOT_LOGIN;
 
   log("start", "boop runner starting", {
     status_comment_id: statusCommentId,
     reaction_comment_id: reactableCommentId,
     review_number: reviewNumber,
     previous_head_sha: previousHeadSHA,
+    bot_login: botLogin,
   });
 
   // Mint installation token first; we need it for the status API too.
@@ -180,6 +184,26 @@ async function main() {
   }
   if (review.inlineComments.length > 0) {
     log("done", `posted ${review.inlineComments.length} inline comments`);
+  }
+
+  // On re-reviews, retire prior Boop artifacts so the PR thread looks
+  // pristine. Best-effort: any error is logged but the review still
+  // completes. Skipped on the first review (nothing to clean) and
+  // when BOOP_BOT_LOGIN is unset (the receiver didn't know the bot
+  // login — most commonly because the App is configured to omit it).
+  if (reviewNumber > 1 && botLogin) {
+    try {
+      const cleaned = await cleanupPriorReview(installationToken);
+      if (cleaned.resolved > 0 || cleaned.minimized > 0) {
+        log("cleanup", "retired prior review artifacts", cleaned);
+      } else {
+        log("cleanup", "no prior artifacts to retire");
+      }
+    } catch (err) {
+      errlog("cleanup", "prior-review cleanup failed", {
+        err: String(err?.message ?? err),
+      });
+    }
   }
 
   await postStatus("done");
@@ -649,6 +673,203 @@ async function postInlineComment(octokit, c) {
     line: c.line,
     side: "RIGHT",
   });
+}
+
+// graphql POSTs a query/mutation to api.github.com/graphql with the
+// installation token and returns the JSON `data` object. Throws on
+// transport errors or top-level GraphQL errors.
+async function graphql(token, query, variables) {
+  const res = await fetch("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      Authorization: `bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "boop-runner",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`graphql HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const json = await res.json();
+  if (json.errors && json.errors.length > 0) {
+    throw new Error(`graphql: ${json.errors.map((e) => e.message).join("; ")}`);
+  }
+  return json.data;
+}
+
+// paginateThreads walks every review thread on the PR, paginating
+// until exhausted. Each returned thread is annotated with the
+// original comment's author login (case-insensitive match).
+async function fetchAllReviewThreads(token) {
+  const threads = [];
+  let cursor = null;
+  const query = `
+    query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          reviewThreads(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              isResolved
+              isOutdated
+              comments(first: 1) {
+                nodes { author { login } }
+              }
+            }
+          }
+        }
+      }
+    }`;
+  while (true) {
+    const data = await graphql(token, query, {
+      owner: PR_OWNER,
+      repo: PR_REPO,
+      number: Number(PR_NUMBER),
+      cursor,
+    });
+    const conn = data?.repository?.pullRequest?.reviewThreads;
+    if (!conn) break;
+    for (const node of conn.nodes) {
+      const author =
+        node?.comments?.nodes?.[0]?.author?.login?.toLowerCase() || "";
+      threads.push({
+        id: node.id,
+        isResolved: node.isResolved === true,
+        isOutdated: node.isOutdated === true,
+        author,
+      });
+    }
+    if (!conn.pageInfo?.hasNextPage) break;
+    cursor = conn.pageInfo.endCursor;
+  }
+  return threads;
+}
+
+// fetchAllIssueCommentIDs walks every issue comment on the PR via
+// the REST API (GraphQL's pullRequest.comments misses some bot
+// comments that were posted via the issue-comments API). Returns
+// the integer IDs of every comment posted by the bot, excluding
+// the current run's status comment.
+async function fetchPriorBotIssueCommentIDs(token) {
+  const ids = [];
+  let page = 1;
+  const url = `https://api.github.com/repos/${PR_OWNER}/${PR_REPO}/issues/${PR_NUMBER}/comments?per_page=100&page=${page}`;
+  const headers = {
+    Authorization: `bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "boop-runner",
+  };
+  while (true) {
+    const res = await fetch(`${url.split("?")[0]}?per_page=100&page=${page}`, { headers });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`list comments HTTP ${res.status}: ${text.slice(0, 200)}`);
+    }
+    const arr = await res.json();
+    if (!Array.isArray(arr) || arr.length === 0) break;
+    for (const c of arr) {
+      const author = c?.user?.login?.toLowerCase() || "";
+      if (author !== botLogin.toLowerCase()) continue;
+      if (statusCommentId && Number(c.id) === statusCommentId) continue;
+      ids.push({ id: Number(c.id), nodeId: c.node_id });
+    }
+    if (arr.length < 100) break;
+    page++;
+  }
+  return ids;
+}
+
+// resolveReviewThread marks one review thread as resolved.
+async function resolveReviewThread(token, threadId) {
+  const data = await graphql(
+    token,
+    `mutation($id: ID!) {
+       resolveReviewThread(input: { threadId: $id }) {
+         thread { id isResolved }
+       }
+     }`,
+    { id: threadId },
+  );
+  return data?.resolveReviewThread?.thread?.isResolved === true;
+}
+
+// minimizeComment collapses a comment in the PR UI. The body
+// stays in the API (so the boop-head-sha marker remains parsable
+// by the receiver's CountPriorReviews) but the comment is hidden
+// by default.
+async function minimizeComment(token, commentNodeId) {
+  const data = await graphql(
+    token,
+    `mutation($id: ID!) {
+       minimizeComment(input: { subjectId: $id, classifier: OUTDATED }) {
+         minimizedComment { isMinimized }
+       }
+     }`,
+    { id: commentNodeId },
+  );
+  return data?.minimizeComment?.minimizedComment?.isMinimized === true;
+}
+
+// cleanupPriorReview runs on re-reviews only. It:
+//   1. Resolves every Boop review thread whose diff line is gone
+//      or changed (isOutdated === true) — the author has either
+//      fixed the issue or removed the code.
+//   2. Minimizes every other prior Boop issue comment (status
+//      threads, prior summary comments) so the PR UI is dominated
+//      by the active review.
+//
+// Best-effort. The review already posted — a cleanup failure is
+// logged but does not fail the run.
+async function cleanupPriorReview(token) {
+  const result = { resolved: 0, minimized: 0, errors: 0 };
+
+  // 1. Resolve outdated bot review threads.
+  const threads = await fetchAllReviewThreads(token);
+  const targets = threads.filter(
+    (t) => !t.isResolved && t.isOutdated && t.author === botLogin.toLowerCase(),
+  );
+  log("cleanup", "scanned review threads", {
+    total: threads.length,
+    bot_outdated: targets.length,
+  });
+  for (const t of targets) {
+    try {
+      if (await resolveReviewThread(token, t.id)) {
+        result.resolved++;
+      }
+    } catch (err) {
+      result.errors++;
+      errlog("cleanup", "resolve failed", {
+        thread: t.id,
+        err: String(err?.message ?? err),
+      });
+    }
+  }
+
+  // 2. Minimize every prior bot issue comment.
+  const priors = await fetchPriorBotIssueCommentIDs(token);
+  log("cleanup", "scanned issue comments", { bot_total: priors.length });
+  for (const c of priors) {
+    try {
+      if (await minimizeComment(token, c.nodeId)) {
+        result.minimized++;
+      }
+    } catch (err) {
+      result.errors++;
+      errlog("cleanup", "minimize failed", {
+        comment: c.id,
+        err: String(err?.message ?? err),
+      });
+    }
+  }
+
+  return result;
 }
 
 main().catch(async (err) => {
