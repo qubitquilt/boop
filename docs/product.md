@@ -170,6 +170,16 @@ is a fresh run. Findings get a new review number (`review #2`,
 - Is deduped at the head-SHA level — pushing the same SHA twice
   (`@BoopPr review` on a SHA that already has a `succeeded` Job) gets a
   short "Already sniffed `a1b2c3d`" reply instead of a new run.
+- Retires prior review artifacts once the new review posts. Every
+  review thread Boop opened on a line that's no longer in the diff
+  (`isOutdated === true`) is auto-resolved, and every other prior
+  Boop issue comment (status threads, prior `## 🐾 Boop's review`
+  summaries) is minimized so the PR UI is dominated by the active
+  review. Bodies are preserved in the API so the `boop-head-sha`
+  marker still drives the next re-review's diff range. Cleanup is
+  best-effort: any error is logged and the review still posts.
+  Requires `BOOP_BOT_LOGIN` to be set on the receiver (same value
+  as `BOT_LOGIN`).
 
 ## How to ask for a re-review
 
