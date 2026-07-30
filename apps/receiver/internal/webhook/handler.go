@@ -86,7 +86,7 @@ type Handler struct {
 	kube     kubernetes.Interface
 	ghClient *boopgithub.Manager
 
-	// dedup is an in-memory LRU keyed by X-GitHub-Delivery
+	// dedup is an in-memory FIFO ring keyed by X-GitHub-Delivery
 	// header. GitHub's webhook deliveries are idempotent (the
 	// same delivery ID represents the same physical event), so
 	// a re-delivery should be a no-op. Without dedup, a transient

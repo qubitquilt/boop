@@ -139,6 +139,20 @@ func validatePreviousHeadSHA(s string) error {
 	return nil
 }
 
+// validateHeadSHA accepts a hex SHA (7-40 chars). Unlike the
+// previous-head SHA, the head SHA is mandatory; an empty string is
+// rejected so a future caller that mishandles a string field does
+// not get a silent green light.
+func validateHeadSHA(s string) error {
+	if s == "" {
+		return fmt.Errorf("head SHA is empty")
+	}
+	if !hexSHAFullRegex.MatchString(s) {
+		return fmt.Errorf("head SHA is not a valid hex SHA: %q", s)
+	}
+	return nil
+}
+
 // buildJob assembles a review Job as a typed batchv1.Job. This
 // replaces the old strings.ReplaceAll + yaml.Unmarshal pattern,
 // which let a PR author break out of a YAML scalar and inject
@@ -160,9 +174,10 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 	// but the SHA also lands in the Job name and the runner's
 	// assertSafeSha. Validating here closes the gap so a future
 	// caller that reads the SHA from a less-typed source cannot
-	// bypass the check.
-	if err := validatePreviousHeadSHA(v.SHA); err != nil {
-		return nil, fmt.Errorf("head SHA: %w", err)
+	// bypass the check. Unlike the previous-head SHA, the head
+	// SHA is mandatory, so an empty string is rejected here.
+	if err := validateHeadSHA(v.SHA); err != nil {
+		return nil, err
 	}
 	number, err := strconv.Atoi(v.Number)
 	if err != nil || number <= 0 {

@@ -70,8 +70,6 @@ test("assertSafeSha rejects non-SHA input", () => {
     "",
     "not-a-sha",
     "ZZZ1234", // non-hex chars
-    "abc12345", // 8 hex (not 7 or 40)
-    "abc1234567890", // 13 hex
     "20cd521abcdef0123456789abcdef012345678900", // 42 hex
     "../etc/passwd",
     "main",

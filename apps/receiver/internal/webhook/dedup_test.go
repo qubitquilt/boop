@@ -166,3 +166,25 @@ func TestValidatePreviousHeadSHA(t *testing.T) {
 	// string is the only allowed blank.
 	_ = time.Now()
 }
+
+func TestValidateHeadSHA(t *testing.T) {
+	good := []string{"abc1234", "87bcc09abcdef0123456789abcdef0123456789a"}
+	for _, in := range good {
+		if err := validateHeadSHA(in); err != nil {
+			t.Errorf("validateHeadSHA(%q) unexpected error: %v", in, err)
+		}
+	}
+	bad := []string{
+		"", // mandatory: empty must be rejected
+		"abc",
+		"not-a-sha",
+		"main",
+		"../etc/passwd",
+		"20cd521abcdef0123456789abcdef012345678900", // 42 hex
+	}
+	for _, in := range bad {
+		if err := validateHeadSHA(in); err == nil {
+			t.Errorf("validateHeadSHA(%q) accepted", in)
+		}
+	}
+}
