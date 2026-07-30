@@ -66,6 +66,16 @@ jobs:
 
           yaml = YAML()
           yaml.preserve_quotes = True
+          # Re-emit the file in the same shape it was committed in:
+          # 2-space mapping indent, 4-space sequence dash, 2-space
+          # content offset. Defaults drop the dashes to column 0
+          # and the inner `digest:` line lands one column too far
+          # left, which produces a multi-line diff on every run.
+          yaml.indent(mapping=2, sequence=4, offset=2)
+          # Preserve the `---` document start marker.
+          yaml.explicit_start = True
+          # Long digests would otherwise wrap onto a new line.
+          yaml.width = 4096
           path = "apps/k8s/overlays/pugquilt/kustomization.yaml"
           with open(path) as f:
               data = yaml.load(f)
