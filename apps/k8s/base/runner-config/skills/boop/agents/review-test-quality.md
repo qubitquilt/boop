@@ -8,6 +8,9 @@ description: >
   reported scenario, not synthetic easier versions. Audits function
   composition for coupled invariants that per-function tests cannot
   catch. Audits silent fallbacks for bug-shape re-introduction.
+  Audits conditional test absence (`importorskip`, `skipif`, `todo`,
+  env-var gates) as a first-class Unverified path tier — CI green is
+  not the same as coverage.
 compatibility: opencode-ai
 version: "1.0"
 ---
@@ -166,6 +169,57 @@ Examples:
 - `if (input.kind === 'A') return ...; else return input.value * 2;` —
   pre-fix was always `input.value * 2`, so the fallback might be fine.
   Verify and say so.
+
+## 5. Audit conditional test absence
+
+A test that does not run is not the same as a test that does not exist.
+A `pytest.importorskip(...)`, `if (!has_module) return`, `it.skip(...)`,
+`test.todo(...)`, or env-var-gated block is **conditional absence** —
+the suite still reports green when the dependency is missing, even
+though the code path is uncovered. CI silently passes and the author
+believes they have coverage they do not.
+
+When the diff touches a test file, scan every skip, skipif, xfail, todo,
+or feature-detect gate:
+
+- `pytest.importorskip("smolagents")` — the whole test was skipped on
+  this CI runner because the optional dep is missing. Treat the path
+  as **unverified** and surface it as its own finding.
+- `if (!hasModule) return;` — same shape, different language.
+- `test.skip(reason=...)` / `it.skip(...)` / `test.todo(...)` — same
+  shape again. Anything that lets a test report green without actually
+  exercising the code is conditional absence.
+- Env-var-gated tests (`if process.env.X: ...; else: return`) — the
+  path is unverified on every runner where the env var is unset.
+
+Report these as a dedicated finding category — **Unverified path**. It is
+neither Missing nor Mis-shaped; it is a third category where the suite
+*looks* green but does not actually exercise the code on this runner.
+A test gated behind `pytest.importorskip('smolagents')` does not
+exist as far as the CI green check is concerned.
+
+Surface as a normal `B-N` or `F-N` finding whose body explains the
+conditional-absence mechanism — there is no new ID prefix for
+"Unverified path." The category lives in the prose; the tier comes
+from the existing `B-N / F-N / O-N` scheme. Unconditional absence with
+no justification comment is `B-N` by default; justified or well-
+scoped conditional absence is `F-N`.
+
+Suggested fix shape:
+
+- Promote the optional dependency to a hard requirement and remove
+  the skip, so the test runs in CI.
+- Or split the test: the always-on assertions run unconditionally, the
+  optional ones run only when the module is present and the skip is
+  acceptable *with a comment* that says so plainly.
+- Or remove the test entirely and replace it with a smoke check that
+  fails fast when the dep is missing.
+
+If the skip is genuinely intentional and well-justified (a comment
+naming the dependency and saying "this is a known optional gate"),
+say so explicitly and downgrade to Follow-up. Conditional absence
+without a justification comment is a Blocking finding by default —
+green CI is a lie.
 
 ---
 

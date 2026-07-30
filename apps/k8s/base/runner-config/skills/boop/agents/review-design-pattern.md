@@ -4,7 +4,9 @@ description: >
   Lens: reviews structural and organizational choices in the changed
   code. Focuses on practical problems — not pattern compliance. Flags
   where current structure will make the next change harder, then
-  suggests a concrete alternative.
+  suggests a concrete alternative. Audits factory / closure
+  consistency so forwarded kwargs are not silently shadowed by
+  captured values.
 compatibility: opencode-ai
 version: "1.0"
 ---
@@ -110,6 +112,53 @@ this is wrong."
 
 Only flag a missing structure if its absence is causing a real
 problem in the changed code — not as a general recommendation.
+
+## 7. Factory / closure consistency
+
+Factories and closures silently capture state. When a caller passes a
+value the factory already has, the passed value is dropped on the
+floor and the caller assumes it took effect. This is one of the
+easiest factory bugs to ship and one of the hardest to catch in
+review because both halves of the code "look right" on their own.
+
+Audit every factory, builder, or closure in the diff:
+
+- **Forwarded kwarg vs captured closure.** If the factory accepts
+  `**kwargs` and stores them on `self`, but a parent closure already
+  set `self.foo` (or `outer.foo`), the closure value wins silently.
+  Concrete shape: `self.max_depth = kwargs.get("max_depth",
+  outer_max_depth)` where `outer_max_depth` is captured and
+  `kwargs["max_depth"]` is whatever the caller passed — the captured
+  default swallows the caller intent. Flag as Blocking if the
+  forward is load-bearing; Follow-up if it is a defaultable knob.
+- **Parameter shadowed by closure.** A method signature lists a
+  parameter, but the body reads a closure variable of the same name
+  instead. The caller passes a value; the code uses a different one.
+  Trace each parameter through the body and verify the parameter is
+  actually consulted on every code path.
+- **Builder / config that ignores a field.** A dataclass or builder
+  accepts a field, stores it, but never propagates it to the built
+  object. The caller's value reaches the constructor and dies there.
+- **Closure capture across rebind.** A nested function captures `x`
+  by reference. The outer code rebinds `x` after the closure is
+  defined. The closure sees the new value, but the caller's
+  expectations (and the docstring) reflect the old value.
+
+The fix shape is mechanical: take the kwarg/parameter, propagate it
+through the construction site, remove the captured duplicate. The
+harder half is the audit — the bug only shows when you trace both
+sides at once.
+
+When the factory is small and the closure capture is clearly a
+constant default that the caller could not meaningfully override,
+leave a brief note in the finding body and downgrade to Optional.
+When the caller expects the forwarded value to take effect (and is
+not just passing a redundant duplicate), default to Follow-up, even
+if the factory is small. When the forwarded value contradicts the
+captured default and the contradiction is silent, default to Blocking.
+When in doubt, default to Follow-up — a one-line note is cheap, and a
+silent swallowed override is exactly the bug shape this lens exists
+to catch.
 
 ---
 

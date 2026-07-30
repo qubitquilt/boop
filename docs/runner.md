@@ -8,16 +8,16 @@ See also: [README](../apps/runner/README.md), [architecture](./architecture.md),
 ## What it does
 
 1. Mints a GitHub App installation token.
-2. PATCHes the pre-created status comment to "🔐 authenticated".
+2. PATCHes the pre-created status comment to "🤝 paw-shaken in".
 3. Clones the PR at `PR_HEAD_SHA` into `/work/repo`.
-4. PATCHes the status comment to "📥 fetched".
+4. PATCHes the status comment to "🥎 fetched".
 5. Builds the boop prompt (orchestrator + 7 lenses inlined).
-6. PATCHes the status comment to "🧠 reviewing".
+6. PATCHes the status comment to "👃 sniffing".
 7. Runs `opencode run` against the repo with the prompt (25-min hard
    timeout).
 8. Parses the `=== SUMMARY === … === INLINE COMMENTS === … === END ===`
    block from stdout.
-9. PATCHes the status comment to "✅ review in" (or "❌ distracted" on
+9. PATCHes the status comment to "💤 napped" (or "🔄 chased tail" on
    failure).
 10. Posts the summary as a single PR comment and the inline comments as
     line-pinned review comments.
@@ -75,19 +75,19 @@ sets all of them; if a value is missing the Job fails to start.
 ```
 1.  Parse env, validate required vars
 2.  Mint installation token                       ← auth
-3.  PATCH status → "🔐 authenticated"            ← status: auth
+3.  PATCH status → "🤝 paw-shaken in"            ← status: auth
 4.  git clone --depth 50, fetch --depth 200, checkout HEAD_SHA
                                                    ← clone
-5.  PATCH status → "📥 fetched"                   ← status: clone
+5.  PATCH status → "🥎 fetched"                    ← status: clone
 6.  Materialize config (cp -r the ConfigMap mount into a writable dir)
 7.  Build the boop prompt                         ← review prep
-8.  PATCH status → "🧠 reviewing"                 ← status: review
+8.  PATCH status → "👃 sniffing"                   ← status: review
 9.  spawn `script -qfc 'opencode run …'` (PTY wrapper)
     ↳ hard-kill at 25 min
 10. Strip ANSI, parse review output
 11. Post summary as PR comment                    ← done
 12. Post each inline comment (best-effort)
-13. PATCH status → "✅ review in"                 ← status: done
+13. PATCH status → "💤 napped"                    ← status: done
 ```
 
 Each `postStatus(stage, detail)` PATCHes the existing status comment
@@ -220,11 +220,11 @@ comments) by replacing the tail with `…(truncated)`.
 
 The receiver pre-creates the status comment with a header like:
 
-> 👀 **boop is reviewing this PR...** (review)
+> 🐾 **Boop's on the case!** (review)
 >
 > Triggered by @alice
 >
-> Last commit: `a1b2c3d`. Updates will appear here.
+> Last commit: `a1b2c3d`. Sniffing now — updates will appear here.
 >
 > <!-- boop-timeline -->
 
@@ -239,11 +239,11 @@ Status stages and emojis (must match the receiver's vocabulary):
 
 | Stage | Emoji | Short label | Body |
 |---|---|---|---|
-| `auth` | 🔐 | `🔐 authenticated` | "Boop has arrived — authenticated with GitHub at `<sha>`." |
-| `clone` | 📥 | `📥 fetched` | "Boop fetched the repo at `<sha>`. Checking out the PR head and starting the multi-lens review." |
-| `review` | 🧠 | `🧠 reviewing` | "Boop is reviewing — running the multi-lens review on `<sha>`." |
-| `done` | ✅ | `✅ review in` | "Boop's review is in. See the comment below." |
-| `failed` | ❌ | `❌ distracted` | "Boop got distracted. Check the Job logs for details." (with a `<details>` block carrying the error tail) |
+| `auth` | 🤝 | `🤝 paw-shaken in` | "Paw-shaken in — authenticated with GitHub at `<sha>`." |
+| `clone` | 🥎 | `🥎 fetched` | "Boop fetched the repo at `<sha>`. Checking out the PR head and starting the multi-lens review." |
+| `review` | 👃 | `👃 sniffing` | "Boop is sniffing — running the multi-lens review on `<sha>`." |
+| `done` | 💤 | `💤 napped` | "Boop napped. See the comment below." |
+| `failed` | 🔄 | `🔄 chased tail` | "Boop chased his tail. Check the Job logs for details." (with a `<details>` block carrying the error tail) |
 
 ## Review header
 
@@ -294,7 +294,7 @@ postinstall has a writable HOME.
 - **Env var missing.** Throws at startup, Job exits 1. The error is
   logged JSON; the status comment is never created (the receiver
   creates it pre-Job). The receiver's pre-created status comment stays
-  stuck at the initial "👀 reviewing" stage. To recover, re-trigger the
+  stuck at the initial "🐾 Boop's on the case!" stage. To recover, re-trigger the
   webhook (push a commit) so the receiver submits a fresh Job.
 - **Clone fails.** `cloneRepo` throws; `main` catches, `postStatus("failed")`,
   rethrows, Job exits 1.

@@ -1,0 +1,37 @@
+# OS / editor cruft
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Logs and scratch
+*.log
+tmp/
+temp/
+
+# Node.js (apps/runner)
+apps/runner/node_modules/
+apps/runner/.npm/
+apps/runner/coverage/
+apps/runner/.nyc_output/
+
+# Go (apps/receiver)
+apps/receiver/bin/
+apps/receiver/vendor/
+apps/receiver/*.exe
+apps/receiver/*.test
+apps/receiver/*.out
