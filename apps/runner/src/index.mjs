@@ -301,6 +301,7 @@ async function main() {
   await postStatus("auth");
 
   try {
+    let review;
     try {
       review = await runOpenCodeSkill(OPENROUTER_API_KEY);
       log("review", "opencode returned", {
