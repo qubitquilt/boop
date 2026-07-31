@@ -5,13 +5,13 @@ on:
     branches: [main]
     tags: ['v*']
     paths-ignore:
-      - 'apps/k8s/overlays/**'
+      - 'apps/k8s/**'
       - '.github/workflows/sync-image-digests.yaml'
       - 'docs/**'
   pull_request:
     branches: [main]
     paths-ignore:
-      - 'apps/k8s/overlays/**'
+      - 'apps/k8s/**'
       - '.github/workflows/sync-image-digests.yaml'
       - 'docs/**'
 
