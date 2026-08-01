@@ -96,11 +96,17 @@ async function writeGitconfig(fs, cleanup, paths) {
 // remember.
 //
 // deps:
-//   fs       — node:fs/promises
-//   execFile — promisified execFile
-//   paths    — { netrc, gitconfig, repoDir, configSrc }
+//   fs         — node:fs/promises
+//   execFile   — promisified execFile
+//   paths      — { netrc, gitconfig, repoDir, configSrc }
+//   log        — logger
+//   postStatus — async (stage) => void; called with "clone" after the
+//                clone completes so the PR status timeline surfaces
+//                the 🥎 fetched stage. Best-effort: callers should
+//                swallow postStatus errors (the runner's postStatus
+//                already does this internally).
 export async function cloneRepo(ctx, deps) {
-  const { fs, execFile, paths, cleanup, log } = deps;
+  const { fs, execFile, paths, cleanup, log, postStatus } = deps;
   await fs.rm(paths.repoDir, { recursive: true, force: true });
   await fs.mkdir(paths.repoDir, { recursive: true });
   await writeNetrc(ctx.installationToken, fs, cleanup, paths);
@@ -134,6 +140,15 @@ export async function cloneRepo(ctx, deps) {
     ],
     { env: gitEnv, timeout: 5 * 60 * 1000 },
   );
+
+  // Surface the 🥎 fetched stage in the PR status timeline. Done
+  // after the clone (so the user can see clone succeeded) and
+  // before the fetch+checkout (so a fetch failure doesn't drop the
+  // "clone done" signal). postStatus itself swallows errors; if the
+  // status comment API is broken the clone still completes.
+  if (postStatus) {
+    await postStatus("clone");
+  }
 
   // Fetch every ref the prompt or the LLM might want to `git diff`
   // against. On a re-review with a known prior head, that ref must

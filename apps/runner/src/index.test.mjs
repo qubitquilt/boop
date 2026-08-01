@@ -13,11 +13,12 @@ import { createCleanupRegistry } from "./lib/git.mjs";
 //   2. mount-secret reads (readSecretFile)
 //   3. mint installation token
 //   4. postStatus("auth")
-//   5. runOpenCodeSkill → review
-//   6. postReview + postInlineComments
-//   7. cleanupPriorReview (re-review only)
-//   8. postStatus("done") — or ("failed", err) on error
-//   9. cleanup registry runs in finally
+//   5. cloneRepo → postStatus("clone") (🥎 fetched)
+//   6. runOpenCodeSkill → review → postStatus("review")
+//   7. postReview + postInlineComments
+//   8. cleanupPriorReview (re-review only)
+//   9. postStatus("done") — or ("failed", err) on error
+//  10. cleanup registry runs in finally
 //
 // All side effects are stubbed via the `overrides` parameter on `run`.
 
@@ -108,7 +109,8 @@ function fakeReview() {
 // override individual fields on top of this. The runOpenCodeSkill
 // stub mimics the real one by calling deps.postStatus("review")
 // before returning the canned review — without that, the postStatus
-// pipeline within the opencode step is never exercised.
+// pipeline within the opencode step is never exercised. The
+// cloneRepo stub mirrors that pattern for the "clone" stage.
 function standardOverrides(extra = {}) {
   return {
     fs: fakeFs(),
@@ -122,6 +124,9 @@ function standardOverrides(extra = {}) {
       kill: () => {},
     }),
     makeOctokit: () => fakeOctokit(),
+    cloneRepo: async (ctx, deps) => {
+      await deps.postStatus("clone");
+    },
     runOpenCodeSkill: async (apiKey, ctx, deps) => {
       await deps.postStatus("review");
       return fakeReview();
@@ -138,7 +143,14 @@ test("run: happy path posts auth, runs review, posts done", async () => {
   const overrides = standardOverrides({ makeOctokit: () => octokit });
   await run(env, overrides);
   const statuses = octokit.calls.updateComment.map((c) => c.body);
+  // Every stage in the runner pipeline must surface in the status
+  // timeline. A missing entry implies the stage ran without being
+  // announced. Today (2026-08-01) this test would catch the
+  // "cloneRepo is dead code" bug introduced by PR #71: the runner
+  // was importing cloneRepo but never calling it, so the timeline
+  // skipped from "auth" straight to "review" with no "fetched" line.
   assert.ok(statuses.some((s) => /paw-shaken in/.test(s)), "missing auth status");
+  assert.ok(statuses.some((s) => /fetched/.test(s)), "missing clone status");
   assert.ok(statuses.some((s) => /sniffing/.test(s)), "missing review status");
   assert.ok(statuses.some((s) => /napped/.test(s)), "missing done status");
   // Review summary posted.
@@ -148,6 +160,25 @@ test("run: happy path posts auth, runs review, posts done", async () => {
   // Inline comment posted.
   assert.equal(octokit.calls.createReviewComment.length, 1);
   assert.equal(octokit.calls.createReviewComment[0].path, "src/foo.ts");
+});
+
+test("run: cloneRepo failure → run rethrows (clone is not best-effort)", async () => {
+  // A failed clone must abort the run before the LLM is invoked.
+  // Otherwise the opencode prompt would run against an empty
+  // /work/repo and the LLM would produce nonsense findings (or
+  // crash on missing files). We re-throw; the outer catch in run()
+  // turns the failure into a "🔄 chased tail" status update.
+  const octokit = fakeOctokit();
+  const overrides = standardOverrides({
+    makeOctokit: () => octokit,
+    cloneRepo: async () => { throw new Error("git clone failed: 403"); },
+  });
+  await assert.rejects(() => run(env, overrides), /git clone failed/);
+  const statuses = octokit.calls.updateComment.map((c) => c.body);
+  // auth still happened; clone did not; review/done must not.
+  assert.ok(statuses.some((s) => /paw-shaken in/.test(s)));
+  assert.ok(!statuses.some((s) => /sniffing/.test(s)), "review must not run after clone failure");
+  assert.ok(!statuses.some((s) => /napped/.test(s)), "done must not run after clone failure");
 });
 
 test("run: re-review calls cleanupPriorReview", async () => {
