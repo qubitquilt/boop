@@ -161,7 +161,12 @@ func TestHumanStatus(t *testing.T) {
 }
 
 func TestListReviews_Handler(t *testing.T) {
-	now := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	// Use time.Now() so the test stays in the recent/failed
+	// windows regardless of when it runs. The previous version
+	// anchored `now` to 2026-07-29, which was inside the 24h
+	// window when the test was first written but aged out a
+	// few days later, leaving the recent bucket empty.
+	now := time.Now()
 
 	boopActive := newJob("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaadeadbeef", time.Hour)
 	boopActive.Status.Active = 1

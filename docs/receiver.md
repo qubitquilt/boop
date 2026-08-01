@@ -47,11 +47,16 @@ live template the receiver renders is the embedded one
 
 ## HTTP API
 
-| Method | Path            | Purpose                                                                |
-|--------|-----------------|------------------------------------------------------------------------|
-| POST   | `/webhook`      | GitHub webhook entry point. Always returns 202 (ack) or 4xx/5xx.        |
-| GET    | `/health`       | Liveness/readiness. Returns `200 ok`. Used by the K8s probes.           |
-| GET    | `/api/reviews`  | Snapshot of boop review Jobs in `TARGET_NAMESPACE`. See below.         |
+| Method | Path                              | Purpose                                                                |
+|--------|-----------------------------------|------------------------------------------------------------------------|
+| POST   | `/webhook`                        | GitHub webhook entry point. Always returns 202 (ack) or 4xx/5xx.        |
+| GET    | `/health`                         | Liveness/readiness. Returns `200 ok`. Used by the K8s probes.           |
+| GET    | `/api/reviews`                    | Snapshot of boop review Jobs in `TARGET_NAMESPACE`. See below.         |
+| GET    | `/api/installations`              | Cached list of GitHub App installations (refreshed every 5 min).       |
+| GET    | `/api/runs`                       | Paginated, filterable run history. The data layer's primary read.     |
+| GET    | `/api/stats`                      | Time-series + per-repo + per-model rollups for the dashboard.         |
+| POST   | `/api/runs/{id}/telemetry`        | Runner posts final token + cost. Requires `X-BOOP-Runner-Token`.       |
+| POST   | `/api/runs/{id}/status`           | Runner posts lifecycle transitions. Requires `X-BOOP-Runner-Token`.    |
 
 Ack body shape (always JSON, status 202):
 
@@ -121,6 +126,54 @@ beyond the cluster, front it with an `IngressRoute` + basic auth or a
 Tailscale-only entrypoint. It reveals Job metadata only — no PR
 content, no secrets.
 
+## Data layer
+
+The receiver persists every review (and the LLM telemetry that came
+with it) to a SQLite database. The database is the source of truth
+for everything `/api/reviews` cannot show: runs older than the K8s
+Job TTL, per-model cost breakdowns, the list of repos the App is
+installed on, and the dashboard's aggregations.
+
+### Storage
+
+A single SQLite file at `DB_PATH` (default `/data/boop.db`). The
+path is mounted from a `PersistentVolumeClaim` so the file
+survives receiver restarts. Schema is auto-migrated on open. WAL
+journal mode + 5s busy timeout so the dashboard's reads and the
+receiver's writes do not block each other.
+
+Schema:
+
+| Table | Purpose |
+|---|---|
+| `runs` | One row per review. Captures owner, repo, PR number, head SHA, status, timing, error. Indexed on `started_at` (DESC), `(owner, repo, started_at)`, and `installation_id` for the dashboard's hot queries. |
+| `telemetry` | One row per run, written by the runner's POST at the end. Token usage (input/output/reasoning/cache.read/cache.write) and cost in USD. |
+| `installations` | The GitHub App installation list, refreshed by a background poller. |
+
+### Endpoints
+
+`/api/installations`, `/api/runs`, and `/api/stats` are read-only
+and share the same auth story as `/api/reviews` (intended for
+in-cluster use; front with auth at the Ingress). The two POST
+endpoints (`/api/runs/{id}/telemetry` and `/api/runs/{id}/status`)
+require the `X-BOOP-Runner-Token` header, value matching the
+`RUNNER_TOKEN` env var (which propagates to the runner as
+`BOOP_DASHBOARD_TOKEN`).
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/installations` | One row per App installation: `id`, `account_login`, `account_type`, `repository_selection`, `installed_at`. Cached for 5 min; refreshed by a background poller so the dashboard's GET is a cheap table read. |
+| `GET /api/runs` | Paginated list of runs. Query string: `owner`, `repo`, `status`, `installation`, `from` (RFC3339), `to` (RFC3339), `cursor`, `limit` (clamped 1..200). Newest-first by `started_at`. Each row carries its telemetry (if recorded) inline so the dashboard's runs page is a single fetch. |
+| `GET /api/stats` | Aggregations: `summary` (totals + p50/p95 duration + unique repos/installs), `buckets` (time series, day/hour/week), `by_repo` (leaderboard, top 50 by run count), `by_model` (cost + token breakdown). Query: `from`, `to`, `bucket`. |
+| `POST /api/runs/{id}/telemetry` | Body: `{model, provider, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd, step_count}`. Idempotent (REPLACE on conflict). 404 if the run does not exist. |
+| `POST /api/runs/{id}/status` | Body: `{stage: "running"|"succeeded"|"done"|"failed", ended_at?, duration_ms?, error?}`. 202 (not 404) if the run does not exist yet — the runner will retry on the next stage transition. |
+
+The data layer is enabled when `DB_PATH` is set and the file
+opens cleanly. When disabled, the new endpoints return 503; the
+webhook path and `/api/reviews` are unaffected.
+
+
+
 ## Configuration
 
 Read from env vars at startup. All required. See
@@ -136,6 +189,8 @@ Read from env vars at startup. All required. See
 | `TARGET_NAMESPACE` | no | `dev-tools` | Namespace to submit Jobs into. |
 | `BOT_LOGIN` | no | (empty) | If set, the receiver drops `issue_comment` events from this sender (skips self-mentions). Empty disables. |
 | `LOG_LEVEL` | no | `info` | One of `debug`, `info`, `warn`, `error`. JSON to stdout. |
+| `DB_PATH` | no | `/data/boop.db` | SQLite file for the data layer. Empty disables the data layer (the new endpoints return 503; the webhook path is unaffected). |
+| `RUNNER_TOKEN` | no | (empty) | Shared secret for the runner's POST endpoints. Empty rejects every runner POST. Propagated to the runner as `BOOP_DASHBOARD_TOKEN`. |
 
 ## Event handling
 

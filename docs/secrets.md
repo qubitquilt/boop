@@ -12,9 +12,16 @@ Credentials Boop needs and where they live. See also
 | `installation-id` | integer | OpenBao `secret/dev-tools/boop` | Receiver + runner (env `GITHUB_APP_INSTALLATION_ID`) |
 | `private-key` | PEM (PKCS#1 RSA) | OpenBao `secret/dev-tools/boop` | Receiver + runner (env `GITHUB_APP_PRIVATE_KEY`) |
 | `openrouter-api-key` | opaque string | OpenBao `secret/dev-tools/boop` | Runner (env `OPENROUTER_API_KEY`) |
+| `runner-token` | opaque string (32-byte hex recommended) | OpenBao `secret/dev-tools/boop` | Receiver + runner (env `RUNNER_TOKEN` / `BOOP_DASHBOARD_TOKEN`); auth on the runner's POST endpoints |
 
 The GitHub App login (`BoopPr[bot]`) is **not** a secret; it is
 hard-coded in the receiver Deployment as `BOT_LOGIN`.
+
+The `runner-token` is a shared secret between the receiver and the
+runner. The receiver authenticates every runner POST (telemetry +
+status) against it; the runner carries it as `BOOP_DASHBOARD_TOKEN`
+in the Job template. Generate once with `openssl rand -hex 32` and
+store alongside the other credentials.
 
 ## OpenBao wiring
 
@@ -30,7 +37,8 @@ OpenBao path: secret/dev-tools/boop
   ├─ app-id                 → K8s Secret key GITHUB_APP_ID
   ├─ installation-id        → K8s Secret key GITHUB_APP_INSTALLATION_ID
   ├─ private-key            → K8s Secret key GITHUB_APP_PRIVATE_KEY
-  └─ openrouter-api-key     → K8s Secret key OPENROUTER_API_KEY
+  ├─ openrouter-api-key     → K8s Secret key OPENROUTER_API_KEY
+  └─ runner-token           → K8s Secret key RUNNER_TOKEN
 ```
 
 ### Updating a secret
@@ -42,7 +50,8 @@ bao kv put secret/dev-tools/boop \
     app-id=... \
     installation-id=... \
     private-key=@/path/to/key.pem \
-    openrouter-api-key=...
+    openrouter-api-key=... \
+    runner-token="$(openssl rand -hex 32)"
 
 # External Secrets Operator resyncs the K8s Secret on its poll interval
 # (or via a manual annotation: kubectl annotate externalsecret boop-secrets -n dev-tools force-sync=$(date +%s))

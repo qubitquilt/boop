@@ -39,3 +39,14 @@ make run
 
 - `POST /webhook` — entry point for the GitHub App webhook
 - `GET /health` — liveness/readiness
+- `GET /api/reviews` — snapshot of in-flight and recent review Jobs
+- `GET /api/installations` — GitHub App installations (data layer)
+- `GET /api/runs` — paginated run history (data layer)
+- `GET /api/stats` — aggregations for the dashboard (data layer)
+- `POST /api/runs/{id}/telemetry` — runner reports final token + cost
+- `POST /api/runs/{id}/status` — runner reports lifecycle transitions
+
+The data-layer endpoints need a writable `DB_PATH` (default
+`/data/boop.db`); the runner POST endpoints additionally need a
+`RUNNER_TOKEN` env var. See [docs/receiver.md](../../docs/receiver.md)
+for the full contract.

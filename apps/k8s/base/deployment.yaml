@@ -1,4 +1,26 @@
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: boop-receiver-data
+  labels:
+    app: boop-receiver
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # 1Gi is plenty for the dashboard's run history. At one row
+  # per review (a few KB) plus a telemetry row (a few hundred
+  # bytes), 1Gi holds hundreds of thousands of runs before
+  # any operator needs to think about growth. Resize is
+  # in-place (StorageClass permitting); bumping is a one-line
+  # change here, no consumer needs an update.
+  resources:
+    requests:
+      storage: 1Gi
+  # No storageClassName — let the cluster's default provisioner
+  # handle it. Tied to a specific SC in the overlay if your
+  # cluster needs a non-default (e.g. local-path on bare metal).
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -61,6 +83,27 @@ spec:
                   key: GITHUB_APP_PRIVATE_KEY
             - name: BOT_LOGIN
               value: "BoopPr[bot]"
+            # Data layer: where the SQLite file lives. The
+            # /data volume is the PVC below. The file is
+            # created on first run; the schema migrates
+            # automatically.
+            - name: DB_PATH
+              value: /data/boop.db
+            # Shared secret for the runner's POST endpoints.
+            # Generated once on first deploy and stored in the
+            # boop-secrets Secret; the Job template below
+            # passes it through to the runner. A missing
+            # value rejects every runner POST (so a forgotten
+            # secret is loud, not silent).
+            - name: RUNNER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: boop-secrets
+                  key: RUNNER_TOKEN
+                  optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /data
           livenessProbe:
             httpGet:
               path: /health
@@ -79,7 +122,11 @@ spec:
               memory: 64Mi
             limits:
               cpu: 200m
-              memory: 128Mi
+              memory: 256Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: boop-receiver-data
 ---
 apiVersion: v1
 kind: Service

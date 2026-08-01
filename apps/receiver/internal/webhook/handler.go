@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	boopgithub "github.com/michaelruelas/boop-receiver/internal/github"
+	"github.com/michaelruelas/boop-receiver/internal/store"
 )
 
 const BotMention = "@BoopPr"
@@ -78,6 +79,9 @@ type Config struct {
 	JobImage        string
 	TargetNamespace string
 	BotLogin        string // GitHub login of the bot, used to ignore self-comments
+	DBPath          string // sqlite path; empty disables the data layer (legacy mode)
+	RunnerToken     string // shared secret for the runner's POST endpoints; empty rejects all runner posts
+	InstallPollInterval time.Duration // how often to refresh installations from GitHub; 0 = 5m default
 }
 
 type Handler struct {
@@ -85,6 +89,7 @@ type Handler struct {
 	logger   *slog.Logger
 	kube     kubernetes.Interface
 	ghClient *boopgithub.Manager
+	store    *store.Store // may be nil; nil disables the data layer (legacy mode)
 
 	// consecutiveConfigMapFallbacks tracks how many submitJob calls
 	// in a row fell back to h.cfg.JobImage because currentJobImage
@@ -195,14 +200,22 @@ func NewHandler(cfg Config, ghClient *boopgithub.Manager, logger *slog.Logger) (
 	// (one webhook per minute per repo) plus headroom for
 	// bursty re-deliveries.
 	limiter := rate.NewLimiter(rate.Limit(20), 40)
-	return &Handler{
+	h := &Handler{
 		cfg:      cfg,
 		logger:   logger,
 		kube:     kube,
 		ghClient: ghClient,
 		dedup:    newDeliveryDedup(4096),
 		limiter:  limiter,
-	}, nil
+	}
+	if cfg.DBPath != "" {
+		s, err := store.Open(cfg.DBPath)
+		if err != nil {
+			return nil, fmt.Errorf("open store: %w", err)
+		}
+		h.store = s
+	}
+	return h, nil
 }
 
 func (h *Handler) Health(w http.ResponseWriter, _ *http.Request) {
@@ -564,6 +577,13 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		ReviewNumber:      fmt.Sprintf("%d", reviewNumber),
 		InstallationID:    fmt.Sprintf("%d", installationID),
 		BotLogin:          h.cfg.BotLogin,
+		JobName:           jobName,
+		// Dashboard URL is the receiver Service's in-cluster DNS.
+		// Hard-coded to the canonical Service name + namespace so
+		// a misconfigured operator can't accidentally point the
+		// runner at a public URL (where the token would leak).
+		DashboardURL:   "http://boop-receiver.dev-tools.svc.cluster.local:8080",
+		DashboardToken: h.cfg.RunnerToken,
 	})
 	if err != nil {
 		// Base-ref or installation-id validation failure: this is a
@@ -589,6 +609,31 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		h.logger.Error("create job", "delivery", delivery, "job", jobName, "err", err)
 		http.Error(w, "create job", http.StatusInternalServerError)
 		return
+	}
+
+	// Persist the run row so the dashboard has it. This is
+	// best-effort: the receiver's job is to submit the Job and
+	// ack the webhook. A store write failure is logged but does
+	// not fail the webhook (the Job is already in flight; the
+	// dashboard will simply not show it, and the next runner
+	// status POST will write the row).
+	if h.store != nil {
+		_, err := h.store.UpsertRun(ctx, store.Run{
+			ID:             jobName,
+			Owner:          owner,
+			Repo:           repo,
+			PRNumber:       number,
+			CommitSHA:      headSHA,
+			BaseRef:        baseRef,
+			ReviewNumber:   reviewNumber,
+			Reason:         reason,
+			InstallationID: installationID,
+			Status:         store.StatusRunning,
+			StartedAt:      time.Now().UTC(),
+		})
+		if err != nil {
+			h.logger.Warn("upsert run", "delivery", delivery, "job", jobName, "err", err)
+		}
 	}
 
 	h.logger.Info("job created",
@@ -706,6 +751,9 @@ type templateVars struct {
 	ReviewNumber      string // 1-based review number for this run; runner uses it for headers
 	InstallationID    string // GitHub App installation ID, sourced from the webhook header
 	BotLogin          string // GitHub login of the bot App (e.g. "booppr[bot]"); used to identify prior review artifacts for cleanup
+	DashboardURL      string // receiver Service URL the runner POSTs telemetry to; empty disables telemetry capture
+	DashboardToken    string // shared secret for the runner's POSTs; empty disables telemetry capture
+	JobName           string // the K8s Job name, which the runner reports back as the run id
 }
 
 type prMeta struct {
@@ -914,3 +962,9 @@ func writeAck(w http.ResponseWriter, status, detail, delivery string) {
 		"ts":       time.Now().UTC().Format(time.RFC3339),
 	})
 }
+
+// Store returns the receiver's persistent store, or nil if the
+// data layer is disabled. main.go uses it to log whether the
+// data layer is on or off; the dashboard handlers use it
+// directly to read.
+func (h *Handler) Store() *store.Store { return h.store }

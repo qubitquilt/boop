@@ -17,13 +17,16 @@ End-to-end view of how a webhook becomes a PR review.
 │  boop-receiver   │ ──────────────▶│  boop-runner │
 │  (Deployment,    │                │  (Job,       │
 │   1 replica,     │                │   1 pod / PR)│
-│   in-cluster)    │                │              │
-│                  │                │              │
-│  - HMAC verify   │                │  - clone PR  │
-│  - filter events │                │  - run skill │
-│  - dedupe by SHA │                │  - post 📝   │
-│  - post 🐾       │                │  - post 📌   │
+│   in-cluster)    │ ◀─── telemetry ┊              │
+│                  │      status    │  - clone PR  │
+│  - HMAC verify   │                │  - run skill │
+│  - filter events │                │  - post 📝   │
+│  - dedupe by SHA │                │  - post 📌   │
+│  - post 🐾       │                │  - post 📊   │
 │  - mint comments │                │              │
+│  - data layer    │                │              │
+│   (SQLite +      │                │              │
+│    PVC)          │                │              │
 └────────▲─────────┘                └───────▲──────┘
          │                                  │
          │     ┌────────────────────────┐   │
@@ -47,11 +50,20 @@ all state lives in the K8s API and the GitHub API.
 - **Replicas:** 1 (eventually consistent — duplicates are deduped by head
   SHA, not by receiver instance).
 - **Endpoints:** `POST /webhook`, `GET /health`, `GET /api/reviews` (the
-  latter for dashboards; see [receiver.md](./receiver.md#apireviews)).
+  latter for dashboards; see [receiver.md](./receiver.md#apireviews));
+  plus the data-layer endpoints `GET /api/installations`,
+  `GET /api/runs`, `GET /api/stats`, and the runner POST endpoints
+  `POST /api/runs/{id}/telemetry`, `POST /api/runs/{id}/status`.
 - **Cluster scope:** namespace `dev-tools`. Creates Jobs in the same
   namespace.
 - **GitHub App auth:** uses the App creds to post the "reviewing…"
   comment and to fetch PR metadata for `@BoopPr review` triggers.
+- **Data layer:** a SQLite file on a PVC backs the data-layer
+  endpoints. The receiver writes the run row on Job submit; the
+  runner posts the telemetry + status updates as the run
+  progresses. The data layer is opt-in: a missing or unopenable
+  `DB_PATH` returns 503 on the new endpoints without affecting
+  the webhook path or `/api/reviews`.
 
 See [receiver.md](./receiver.md).
 
@@ -128,7 +140,7 @@ post-review work.
 
 ## State
 
-State lives in three places:
+State lives in four places:
 
 1. **Kubernetes API.** The Job object is the deduplication unit. Its
    name encodes the head SHA (`boop-<owner>-<repo>-<number>-<sha7>`). Its
@@ -140,7 +152,14 @@ State lives in three places:
    can PATCH the same one the receiver created.
 3. **In-memory caches.** Both services cache GitHub App installation
    tokens for up to (token expiry − 5 min). On cache miss, a new App JWT
-   is minted and exchanged. No persistent local state.
+   is minted and exchanged. The receiver also caches the App
+   installation list (5 min) so the dashboard's poll does not hammer
+   GitHub. No persistent local state.
+4. **SQLite (data layer).** A single file on a PVC stores every run
+   and its telemetry. The receiver writes the run row on Job submit;
+   the runner POSTs the final telemetry at the end of the review. The
+   data layer is the source of truth for runs older than the Job TTL
+   (1h after finish) and for all the dashboard's aggregations.
 
 The receiver and runner share no state directly. The handoff is the Job
 spec the receiver submits; everything after that is a clean pod start.

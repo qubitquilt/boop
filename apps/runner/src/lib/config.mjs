@@ -113,6 +113,13 @@ export function loadConfig(env = process.env) {
     debug: !!env.BOOP_DEBUG,
     home: env.HOME || "/home/opencode",
     cwd: env.CWD || "/app",
+    // Dashboard data layer. Both must be set for the runner to
+    // POST lifecycle + telemetry; if either is missing the
+    // dashboard helpers are no-ops and the runner falls back
+    // to the TUI mode in opencode.mjs (no telemetry captured).
+    dashboardUrl: env.BOOP_DASHBOARD_URL || null,
+    dashboardToken: env.BOOP_DASHBOARD_TOKEN || null,
+    jobName: env.BOOP_JOB_NAME || null,
   };
 }
 

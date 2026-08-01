@@ -58,6 +58,7 @@ import {
   postStatus,
   cleanupPriorReview,
 } from "./lib/github.mjs";
+import { postStatus as postDashboardStatus, postTelemetry } from "./lib/dashboard.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -173,6 +174,11 @@ export async function run(env = process.env, overrides = {}) {
     : makeOctokit(installationToken);
   log.log("auth", "minted installation token");
   await deps.postStatus("auth");
+  // Dashboard data layer: announce the run as started. The
+  // receiver wrote the run row in its submitJob; this call
+  // updates it to the "running" stage so the dashboard's
+  // live panel knows the runner is alive.
+  await postDashboardStatus("running", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
 
   try {
     // Clone the PR at the head SHA into /work/repo before the LLM
@@ -187,11 +193,23 @@ export async function run(env = process.env, overrides = {}) {
     let review;
     try {
       const skillFn = overrides.runOpenCodeSkill || runOpenCodeSkill;
-      const review = await skillFn(OPENROUTER_API_KEY, ctx, deps);
+      const reviewResult = await skillFn(OPENROUTER_API_KEY, ctx, deps);
+      const telemetry = reviewResult.telemetry ?? null;
+      const review = {
+        summary: reviewResult.summary,
+        inlineComments: reviewResult.inlineComments,
+        confidence: reviewResult.confidence,
+      };
       log.log("review", "opencode returned", {
         summaryBytes: review.summary.length,
         inlineCount: review.inlineComments.length,
         confidence: review.confidence,
+        ...(telemetry ? {
+          cost_usd: telemetry.costUsd,
+          tokens_in: telemetry.inputTokens,
+          tokens_out: telemetry.outputTokens,
+          step_count: telemetry.stepCount,
+        } : {}),
       });
 
       await postReview(currentOctokit, review.summary, ctx.reviewNumber, review.confidence, ctx);
@@ -227,9 +245,20 @@ export async function run(env = process.env, overrides = {}) {
         }
       }
 
+      // Dashboard data layer: POST final telemetry (token usage
+      // + cost) once the review is fully posted. Best-effort —
+      // failures are logged inside postTelemetry.
+      if (telemetry) {
+        await postTelemetry(telemetry, ctx, { log: log.log, fetchImpl: deps.fetchImpl });
+      }
+      await postDashboardStatus("done", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
       await deps.postStatus("done");
     } catch (err) {
       log.errlog("review", "opencode failed", { error: String(err?.message ?? err) });
+      // Best-effort dashboard status so the dashboard's live
+      // view shows the run as failed even if the post-pipeline
+      // status PATCH (deps.postStatus) also fails.
+      await postDashboardStatus("failed", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
       await deps.postStatus("failed", String(err?.message ?? err));
       throw err;
     }
