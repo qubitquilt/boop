@@ -86,6 +86,11 @@ function makeDeps(ctx, log, cleanup) {
     log: log.log,
     errlog: log.errlog,
     postStatus: (stage, detail) => postStatus(stage, detail, ctx, octokitDeps(log)),
+    // cloneRepo is wrapped so its postStatus call goes through the
+    // same lazy octokit-resolution path as the direct postStatus.
+    // The clone runs AFTER token minting so the GitHub-App
+    // installation token is already populated in currentOctokit.
+    cloneRepo: (c, d) => cloneRepo(c, { ...d, postStatus: (s) => postStatus(s, undefined, c, octokitDeps(log)) }),
   };
 }
 
@@ -170,6 +175,15 @@ export async function run(env = process.env, overrides = {}) {
   await deps.postStatus("auth");
 
   try {
+    // Clone the PR at the head SHA into /work/repo before the LLM
+    // stage. The status timeline should show every stage the runner
+    // actually performs; a missing "clone" line would imply the
+    // clone happened but went unannounced. cloneRepo itself calls
+    // deps.postStatus("clone") so the 🥎 fetched stage lands in
+    // the timeline after a successful clone.
+    await deps.cloneRepo(ctx, deps);
+    log.log("clone", "repo cloned", { dir: deps.paths.repoDir, sha: ctx.prHeadSha });
+
     let review;
     try {
       const skillFn = overrides.runOpenCodeSkill || runOpenCodeSkill;
