@@ -184,6 +184,26 @@ The receiver rolls on the next sync. The runner is consumed on the
 next Job submit (Jobs are not owned by ArgoCD, so there is nothing
 to roll).
 
+### JOB_IMAGE runtime resolution
+
+The receiver reads `JOB_IMAGE` from the `boop-config` ConfigMap on
+**every webhook submit**, not at startup. The Pod's `JOB_IMAGE`
+env var is still wired through `configMapKeyRef`, but only as a
+fallback for when the K8s API read fails. This avoids the
+"ArgoCD syncs the ConfigMap but the receiver pod doesn't restart,
+so the next Job pulls the old image" race that bit us on
+2026-08-01 (PR #83).
+
+The receiver's RBAC Role grants `configmaps:get,list,watch` in
+`TARGET_NAMESPACE` only — `apps/k8s/base/role.yaml`. Reads are
+namespace-scoped to `dev-tools`, so a compromised receiver cannot
+enumerate ConfigMaps cluster-wide.
+
+Cost: one extra `Get` per webhook. Webhooks are bounded by GitHub's
+delivery rate (one per push per repo, in practice), and the read
+returns from the API server's in-memory cache, so the latency
+overhead is single-digit milliseconds.
+
 ## Image publishing
 
 Two GitHub Actions workflows, one per image. Each runs on the

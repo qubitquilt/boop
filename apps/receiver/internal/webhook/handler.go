@@ -513,6 +513,21 @@ func duplicateReviewReply(status, headSHA string) string {
 func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID, installationID int64, reviewNumber int) {
 	jobName := buildJobName(owner, repo, number, headSHA)
 
+	// Resolve JOB_IMAGE fresh from the boop-config ConfigMap instead
+	// of using the env-var snapshot captured at startup. ArgoCD
+	// updates the ConfigMap digest without redeploying the receiver
+	// Deployment, so the env-var value goes stale until the next
+	// receiver restart. Reading on each submit (one extra K8s API
+	// call per webhook, webhook rate is bounded) keeps the Job in
+	// sync with whatever digest sync-image-digests just landed.
+	// Falls back to the env-var snapshot if the API read fails so
+	// a transient API hiccup doesn't block a review.
+	image, err := h.currentJobImage(ctx)
+	if err != nil {
+		h.logger.Warn("read boop-config for JOB_IMAGE, using startup value", "err", err)
+		image = h.cfg.JobImage
+	}
+
 	job, err := buildJob(templateVars{
 		Owner:             owner,
 		Repo:              repo,
@@ -521,7 +536,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		SHA7:              shortSHA(headSHA),
 		BaseRef:           baseRef,
 		PreviousHeadSHA:   previousHeadSHA,
-		Image:             h.cfg.JobImage,
+		Image:             image,
 		StatusCommentID:   fmt.Sprintf("%d", statusCommentID),
 		ReactionCommentID: fmt.Sprintf("%d", reactionCommentID),
 		ReviewNumber:      fmt.Sprintf("%d", reviewNumber),
@@ -567,6 +582,42 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		"review_number", reviewNumber,
 	)
 	writeAck(w, "accepted", jobName, delivery)
+}
+
+// boopConfigMapName is the ConfigMap the receiver reads for
+// JOB_IMAGE. Defined as a constant so the test can use the same
+// value when seeding the fake client. The ConfigMap lives in the
+// receiver's own namespace (TARGET_NAMESPACE, default "dev-tools")
+// and is owned by ArgoCD, not the receiver.
+const boopConfigMapName = "boop-config"
+
+// jobImageKey is the data key under which JOB_IMAGE is stored in
+// the boop-config ConfigMap. Must match apps/k8s/base/config.yaml.
+const jobImageKey = "JOB_IMAGE"
+
+// currentJobImage reads JOB_IMAGE from the boop-config ConfigMap
+// in the receiver's namespace and returns the freshest value ArgoCD
+// has synced. Falls back to the env-var snapshot (h.cfg.JobImage)
+// when the read fails so a transient K8s API hiccup doesn't block
+// a review. Not cached: the K8s API round-trip is cheap relative to
+// the rest of the webhook handler (token mint + GitHub API calls),
+// and skipping the cache keeps the recovery time at "next webhook"
+// after ArgoCD syncs a new digest.
+//
+// The receiver's Role grants configmaps:get/list/watch in
+// TARGET_NAMESPACE — see apps/k8s/base/role.yaml. The ConfigMap is
+// namespace-scoped, so the receiver can only read it from its own
+// namespace, which is the right blast-radius.
+func (h *Handler) currentJobImage(ctx context.Context) (string, error) {
+	cm, err := h.kube.CoreV1().ConfigMaps(h.cfg.TargetNamespace).Get(ctx, boopConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get %s/%s: %w", h.cfg.TargetNamespace, boopConfigMapName, err)
+	}
+	v, ok := cm.Data[jobImageKey]
+	if !ok || v == "" {
+		return "", fmt.Errorf("%s/%s missing %q key", h.cfg.TargetNamespace, boopConfigMapName, jobImageKey)
+	}
+	return v, nil
 }
 
 type templateVars struct {

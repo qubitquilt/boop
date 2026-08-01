@@ -1,10 +1,13 @@
 package webhook
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 // TestRenderStatusBody locks the initial status comment template the
@@ -418,5 +421,150 @@ func TestBuildJob_RejectsBadPreviousHeadSHA(t *testing.T) {
 				t.Errorf("buildJob accepted previous head SHA %q", ref)
 			}
 		})
+	}
+}
+
+// TestCurrentJobImage_ReadsConfigMap pins the receiver's
+// runtime-JOB_IMAGE-resolution path. The receiver used to bake
+// JOB_IMAGE at startup from the boop-config ConfigMap, which
+// meant ArgoCD-driven ConfigMap updates didn't reach the Job
+// template until the receiver pod was restarted. Today
+// (2026-08-01) this caused a real incident: PR #83 bumped the
+// runner digest in main, ArgoCD synced the ConfigMap, but the
+// next Boop Job pulled the pre-#83 image. The fix is to read
+// the ConfigMap on each submitJob call.
+func TestCurrentJobImage_ReadsConfigMap(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "boop-config",
+			Namespace: "dev-tools",
+		},
+		Data: map[string]string{
+			"JOB_IMAGE": "ghcr.io/qubitquilt/boop-runner@sha256:f71ad0c70075e10423ba5ec741d826bbd212f36a4dc97d255c5ed51256bbde72",
+		},
+	}
+	client := fake.NewSimpleClientset(cm)
+	h := &Handler{
+		cfg: Config{
+			TargetNamespace: "dev-tools",
+			// Stale startup value — currentJobImage must NOT return this
+			// when the ConfigMap has a fresh value.
+			JobImage: "ghcr.io/qubitquilt/boop-runner@sha256:old-old-old",
+		},
+		kube: client,
+	}
+	got, err := h.currentJobImage(context.Background())
+	if err != nil {
+		t.Fatalf("currentJobImage: %v", err)
+	}
+	if got != cm.Data["JOB_IMAGE"] {
+		t.Errorf("currentJobImage = %q, want %q", got, cm.Data["JOB_IMAGE"])
+	}
+}
+
+func TestCurrentJobImage_PicksUpLatestDigest(t *testing.T) {
+	// Two calls in a row — second call sees an updated ConfigMap.
+	// Without re-reading, the second call would return the first
+	// call's value (or the env-var snapshot). With re-reading, the
+	// receiver picks up the new digest within one submit.
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "boop-config",
+			Namespace: "dev-tools",
+		},
+		Data: map[string]string{
+			"JOB_IMAGE": "ghcr.io/qubitquilt/boop-runner@sha256:first",
+		},
+	}
+	client := fake.NewSimpleClientset(cm)
+	h := &Handler{
+		cfg: Config{TargetNamespace: "dev-tools"},
+		kube: client,
+	}
+	first, err := h.currentJobImage(context.Background())
+	if err != nil {
+		t.Fatalf("first currentJobImage: %v", err)
+	}
+	if first != "ghcr.io/qubitquilt/boop-runner@sha256:first" {
+		t.Fatalf("first read = %q, want first digest", first)
+	}
+	// The fake client returns a deep copy from Get, so mutating
+	// the original `cm` object does NOT change what subsequent Get
+	// calls return. Update the ConfigMap through the fake client
+	// to simulate ArgoCD landing a new digest.
+	cm.Data["JOB_IMAGE"] = "ghcr.io/qubitquilt/boop-runner@sha256:second"
+	updated, err := client.CoreV1().ConfigMaps("dev-tools").Update(
+		context.Background(), cm, metav1.UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatalf("update configmap: %v", err)
+	}
+	if updated.Data["JOB_IMAGE"] != "ghcr.io/qubitquilt/boop-runner@sha256:second" {
+		t.Fatalf("post-update data = %q, want second digest", updated.Data["JOB_IMAGE"])
+	}
+	second, err := h.currentJobImage(context.Background())
+	if err != nil {
+		t.Fatalf("second currentJobImage: %v", err)
+	}
+	if first == second {
+		t.Errorf("expected the second read to differ; got both = %q", first)
+	}
+	if second != "ghcr.io/qubitquilt/boop-runner@sha256:second" {
+		t.Errorf("second currentJobImage = %q, want the updated digest", second)
+	}
+}
+
+func TestCurrentJobImage_FallsBackOnMissingConfigMap(t *testing.T) {
+	// No ConfigMap seeded — the read must fail, and the caller
+	// (submitJob) falls back to cfg.JobImage (the env-var
+	// snapshot). This test pins the read-error contract: missing
+	// ConfigMap is NOT a panic, it's a regular error that the
+	// caller can recover from.
+	client := fake.NewSimpleClientset()
+	h := &Handler{
+		cfg: Config{
+			TargetNamespace: "dev-tools",
+			JobImage:        "ghcr.io/qubitquilt/boop-runner@sha256:fallback",
+		},
+		kube: client,
+	}
+	_, err := h.currentJobImage(context.Background())
+	if err == nil {
+		t.Fatal("expected error when ConfigMap is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "boop-config") {
+		t.Errorf("error %q should reference the ConfigMap name", err)
+	}
+}
+
+func TestCurrentJobImage_FallsBackOnMissingKey(t *testing.T) {
+	// ConfigMap exists but is missing the JOB_IMAGE key. The
+	// current code treats this as an error so submitJob falls
+	// back to the env-var value rather than silently using an
+	// empty string (which would surface as an empty `image:`
+	// in the Job template and K8s would reject the Job).
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "boop-config",
+			Namespace: "dev-tools",
+		},
+		Data: map[string]string{
+			"LOG_LEVEL": "info",
+		},
+	}
+	client := fake.NewSimpleClientset(cm)
+	h := &Handler{
+		cfg: Config{
+			TargetNamespace: "dev-tools",
+			JobImage:        "ghcr.io/qubitquilt/boop-runner@sha256:fallback",
+		},
+		kube: client,
+	}
+	_, err := h.currentJobImage(context.Background())
+	if err == nil {
+		t.Fatal("expected error when JOB_IMAGE key is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "JOB_IMAGE") {
+		t.Errorf("error %q should reference the missing key", err)
 	}
 }
