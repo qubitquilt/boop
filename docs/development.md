@@ -67,15 +67,19 @@ make docker-push
 cd apps/runner
 make install        # npm install
 make build          # node --check src/index.mjs (syntax check)
-node --test src/*.test.mjs
+npm test            # node --test src/*.test.mjs src/lib/*.test.mjs
 ```
 
 ### Run locally (no cluster, no LLM)
 
-For the header format, the test suite is the only check:
+For the header format and other pure helpers, the test suite is the only check:
 
 ```
-node --test src/review-header.test.mjs
+cd apps/runner
+npm test                                                  # all tests
+node --test src/review-header.test.mjs                    # just the header fixtures
+node --test src/lib/github.test.mjs                       # GitHub API surface
+node --test src/lib/opencode.test.mjs                     # parser, prompt builder
 ```
 
 ### Run locally (against a real PR, outside a Job)
@@ -203,7 +207,7 @@ make vet            # go vet ./...
 # Runner
 cd apps/runner
 make build          # syntax check
-node --test src/*.test.mjs
+npm test            # all unit + integration tests
 
 # End-to-end (smoke)
 kubectl logs -n dev-tools -l app=boop-receiver --tail=200
@@ -244,10 +248,11 @@ the cluster does not match the GitHub App config. Compare
 | Change the review header format | `apps/runner/src/review-header.mjs` + `apps/receiver/internal/github/client.go` (mirror both) + their tests |
 | Change the dedup key | `apps/receiver/internal/webhook/handler.go` `buildJobName` |
 | Change the request grammar | `apps/receiver/internal/webhook/handler.go` `reviewRequestRegex` |
-| Add a new env var to the Job | `apps/receiver/internal/webhook/job-template.yaml` + `apps/runner/src/index.mjs` (env destructuring) |
+| Add a new env var to the Job | `apps/receiver/internal/webhook/job-template.yaml` + `apps/runner/src/lib/config.mjs` `loadConfig` (env destructuring) + `apps/runner/src/index.mjs` (ctx field uses) |
 | Bump the opencode version | `apps/runner/package.json` |
 | Add a new cluster overlay | [deployment.md](./deployment.md#to-add-a-new-cluster) |
-| Change a status emoji / label | Both the receiver's `STATUS` (`apps/receiver/internal/webhook/handler.go`) and the runner's `STATUS` (`apps/runner/src/index.mjs`). The receiver builds the initial body; the runner appends the timeline. |
+| Change a status emoji / label | Both the receiver's `STATUS` (`apps/receiver/internal/webhook/handler.go`) and the runner's `STATUS` (`apps/runner/src/lib/config.mjs`). The receiver builds the initial body; the runner appends the timeline. |
+| Change a pipeline step | The runner's pipeline is in `apps/runner/src/index.mjs` (orchestration) plus `apps/runner/src/lib/*.mjs` (steps). New tests belong next to the module they cover (`src/lib/<module>.test.mjs`); the integration test in `src/index.test.mjs` exercises the wiring. |
 
 ## See also
 

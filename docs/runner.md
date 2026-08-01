@@ -27,13 +27,27 @@ See also: [README](../apps/runner/README.md), [architecture](./architecture.md),
 ```
 apps/runner/
 ├── src/
-│   ├── index.mjs                  # main: orchestration, status updates, posting
+│   ├── index.mjs                  # thin orchestrator: loadConfig + run() with injected deps
 │   ├── review-header.mjs          # reviewHeader(n) — mirror of Go side
-│   └── review-header.test.mjs     # node:test fixtures
+│   ├── review-header.test.mjs     # node:test fixtures
+│   └── lib/
+│       ├── config.mjs             # loadConfig(env), path constants, STATUS constants
+│       ├── log.mjs                # makeLogger(ctx) — JSON logger with pr/sha stamped
+│       ├── security.mjs           # assertSafeRef, assertSafeSha, readSecretFile, shortSha
+│       ├── git.mjs                # writeNetrc, writeGitconfig, cloneRepo, createCleanupRegistry
+│       ├── opencode.mjs           # runOpencode, materializeConfig, buildBoopPrompt, parseReviewOutput, …
+│       └── github.mjs             # mintInstallationToken, postStatus, postReview, postInlineComments, cleanupPriorReview
 ├── package.json                   # opencode-ai, @octokit/rest, jsonwebtoken
 ├── Dockerfile                     # ubuntu 24.04, node 22, opencode-ai npm
 └── Makefile                       # install / build / docker
 ```
+
+`index.mjs` is just the entry point: it loads the config, mints
+the token, runs the pipeline, and cleans up. Every side effect
+lives in `lib/*.mjs`, each of which accepts a `ctx` (loaded config)
+and a `deps` bundle. A test passes fixture `ctx` + stubbed `deps`
+to drive any single function without env vars, real network, or
+real `git`.
 
 ## Dependencies
 
@@ -263,14 +277,23 @@ both sides pin this.
 
 ```
 cd apps/runner
-make build                  # node --check src/index.mjs
-node --test src/*.test.mjs  # runs review-header.test.mjs
+make build                              # node --check src/index.mjs
+npm test                                # node --test src/*.test.mjs src/lib/*.test.mjs
 ```
 
-The test file lives next to the source (Node 22 supports
-`node --test src/*.test.mjs`). The header test mirrors
-`apps/receiver/internal/github/review_header_test.go` — change one, change
-both.
+Tests are granular — one file per module under `src/lib/`:
+
+- `src/lib/config.test.mjs` — `loadConfig` (env → ctx, defaults, error cases).
+- `src/lib/log.test.mjs` — `makeLogger` shape and JSON stamping.
+- `src/lib/security.test.mjs` — `assertSafeRef`, `assertSafeSha`, `shortSha`, `readSecretFile`.
+- `src/lib/git.test.mjs` — `createCleanupRegistry` (parallel + idempotent) and `cloneRepo` (with mock fs + execFile; verifies each git argv, env, and the netrc/gitconfig content).
+- `src/lib/opencode.test.mjs` — `stripAnsi`, `parseReviewOutput`, `shellQuote`, `confidenceBadge`, `buildBoopPrompt` (with mock fs; verifies H5 markers, lens ordering, frontmatter stripping, re-review vs first-review diff range).
+- `src/lib/github.test.mjs` — `mintInstallationToken`, `postStatus`, `postReview`, `postInlineComments` (parallel + partial failures), `cleanupPriorReview` (parallel fetches + pagination + error counting).
+
+`src/index.test.mjs` is the integration test: it drives `run(env, overrides)` end-to-end with every side effect stubbed — fetch returns canned responses, Octokit is a recording fake, `spawn` and `execFile` are stubs, `runOpenCodeSkill` returns a canned review — and asserts the orchestration order (auth → review → done), failure paths, re-review cleanup gating, and defense-in-depth gates.
+
+The `review-header.test.mjs` mirrors
+`apps/receiver/internal/github/review_header_test.go` — change one, change both.
 
 ## Build
 
