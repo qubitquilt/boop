@@ -1,0 +1,405 @@
+// GitHub API surface.
+//
+// Everything the runner does against GitHub lives here:
+//   - mintInstallationToken: exchange an App JWT for an installation token
+//   - postStatus / postReview / postInlineComment: the public comments
+//   - cleanupPriorReview: resolve outdated threads + minimize prior bot comments
+//   - graphql + paginated fetches used by cleanup
+//
+// Each function takes the loaded `ctx` and a `deps` bundle (fetch,
+// Octokit factory, logger, status constants) so a test can pass a
+// stub Octokit and a recording fetch without touching the network.
+
+import { Octokit } from "@octokit/rest";
+import { SHORT, STATUS } from "./config.mjs";
+import { shortSha } from "./security.mjs";
+import { reviewHeader } from "../review-header.mjs";
+
+// mintInstallationToken exchanges an App JWT for an installation
+// token (1h TTL). Used by both status updates and the cleanup
+// GraphQL fetches.
+export async function mintInstallationToken(appId, privateKey, installationId, deps) {
+  const { jwt, fetch, fetchImpl = fetch, log } = deps;
+  const now = Math.floor(Date.now() / 1000);
+  const appJwt = jwt.sign(
+    { iat: now - 30, exp: now + 600, iss: String(appId) },
+    privateKey,
+    { algorithm: "RS256" },
+  );
+
+  const res = await fetchImpl(
+    `https://api.github.com/app/installations/${installationId}/access_tokens`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${appJwt}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "boop-runner",
+      },
+    },
+  );
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`mint installation token: ${res.status} ${text}`);
+  }
+  const data = await res.json();
+  return data.token;
+}
+
+// graphql POSTs a query/mutation to api.github.com/graphql with the
+// installation token and returns the JSON `data` object. Throws on
+// transport errors or top-level GraphQL errors.
+async function graphql(token, query, variables, deps) {
+  const { fetchImpl = fetch } = deps;
+  const res = await fetchImpl("https://api.github.com/graphql", {
+    method: "POST",
+    headers: {
+      Authorization: `bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "boop-runner",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`graphql HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const json = await res.json();
+  if (json.errors && json.errors.length > 0) {
+    throw new Error(`graphql: ${json.errors.map((e) => e.message).join("; ")}`);
+  }
+  return json.data;
+}
+
+// paginateThreads walks every review thread on the PR, paginating
+// until exhausted. Each returned thread is annotated with the
+// original comment's author login (case-insensitive match).
+async function fetchAllReviewThreads(token, ctx, deps) {
+  const threads = [];
+  let cursor = null;
+  const query = `
+    query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          reviewThreads(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id
+              isResolved
+              isOutdated
+              comments(first: 1) {
+                nodes { author { login } }
+              }
+            }
+          }
+        }
+      }
+    }`;
+  while (true) {
+    const data = await graphql(token, query, {
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      number: Number(ctx.prNumber),
+      cursor,
+    }, deps);
+    const conn = data?.repository?.pullRequest?.reviewThreads;
+    if (!conn) break;
+    for (const node of conn.nodes) {
+      const author =
+        node?.comments?.nodes?.[0]?.author?.login?.toLowerCase() || "";
+      threads.push({
+        id: node.id,
+        isResolved: node.isResolved === true,
+        isOutdated: node.isOutdated === true,
+        author,
+      });
+    }
+    if (!conn.pageInfo?.hasNextPage) break;
+    cursor = conn.pageInfo.endCursor;
+  }
+  return threads;
+}
+
+// fetchPriorBotIssueCommentIDs walks every issue comment on the PR
+// via the REST API (GraphQL's pullRequest.comments misses some bot
+// comments that were posted via the issue-comments API). Returns
+// the integer IDs of every comment posted by the bot, excluding the
+// current run's status comment.
+async function fetchPriorBotIssueCommentIDs(token, ctx, deps) {
+  const ids = [];
+  const headers = {
+    Authorization: `bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "boop-runner",
+  };
+  const { fetchImpl = fetch } = deps;
+
+  let page = 1;
+  while (true) {
+    const res = await fetchImpl(
+      `https://api.github.com/repos/${ctx.prOwner}/${ctx.prRepo}/issues/${ctx.prNumber}/comments?per_page=100&page=${page}`,
+      { headers },
+    );
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`list comments HTTP ${res.status}: ${text.slice(0, 200)}`);
+    }
+    const arr = await res.json();
+    if (!Array.isArray(arr) || arr.length === 0) break;
+    for (const c of arr) {
+      const author = c?.user?.login?.toLowerCase() || "";
+      if (ctx.botLogin && author !== ctx.botLogin.toLowerCase()) continue;
+      if (ctx.statusCommentId && Number(c.id) === ctx.statusCommentId) continue;
+      ids.push({ id: Number(c.id), nodeId: c.node_id });
+    }
+    if (arr.length < 100) break;
+    page++;
+  }
+  return ids;
+}
+
+// resolveReviewThread marks one review thread as resolved.
+async function resolveReviewThread(token, threadId, deps) {
+  const data = await graphql(
+    token,
+    `mutation($id: ID!) {
+       resolveReviewThread(input: { threadId: $id }) {
+         thread { id isResolved }
+       }
+     }`,
+    { id: threadId },
+    deps,
+  );
+  return data?.resolveReviewThread?.thread?.isResolved === true;
+}
+
+// minimizeComment collapses a comment in the PR UI. The body stays
+// in the API (so the boop-head-sha marker remains parsable by the
+// receiver's CountPriorReviews) but the comment is hidden by default.
+async function minimizeComment(token, commentNodeId, deps) {
+  const data = await graphql(
+    token,
+    `mutation($id: ID!) {
+       minimizeComment(input: { subjectId: $id, classifier: OUTDATED }) {
+         minimizedComment { isMinimized }
+       }
+     }`,
+    { id: commentNodeId },
+    deps,
+  );
+  return data?.minimizeComment?.minimizedComment?.isMinimized === true;
+}
+
+// postStatus PATCHes the receiver-pre-created status comment with the
+// latest stage. Best-effort: any error is logged but the run continues
+// (status is informational, not load-bearing for the review itself).
+export async function postStatus(stage, detail, ctx, deps) {
+  const { octokit, log, errlog } = deps;
+  if (!octokit || !ctx.statusCommentId) {
+    log("status", "skip (no client or comment id)", { stage });
+    return;
+  }
+  const tpl = STATUS[stage] || `boop status: ${stage}`;
+  const short = SHORT[stage] || stage;
+  const entry = detail
+    ? `- ${short}
+  <details><summary>details</summary>
+
+  \`\`\`
+  ${detail}
+  \`\`\`
+  </details>`
+    : `- ${short}`;
+  try {
+    const { data: current } = await octokit.rest.issues.getComment({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      comment_id: ctx.statusCommentId,
+    });
+    const sep = "<!-- boop-timeline -->";
+    let body;
+    if (current.body.includes(sep)) {
+      body = current.body + "\n" + entry;
+    } else {
+      const header = tpl.replace(/\{sha\}/g, shortSha(ctx.prHeadSha));
+      body = `${header}\n\n${sep}\n${entry}`;
+    }
+    if (body.length > 60000) {
+      const cutAt = body.indexOf(sep) + sep.length + 2;
+      body = body.slice(0, cutAt) + "_(earlier entries trimmed)_\n" + body.slice(body.length - 58000);
+    }
+    await octokit.rest.issues.updateComment({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      comment_id: ctx.statusCommentId,
+      body,
+    });
+    log("status", "comment updated", { stage, comment_id: ctx.statusCommentId });
+  } catch (err) {
+    errlog("status", "comment update failed", { stage, err: String(err?.message ?? err) });
+  }
+}
+
+// makeOctokit creates an Octokit bound to the installation token.
+// Exported so callers can reuse the same instance for both REST and
+// the postStatus / postReview / postInlineComment calls.
+export function makeOctokit(installationToken, deps = {}) {
+  const OctokitCtor = deps.OctokitCtor || Octokit;
+  return new OctokitCtor({ auth: installationToken });
+}
+
+// postReview creates the summary comment with the confidence badge,
+// review header, and the hidden head-SHA marker for re-review diffing.
+export async function postReview(octokit, body, reviewNumber, confidence, ctx) {
+  const max = 65000;
+  const cleaned = body.replace(/\n{3,}/g, "\n\n").trim();
+  const trimmed = cleaned.length > max ? cleaned.slice(0, max - 50) + "\n\n…(truncated)" : cleaned;
+  const reviewTag = reviewNumber > 1 ? ` · review #${reviewNumber}` : "";
+  const badge = confidenceBadgeLocal(confidence || "medium");
+  // Hidden marker carrying the full head SHA so the next re-review
+  // can diff the delta from this commit. The receiver parses this
+  // (see priorReviewHeadSHARegex in client.go). GitHub renders HTML
+  // comments as nothing in the markdown view, so it's invisible to
+  // human readers.
+  const headMarker = `<!-- boop-head-sha: ${ctx.prHeadSha} -->`;
+  await octokit.rest.issues.createComment({
+    owner: ctx.prOwner,
+    repo: ctx.prRepo,
+    issue_number: Number(ctx.prNumber),
+    body:
+      `${reviewHeader(reviewNumber)}\n\n` +
+      `${badge}\n\n` +
+      trimmed +
+      `\n\n<sub>Posted by [BoopPr](https://github.com/qubitquilt/boop) · PR \`${shortSha(ctx.prHeadSha)}\`${reviewTag} · good boy powered</sub>` +
+      `\n${headMarker}`,
+  });
+}
+
+// postInlineComment creates a single line-specific review comment on
+// the PR. Uses GitHub's "review comments" API which renders inline on
+// the file diff.
+async function postInlineComment(octokit, c, ctx) {
+  await octokit.rest.pulls.createReviewComment({
+    owner: ctx.prOwner,
+    repo: ctx.prRepo,
+    pull_number: Number(ctx.prNumber),
+    body: c.body,
+    commit_id: ctx.prHeadSha,
+    path: c.path,
+    line: c.line,
+    side: "RIGHT",
+  });
+}
+
+// postInlineComments posts every line-specific comment in parallel.
+// Each comment is independent, so a single failure does not block the
+// rest. We use Promise.allSettled so failures are surfaced via the
+// logger rather than thrown.
+export async function postInlineComments(octokit, comments, ctx, deps) {
+  const { log, errlog } = deps;
+  const results = await Promise.allSettled(
+    comments.map((c) => postInlineComment(octokit, c, ctx)),
+  );
+  let ok = 0;
+  results.forEach((r, i) => {
+    if (r.status === "fulfilled") {
+      ok++;
+    } else {
+      errlog("inline", "failed to post inline comment", {
+        path: comments[i].path,
+        line: comments[i].line,
+        err: String(r.reason?.message ?? r.reason),
+      });
+    }
+  });
+  if (comments.length > 0) {
+    log("done", `posted ${ok}/${comments.length} inline comments`);
+  }
+}
+
+// cleanupPriorReview runs on re-reviews only. It:
+//   1. Resolves every Boop review thread whose diff line is gone or
+//      changed (isOutdated === true) — the author has either fixed
+//      the issue or removed the code.
+//   2. Minimizes every other prior Boop issue comment (status
+//      threads, prior summary comments) so the PR UI is dominated
+//      by the active review.
+//
+// Best-effort. The review already posted — a cleanup failure is
+// logged but does not fail the run. The two fetches (review threads,
+// issue comments) run in parallel; without that, a slow reviewThreads
+// fetch would block the minimize pass by ~tens of seconds.
+export async function cleanupPriorReview(token, ctx, deps) {
+  const { log, errlog } = deps;
+  const result = { resolved: 0, minimized: 0, errors: 0 };
+
+  // 1+2 in parallel. Each returns a list we then iterate serially to
+  // mutate the threads/comments — the network wait is the slow part
+  // and that's what we're collapsing.
+  const [threads, priors] = await Promise.all([
+    fetchAllReviewThreads(token, ctx, deps),
+    fetchPriorBotIssueCommentIDs(token, ctx, deps),
+  ]);
+
+  const targets = threads.filter(
+    (t) =>
+      !t.isResolved &&
+      t.isOutdated &&
+      ctx.botLogin &&
+      t.author === ctx.botLogin.toLowerCase(),
+  );
+  log("cleanup", "scanned review threads", {
+    total: threads.length,
+    bot_outdated: targets.length,
+  });
+  for (const t of targets) {
+    try {
+      if (await resolveReviewThread(token, t.id, deps)) {
+        result.resolved++;
+      }
+    } catch (err) {
+      result.errors++;
+      errlog("cleanup", "resolve failed", {
+        thread: t.id,
+        err: String(err?.message ?? err),
+      });
+    }
+  }
+
+  log("cleanup", "scanned issue comments", { bot_total: priors.length });
+  for (const c of priors) {
+    try {
+      if (await minimizeComment(token, c.nodeId, deps)) {
+        result.minimized++;
+      }
+    } catch (err) {
+      result.errors++;
+      errlog("cleanup", "minimize failed", {
+        comment: c.id,
+        err: String(err?.message ?? err),
+      });
+    }
+  }
+
+  return result;
+}
+
+// confidenceBadge mirrors the one in lib/opencode.mjs; inlined here
+// because the comment-rendering path doesn't need the opencode deps
+// and tests for postReview can import this module without pulling in
+// the opencode pipeline.
+function confidenceBadgeLocal(c) {
+  switch (c) {
+    case "high":
+      return "✅ **Confidence: high** — ready to merge.";
+    case "medium":
+      return "⚠️ **Confidence: medium** — Follow-ups worth addressing, no Blocking findings.";
+    case "low":
+    default:
+      return "🚨 **Confidence: low** — Blocking finding(s) present, not safe to merge without changes.";
+  }
+}

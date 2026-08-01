@@ -6,7 +6,7 @@
   "description": "BoopPr runner: clones a PR, runs the multi-lens review via OpenCode, and posts a friendly summary with inline comments",
   "scripts": {
     "start": "node src/index.mjs",
-    "test": "node --test src/*.test.mjs"
+    "test": "node --test src/*.test.mjs src/lib/*.test.mjs"
   },
   "engines": {
     "node": ">=22"
