@@ -490,6 +490,9 @@ export function runOpencode(prompt, configContent, deps) {
   });
 }
 
+// 2026-08-01: trivial commit to trigger build-runner and exercise
+// the new sync-image-digests dedupe shape end-to-end. Revert.
+
 // runOpenCodeSkill is the orchestrator over buildBoopPrompt + opencode
 // subprocess invocation. Returns { summary, inlineComments, confidence }.
 export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
