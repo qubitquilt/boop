@@ -1,10 +1,21 @@
 package webhook
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 )
 
 // TestRenderStatusBody locks the initial status comment template the
@@ -418,5 +429,445 @@ func TestBuildJob_RejectsBadPreviousHeadSHA(t *testing.T) {
 				t.Errorf("buildJob accepted previous head SHA %q", ref)
 			}
 		})
+	}
+}
+
+// TestCurrentJobImage_ReadsConfigMap pins the receiver's
+// runtime-JOB_IMAGE-resolution path. The receiver used to bake
+// JOB_IMAGE at startup from the boop-config ConfigMap, which
+// meant ArgoCD-driven ConfigMap updates didn't reach the Job
+// template until the receiver pod was restarted. Today
+// (2026-08-01) this caused a real incident: PR #83 bumped the
+// runner digest in main, ArgoCD synced the ConfigMap, but the
+// next Boop Job pulled the pre-#83 image. The fix is to read
+// the ConfigMap on each submitJob call.
+func TestCurrentJobImage_ReadsConfigMap(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "boop-config",
+			Namespace: "dev-tools",
+		},
+		Data: map[string]string{
+			"JOB_IMAGE": "ghcr.io/qubitquilt/boop-runner@sha256:f71ad0c70075e10423ba5ec741d826bbd212f36a4dc97d255c5ed51256bbde72",
+		},
+	}
+	client := fake.NewSimpleClientset(cm)
+	h := &Handler{
+		cfg: Config{
+			TargetNamespace: "dev-tools",
+			// Stale startup value — currentJobImage must NOT return this
+			// when the ConfigMap has a fresh value.
+			JobImage: "ghcr.io/qubitquilt/boop-runner@sha256:old-old-old",
+		},
+		kube: client,
+	}
+	got, err := h.currentJobImage(context.Background())
+	if err != nil {
+		t.Fatalf("currentJobImage: %v", err)
+	}
+	if got != cm.Data["JOB_IMAGE"] {
+		t.Errorf("currentJobImage = %q, want %q", got, cm.Data["JOB_IMAGE"])
+	}
+}
+
+func TestCurrentJobImage_PicksUpLatestDigest(t *testing.T) {
+	// Two calls in a row — second call sees an updated ConfigMap.
+	// Without re-reading, the second call would return the first
+	// call's value (or the env-var snapshot). With re-reading, the
+	// receiver picks up the new digest within one submit.
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "boop-config",
+			Namespace: "dev-tools",
+		},
+		Data: map[string]string{
+			"JOB_IMAGE": "ghcr.io/qubitquilt/boop-runner@sha256:first",
+		},
+	}
+	client := fake.NewSimpleClientset(cm)
+	h := &Handler{
+		cfg: Config{TargetNamespace: "dev-tools"},
+		kube: client,
+	}
+	first, err := h.currentJobImage(context.Background())
+	if err != nil {
+		t.Fatalf("first currentJobImage: %v", err)
+	}
+	if first != "ghcr.io/qubitquilt/boop-runner@sha256:first" {
+		t.Fatalf("first read = %q, want first digest", first)
+	}
+	// The fake client returns a deep copy from Get, so mutating
+	// the original `cm` object does NOT change what subsequent Get
+	// calls return. Update the ConfigMap through the fake client
+	// to simulate ArgoCD landing a new digest.
+	cm.Data["JOB_IMAGE"] = "ghcr.io/qubitquilt/boop-runner@sha256:second"
+	updated, err := client.CoreV1().ConfigMaps("dev-tools").Update(
+		context.Background(), cm, metav1.UpdateOptions{},
+	)
+	if err != nil {
+		t.Fatalf("update configmap: %v", err)
+	}
+	if updated.Data["JOB_IMAGE"] != "ghcr.io/qubitquilt/boop-runner@sha256:second" {
+		t.Fatalf("post-update data = %q, want second digest", updated.Data["JOB_IMAGE"])
+	}
+	second, err := h.currentJobImage(context.Background())
+	if err != nil {
+		t.Fatalf("second currentJobImage: %v", err)
+	}
+	if first == second {
+		t.Errorf("expected the second read to differ; got both = %q", first)
+	}
+	if second != "ghcr.io/qubitquilt/boop-runner@sha256:second" {
+		t.Errorf("second currentJobImage = %q, want the updated digest", second)
+	}
+}
+
+func TestCurrentJobImage_FallsBackOnMissingConfigMap(t *testing.T) {
+	// No ConfigMap seeded — the read must fail, and the caller
+	// (submitJob) falls back to cfg.JobImage (the env-var
+	// snapshot). This test pins the read-error contract: missing
+	// ConfigMap is NOT a panic, it's a regular error that the
+	// caller can recover from.
+	client := fake.NewSimpleClientset()
+	h := &Handler{
+		cfg: Config{
+			TargetNamespace: "dev-tools",
+			JobImage:        "ghcr.io/qubitquilt/boop-runner@sha256:fallback",
+		},
+		kube: client,
+	}
+	_, err := h.currentJobImage(context.Background())
+	if err == nil {
+		t.Fatal("expected error when ConfigMap is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "boop-config") {
+		t.Errorf("error %q should reference the ConfigMap name", err)
+	}
+}
+
+func TestCurrentJobImage_FallsBackOnMissingKey(t *testing.T) {
+	// ConfigMap exists but is missing the JOB_IMAGE key. The
+	// current code treats this as an error so submitJob falls
+	// back to the env-var value rather than silently using an
+	// empty string (which would surface as an empty `image:`
+	// in the Job template and K8s would reject the Job).
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "boop-config",
+			Namespace: "dev-tools",
+		},
+		Data: map[string]string{
+			"LOG_LEVEL": "info",
+		},
+	}
+	client := fake.NewSimpleClientset(cm)
+	h := &Handler{
+		cfg: Config{
+			TargetNamespace: "dev-tools",
+			JobImage:        "ghcr.io/qubitquilt/boop-runner@sha256:fallback",
+		},
+		kube: client,
+	}
+	_, err := h.currentJobImage(context.Background())
+	if err == nil {
+		t.Fatal("expected error when JOB_IMAGE key is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "JOB_IMAGE") {
+		t.Errorf("error %q should reference the missing key", err)
+	}
+}
+
+// TestResolveJobImageForSubmit_FallbackLogsWarn pins F2: a single
+// fallback logs at Warn level (not Error). The Error escalation
+// lives in a separate test.
+func TestResolveJobImageForSubmit_FallbackLogsWarn(t *testing.T) {
+	client := fake.NewSimpleClientset() // no ConfigMap seeded → read fails
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := &Handler{
+		cfg: Config{
+			TargetNamespace: "dev-tools",
+			JobImage:        "ghcr.io/qubitquilt/boop-runner@sha256:fallback",
+		},
+		kube:   client,
+		logger: logger,
+	}
+	image, source := h.resolveJobImageForSubmit(context.Background())
+	if image != h.cfg.JobImage {
+		t.Errorf("image = %q, want fallback %q", image, h.cfg.JobImage)
+	}
+	if source != "fallback" {
+		t.Errorf("source = %q, want fallback", source)
+	}
+	// First failure: Warn.
+	if !strings.Contains(logBuf.String(), `"level":"WARN"`) {
+		t.Errorf("first fallback should log at WARN, got: %s", logBuf.String())
+	}
+	if strings.Contains(logBuf.String(), `"level":"ERROR"`) {
+		t.Errorf("first fallback should NOT escalate to ERROR: %s", logBuf.String())
+	}
+}
+
+// TestResolveJobImageForSubmit_EscalatesAfterThreshold pins F2:
+// consecutive fallbacks escalate Warn → Error once the count
+// crosses consecutiveFallbackAlertAt. A single successful read in
+// between resets the counter.
+//
+// In production the receiver is one process with one Handler, so
+// the counter persists across webhook calls. The test mirrors that
+// by constructing ONE Handler and driving multiple calls against
+// it — if each call got its own Handler, the counter would always
+// start at 0 and the escalation would never fire.
+func TestResolveJobImageForSubmit_EscalatesAfterThreshold(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "boop-config",
+			Namespace: "dev-tools",
+		},
+		Data: map[string]string{"JOB_IMAGE": "ghcr.io/qubitquilt/boop-runner@sha256:live"},
+	}
+	var failConfigMap bool
+	var configMapMu sync.Mutex
+	client := fake.NewSimpleClientset(cm)
+	client.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+		configMapMu.Lock()
+		defer configMapMu.Unlock()
+		if failConfigMap {
+			return true, nil, errors.New("simulated API outage")
+		}
+		return false, nil, nil
+	})
+
+	// One Handler shared across all calls so the counter persists.
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := &Handler{
+		cfg: Config{
+			TargetNamespace: "dev-tools",
+			JobImage:        "ghcr.io/qubitquilt/boop-runner@sha256:fallback",
+		},
+		kube:   client,
+		logger: logger,
+	}
+
+	callOnce := func(label string) {
+		logBuf.Reset()
+		configMapMu.Lock()
+		fail := failConfigMap
+		configMapMu.Unlock()
+		image, _ := h.resolveJobImageForSubmit(context.Background())
+		t.Logf("%s: image=%s fail=%v log=%s", label, image, fail, strings.TrimSpace(logBuf.String()))
+	}
+
+	// Three consecutive failures — first two should be WARN, third
+	// is the one that crosses the threshold.
+	configMapMu.Lock()
+	failConfigMap = true
+	configMapMu.Unlock()
+	callOnce("first failure")
+	first := logBuf.String()
+
+	logBuf.Reset()
+	callOnce("second failure")
+	second := logBuf.String()
+
+	logBuf.Reset()
+	callOnce("third failure (crosses threshold)")
+	third := logBuf.String()
+
+	if !strings.Contains(first, `"level":"WARN"`) || strings.Contains(first, `"level":"ERROR"`) {
+		t.Errorf("first failure should be WARN only, got: %s", first)
+	}
+	if !strings.Contains(second, `"level":"WARN"`) || strings.Contains(second, `"level":"ERROR"`) {
+		t.Errorf("second failure should be WARN only, got: %s", second)
+	}
+	if !strings.Contains(third, `"level":"ERROR"`) {
+		t.Errorf("third failure should escalate to ERROR, got: %s", third)
+	}
+	// The counter field is logged so dashboards can graph the
+	// degradation even before the escalation threshold.
+	for i, log := range []string{first, second, third} {
+		if !strings.Contains(log, `"consecutive_fallbacks":`) {
+			t.Errorf("call %d missing consecutive_fallbacks in log: %s", i+1, log)
+		}
+	}
+	if !strings.Contains(first, `"consecutive_fallbacks":1`) {
+		t.Errorf("first failure counter should be 1, got: %s", first)
+	}
+	if !strings.Contains(third, `"consecutive_fallbacks":3`) {
+		t.Errorf("third failure counter should be 3, got: %s", third)
+	}
+
+	// Now the API recovers. A single successful read must reset
+	// the counter — the next failure should log WARN again, not
+	// ERROR.
+	configMapMu.Lock()
+	failConfigMap = false
+	configMapMu.Unlock()
+	logBuf.Reset()
+	callOnce("recovery read")
+	recovery := logBuf.String()
+	if !strings.Contains(recovery, `"level":"INFO"`) {
+		// Successful read logs nothing — only the failure path
+		// emits a log line. Confirm that.
+		if recovery != "" {
+			t.Errorf("recovery read should produce no log, got: %s", recovery)
+		}
+	}
+
+	configMapMu.Lock()
+	failConfigMap = true
+	configMapMu.Unlock()
+	logBuf.Reset()
+	callOnce("failure after recovery")
+	afterRecovery := logBuf.String()
+	if !strings.Contains(afterRecovery, `"level":"WARN"`) || strings.Contains(afterRecovery, `"level":"ERROR"`) {
+		t.Errorf("post-recovery failure should be WARN (counter reset), got: %s", afterRecovery)
+	}
+	if !strings.Contains(afterRecovery, `"consecutive_fallbacks":1`) {
+		t.Errorf("post-recovery failure should log counter=1, got: %s", afterRecovery)
+	}
+}
+
+// TestSubmitJob_FallsBackOnConfigMapReadFailure pins F1: even
+// when currentJobImage errors, submitJob's Job template uses
+// cfg.JobImage (the env-var snapshot). Without this test, a
+// future refactor of submitJob that drops the fallback
+// assignment would re-introduce the original bug
+// (Job created with an empty image field) silently.
+func TestSubmitJob_FallsBackOnConfigMapReadFailure(t *testing.T) {
+	const fallbackImage = "ghcr.io/qubitquilt/boop-runner@sha256:fallback-from-env"
+	const liveImage = "ghcr.io/qubitquilt/boop-runner@sha256:should-NOT-be-used"
+
+	// Seed a ConfigMap that the test would otherwise pick up —
+	// proves the fallback path runs even when a fresh digest is
+	// available (because the read fails).
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "boop-config",
+			Namespace: "dev-tools",
+		},
+		Data: map[string]string{"JOB_IMAGE": liveImage},
+	}
+	client := fake.NewSimpleClientset(cm)
+	client.PrependReactor("get", "configmaps", func(action ktesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("simulated API outage: ConfigMap get fails")
+	})
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	h := &Handler{
+		cfg: Config{
+			Port:            "8080",
+			WebhookSecret:   "test-secret",
+			TargetNamespace: "dev-tools",
+			JobImage:        fallbackImage,
+		},
+		kube:   client,
+		logger: logger,
+		dedup:  newDeliveryDedup(4096),
+		limiter: nil, // not exercised in this test path
+	}
+
+	// submitJob's signature is wide; most args are required for
+	// buildJob but not for the image-resolution path we're
+	// pinning. reactionCommentID=0 because the pull_request branch
+	// doesn't react on the trigger comment.
+	w := httptest.NewRecorder()
+	h.submitJob(
+		context.Background(),
+		w,
+		"delivery-id-fallback",
+		"michaelruelas",
+		"family-picnic-platform",
+		18,
+		"7e895631f15f6ba1a542b5cbf68d7dc8d887de82",
+		"main",
+		"",                                // previousHeadSHA
+		"pull_request.opened",
+		0,                                 // reactionCommentID
+		5153677875,                        // statusCommentID (validates the Job runs the status thread)
+		12345,                             // installationID
+		1,                                 // reviewNumber
+	)
+
+	// Pull the Job the handler created and assert its image.
+	jobs, err := client.BatchV1().Jobs("dev-tools").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected exactly 1 Job created, got %d", len(jobs.Items))
+	}
+	gotImage := jobs.Items[0].Spec.Template.Spec.Containers[0].Image
+	if gotImage != fallbackImage {
+		t.Errorf("Job image = %q, want fallback %q", gotImage, fallbackImage)
+	}
+	if gotImage == liveImage {
+		t.Errorf("Job image picked up the live ConfigMap value despite the read failure — the read did not actually fail")
+	}
+
+	// The fallback log line should appear.
+	if !strings.Contains(logBuf.String(), `"msg":"read boop-config for JOB_IMAGE, using startup value"`) {
+		t.Errorf("expected fallback log line, got: %s", logBuf.String())
+	}
+}
+
+// TestSubmitJob_UsesLiveConfigMapWhenAvailable pins the opposite
+// half of F1: when the ConfigMap read succeeds, submitJob uses
+// the live digest, not the env-var snapshot. Together with
+// TestSubmitJob_FallsBackOnConfigMapReadFailure, this test pins
+// the full submitJob image-resolution contract.
+func TestSubmitJob_UsesLiveConfigMapWhenAvailable(t *testing.T) {
+	const liveImage = "ghcr.io/qubitquilt/boop-runner@sha256:live"
+	const staleImage = "ghcr.io/qubitquilt/boop-runner@sha256:stale-from-env"
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "boop-config",
+			Namespace: "dev-tools",
+		},
+		Data: map[string]string{"JOB_IMAGE": liveImage},
+	}
+	client := fake.NewSimpleClientset(cm)
+	h := &Handler{
+		cfg: Config{
+			Port:            "8080",
+			WebhookSecret:   "test-secret",
+			TargetNamespace: "dev-tools",
+			JobImage:        staleImage,
+		},
+		kube:    client,
+		logger:  slog.New(slog.NewJSONHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		dedup:   newDeliveryDedup(4096),
+		limiter: nil,
+	}
+	w := httptest.NewRecorder()
+	h.submitJob(
+		context.Background(),
+		w,
+		"delivery-id-live",
+		"michaelruelas",
+		"family-picnic-platform",
+		18,
+		"7e895631f15f6ba1a542b5cbf68d7dc8d887de82",
+		"main",
+		"",
+		"pull_request.opened",
+		0,
+		5153677875,
+		12345,
+		1,
+	)
+	jobs, err := client.BatchV1().Jobs("dev-tools").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("list jobs: %v", err)
+	}
+	if len(jobs.Items) != 1 {
+		t.Fatalf("expected exactly 1 Job created, got %d", len(jobs.Items))
+	}
+	gotImage := jobs.Items[0].Spec.Template.Spec.Containers[0].Image
+	if gotImage != liveImage {
+		t.Errorf("Job image = %q, want live %q", gotImage, liveImage)
 	}
 }

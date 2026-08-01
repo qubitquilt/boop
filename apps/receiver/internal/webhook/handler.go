@@ -86,6 +86,20 @@ type Handler struct {
 	kube     kubernetes.Interface
 	ghClient *boopgithub.Manager
 
+	// consecutiveConfigMapFallbacks tracks how many submitJob calls
+	// in a row fell back to h.cfg.JobImage because currentJobImage
+	// failed. Reset to 0 on each successful ConfigMap read. When
+	// the count crosses consecutiveFallbackAlertAt, the receiver
+	// logs at Error level instead of Warn so a sustained
+	// staleness surfaces on log-based alerting instead of only on
+	// grep. The original bug shape (receiver submits Jobs with
+	// the env-var snapshot while the ConfigMap carries a newer
+	// digest) returns under any persistent K8s API failure —
+	// RBAC misconfiguration, deleted ConfigMap, wrong namespace.
+	// Without an escalation, a sustained staleness is invisible.
+	consecutiveConfigMapFallbacks     int
+	consecutiveConfigMapFallbacksLock sync.Mutex
+
 	// dedup is an in-memory FIFO ring keyed by X-GitHub-Delivery
 	// header. GitHub's webhook deliveries are idempotent (the
 	// same delivery ID represents the same physical event), so
@@ -104,6 +118,16 @@ type Handler struct {
 	// thousands of webhooks against a single receiver.
 	limiter *rate.Limiter
 }
+
+// consecutiveFallbackAlertAt is the threshold at which the
+// receiver escalates the K8s ConfigMap fallback log line from
+// Warn to Error. The number is small enough that a real outage
+// (RBAC broken, ConfigMap deleted) trips it within a handful of
+// webhooks, and large enough that a transient API blip stays at
+// Warn. The threshold is a constant rather than a field because
+// no operator has asked for it to be tunable and a misconfiguration
+// here would be hard to detect.
+const consecutiveFallbackAlertAt = 3
 
 // deliveryDedup is a fixed-size FIFO ring keyed by the GitHub
 // delivery ID. Sized for 4096 entries (well above the practical
@@ -513,6 +537,19 @@ func duplicateReviewReply(status, headSHA string) string {
 func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID, installationID int64, reviewNumber int) {
 	jobName := buildJobName(owner, repo, number, headSHA)
 
+	// Resolve JOB_IMAGE fresh from the boop-config ConfigMap instead
+	// of using the env-var snapshot captured at startup. ArgoCD
+	// updates the ConfigMap digest without redeploying the receiver
+	// Deployment, so the env-var value goes stale until the next
+	// receiver restart. Reading on each submit (one extra K8s API
+	// call per webhook, webhook rate is bounded) keeps the Job in
+	// sync with whatever digest sync-image-digests just landed.
+	// Falls back to the env-var snapshot if the API read fails so
+	// a transient API hiccup doesn't block a review; the fallback
+	// counter escalates to Error-level logging after
+	// consecutiveFallbackAlertAt uses in a row.
+	image, _ := h.resolveJobImageForSubmit(ctx)
+
 	job, err := buildJob(templateVars{
 		Owner:             owner,
 		Repo:              repo,
@@ -521,7 +558,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		SHA7:              shortSHA(headSHA),
 		BaseRef:           baseRef,
 		PreviousHeadSHA:   previousHeadSHA,
-		Image:             h.cfg.JobImage,
+		Image:             image,
 		StatusCommentID:   fmt.Sprintf("%d", statusCommentID),
 		ReactionCommentID: fmt.Sprintf("%d", reactionCommentID),
 		ReviewNumber:      fmt.Sprintf("%d", reviewNumber),
@@ -567,6 +604,92 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		"review_number", reviewNumber,
 	)
 	writeAck(w, "accepted", jobName, delivery)
+}
+
+// boopConfigMapName is the ConfigMap the receiver reads for
+// JOB_IMAGE. Defined as a constant so the test can use the same
+// value when seeding the fake client. The ConfigMap lives in the
+// receiver's own namespace (TARGET_NAMESPACE, default "dev-tools")
+// and is owned by ArgoCD, not the receiver.
+const boopConfigMapName = "boop-config"
+
+// jobImageKey is the data key under which JOB_IMAGE is stored in
+// the boop-config ConfigMap. Must match apps/k8s/base/config.yaml.
+const jobImageKey = "JOB_IMAGE"
+
+// currentJobImage reads JOB_IMAGE from the boop-config ConfigMap
+// in the receiver's namespace and returns the freshest value ArgoCD
+// has synced. Falls back to the env-var snapshot (h.cfg.JobImage)
+// when the read fails so a transient K8s API hiccup doesn't block
+// a review. Not cached: the K8s API round-trip is cheap relative to
+// the rest of the webhook handler (token mint + GitHub API calls),
+// and skipping the cache keeps the recovery time at "next webhook"
+// after ArgoCD syncs a new digest.
+//
+// The receiver's Role grants configmaps:get/list/watch in
+// TARGET_NAMESPACE — see apps/k8s/base/role.yaml. The ConfigMap is
+// namespace-scoped, so the receiver can only read it from its own
+// namespace, which is the right blast-radius.
+func (h *Handler) currentJobImage(ctx context.Context) (string, error) {
+	cm, err := h.kube.CoreV1().ConfigMaps(h.cfg.TargetNamespace).Get(ctx, boopConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("get %s/%s: %w", h.cfg.TargetNamespace, boopConfigMapName, err)
+	}
+	v, ok := cm.Data[jobImageKey]
+	if !ok || v == "" {
+		return "", fmt.Errorf("%s/%s missing %q key", h.cfg.TargetNamespace, boopConfigMapName, jobImageKey)
+	}
+	return v, nil
+}
+
+// resolveJobImageForSubmit wraps currentJobImage with the
+// fallback-to-env-snapshot policy and the consecutive-failure
+// counter. Always returns a non-empty image suitable for the Job
+// template: a successful ConfigMap read returns the live digest;
+// a failed read returns the env-var snapshot and increments the
+// counter (escalating to Error-level logging after
+// consecutiveFallbackAlertAt). On success, the counter resets to
+// 0 — a single successful read is enough to declare "the API is
+// fine, the previous failures were transient."
+//
+// Returned source is "configmap" or "fallback" so tests can
+// assert the path taken without inspecting logs.
+func (h *Handler) resolveJobImageForSubmit(ctx context.Context) (image, source string) {
+	cm, err := h.currentJobImage(ctx)
+	if err == nil {
+		h.resetConfigMapFallbacks()
+		return cm, "configmap"
+	}
+	count := h.bumpConfigMapFallbacks()
+	level := slog.LevelWarn
+	if count >= consecutiveFallbackAlertAt {
+		level = slog.LevelError
+	}
+	h.logger.Log(ctx, level, "read boop-config for JOB_IMAGE, using startup value",
+		"err", err,
+		"consecutive_fallbacks", count,
+		"alert_threshold", consecutiveFallbackAlertAt,
+	)
+	return h.cfg.JobImage, "fallback"
+}
+
+// bumpConfigMapFallbacks increments the consecutive-fallback
+// counter under a lock and returns the new value. The lock is a
+// separate mutex (not the dedup mutex) so the read-then-increment
+// pattern stays a single critical section.
+func (h *Handler) bumpConfigMapFallbacks() int {
+	h.consecutiveConfigMapFallbacksLock.Lock()
+	defer h.consecutiveConfigMapFallbacksLock.Unlock()
+	h.consecutiveConfigMapFallbacks++
+	return h.consecutiveConfigMapFallbacks
+}
+
+// resetConfigMapFallbacks zeroes the counter on a successful
+// ConfigMap read. Lock-protected for the same reason as bump.
+func (h *Handler) resetConfigMapFallbacks() {
+	h.consecutiveConfigMapFallbacksLock.Lock()
+	defer h.consecutiveConfigMapFallbacksLock.Unlock()
+	h.consecutiveConfigMapFallbacks = 0
 }
 
 type templateVars struct {
