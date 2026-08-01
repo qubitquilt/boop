@@ -177,7 +177,6 @@ export async function cloneRepo(ctx, deps) {
     [
       "-c", "credential.helper=",
       "checkout",
-      "--",
       headSha,
     ],
     { env: gitEnv, cwd: paths.repoDir },
