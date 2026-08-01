@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,21 +87,28 @@ func (m *Manager) appJWT(now time.Time) (string, error) {
 	return tok.SignedString(m.cfg.PrivateKey)
 }
 
-// AppBotLogin returns the GitHub login of the App for the given
-// installation (e.g. "BoopPr[bot]"). The receiver uses this to
-// recognise self-comments on issue_comment events so it doesn't
-// trigger a review in response to its own prior messages. The
-// hard-coded BOT_LOGIN env var (passed in via main.go) is the
-// fallback for air-gapped setups where the App cannot reach
-// api.github.com at startup; this call is the canonical answer
-// and is cached per-installation.
+// AppBotLogin returns the GitHub login of the App (e.g. "booppr[bot]").
+// The receiver uses this to recognise self-comments on issue_comment
+// events so it doesn't trigger a review in response to its own prior
+// messages. The hard-coded BOT_LOGIN env var (passed in via main.go)
+// is the fallback for air-gapped setups where the App cannot reach
+// api.github.com at startup; this call is the canonical answer and
+// is cached per-installation. (The bot login is the same for every
+// installation of a given App, but caching per-install keeps the call
+// site simple and matches how installation tokens are cached.)
 //
 // Reaches the GitHub API as the App (using an app JWT, not an
 // installation token) because the App's own login is the same
-// for every installation. Endpoints:
+// for every installation. Endpoint:
 //
-//	GET /app/installations/{installation_id}
-//	  -> { "account": { "login": "BoopPr[bot]" } }
+//	GET /app -> { "id": ..., "slug": "booppr", "name": "BoopPr", ... }
+//
+// The bot login is constructed as `lower(slug) + "[bot]"`. The
+// previous implementation read `account.login` from
+// `GET /app/installations/{installation_id}`, but that field is the
+// installing user or org, not the App's bot. On a personal-account
+// install the two happen to be the same string, so every comment
+// from the owner was treated as a self-mention.
 //
 // M5: previously the receiver trusted a hard-coded
 // BOT_LOGIN env var. Drift between env and the App's actual
@@ -129,7 +137,7 @@ func (m *Manager) AppBotLogin(ctx context.Context, installationID int64) (string
 		return "", fmt.Errorf("mint app jwt: %w", err)
 	}
 
-	url := fmt.Sprintf("https://api.github.com/app/installations/%d", installationID)
+	url := appInfoURL
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("build request: %w", err)
@@ -141,29 +149,27 @@ func (m *Manager) AppBotLogin(ctx context.Context, installationID int64) (string
 
 	res, err := m.baseHTTP.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetch installation: %w", err)
+		return "", fmt.Errorf("fetch app: %w", err)
 	}
 	defer res.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("read installation body: %w", err)
+		return "", fmt.Errorf("read app body: %w", err)
 	}
 	if res.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch installation %d: %s", res.StatusCode, string(body))
+		return "", fmt.Errorf("fetch app: %d %s", res.StatusCode, string(body))
 	}
 
 	var probe struct {
-		Account *struct {
-			Login string `json:"login"`
-		} `json:"account"`
+		Slug string `json:"slug"`
 	}
 	if err := json.Unmarshal(body, &probe); err != nil {
-		return "", fmt.Errorf("decode installation body: %w", err)
+		return "", fmt.Errorf("decode app body: %w", err)
 	}
-	if probe.Account == nil || probe.Account.Login == "" {
-		return "", fmt.Errorf("installation %d has no account.login in response", installationID)
+	if probe.Slug == "" {
+		return "", fmt.Errorf("app response has no slug")
 	}
-	login := probe.Account.Login
+	login := strings.ToLower(probe.Slug) + "[bot]"
 
 	m.mu.Lock()
 	m.botLoginCache[installationID] = botLoginCacheEntry{login: login, at: now}
@@ -178,3 +184,8 @@ const (
 	appJWTTTL       = 10 * time.Minute
 	appJWTLeeway    = 30 * time.Second
 )
+
+// appInfoURL is the endpoint AppBotLogin queries. It is a var (not a
+// const) so tests can point it at a httptest.Server without standing
+// up a TLS terminator.
+var appInfoURL = "https://api.github.com/app"
