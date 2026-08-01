@@ -415,7 +415,7 @@ export function runOpencode(prompt, configContent, deps) {
       "--",
       shellQuote(prompt),
     ];
-    const cmd = ["script", "-qfc", ["opencode", ...args].join(" "), "/dev/null"];
+    const cmd = ["script", "-qfc", args.join(" "), "/dev/null"];
     deps.log("opencode", "spawning", { via: "script(1) PTY", argCount: args.length });
 
     // Env: only the keys opencode needs are inherited. The GitHub
