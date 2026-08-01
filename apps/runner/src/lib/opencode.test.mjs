@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { EventEmitter } from "node:events";
 
 import {
   stripAnsi,
@@ -9,6 +10,7 @@ import {
   shellQuote,
   confidenceBadge,
   buildBoopPrompt,
+  runOpencode,
 } from "./opencode.mjs";
 
 // --- stripAnsi ----------------------------------------------------------
@@ -313,4 +315,104 @@ test("buildBoopPrompt source preserves H5 ordering invariant", () => {
   assert.ok(systemIdx > -1);
   assert.ok(dataIdx > -1);
   assert.ok(systemIdx < dataIdx);
+});
+
+// --- runOpencode command shape -----------------------------------------
+
+// 2026-08-01 incident: runOpencode constructed the `script -qfc` argv as
+// `["opencode", ...args].join(" ")` while `args` already started with
+// "opencode", producing `opencode opencode run …`. The opencode binary
+// saw the literal token "opencode" as its first positional arg, matched
+// no subcommand, printed its help text, and exited 0 in ~300ms. The
+// runner parsed the help text as the review summary and posted it to
+// the PR. The regression test below pins the command shape: the joined
+// argv must begin with `opencode run ` exactly once.
+
+function makeFakeProc() {
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const proc = new EventEmitter();
+  proc.stdout = stdout;
+  proc.stderr = stderr;
+  proc.kill = () => {};
+  return proc;
+}
+
+test("runOpencode joins args without duplicating the program name", async () => {
+  let captured = null;
+  const fakeProc = makeFakeProc();
+  const spawnFn = (cmd, argv) => {
+    captured = { cmd, argv };
+    return fakeProc;
+  };
+  const log = () => {};
+  const deps = {
+    paths: {
+      repoDir: "/work/repo",
+      writableHome: "/tmp/oh",
+      writableConfig: "/tmp/oc",
+      configDir: "/tmp/oc",
+    },
+    spawnFn,
+    log,
+    debug: false,
+  };
+
+  const promise = runOpencode("review this PR", "{}", deps);
+  // Resolve the promise: emit a benign empty stdout + close(0).
+  fakeProc.stdout.emit("data", "");
+  fakeProc.emit("close", 0);
+  await promise;
+
+  assert.ok(captured, "spawnFn was not called");
+  assert.equal(captured.cmd, "script");
+  assert.equal(captured.argv[0], "-qfc");
+  const joined = captured.argv[1];
+  // The joined argv is the literal command `script -qfc` will run via
+  // /bin/sh. It must contain `opencode run ` exactly once and never
+  // `opencode opencode`.
+  const occurrences = joined.match(/\bopencode run\b/g) ?? [];
+  assert.equal(
+    occurrences.length,
+    1,
+    `expected exactly one "opencode run" in argv, got ${occurrences.length}: ${JSON.stringify(joined)}`,
+  );
+  assert.ok(
+    joined.startsWith("opencode run "),
+    `argv must start with "opencode run ", got ${JSON.stringify(joined.slice(0, 40))}`,
+  );
+  assert.match(joined, /--dir \/work\/repo/);
+  assert.match(joined, /--auto/);
+  assert.match(joined, /-- /);
+  assert.match(joined, /'review this PR'/);
+});
+
+test("runOpencode adds --log-level DEBUG when deps.debug is true", async () => {
+  let captured = null;
+  const fakeProc = makeFakeProc();
+  const spawnFn = (cmd, argv) => {
+    captured = { cmd, argv };
+    return fakeProc;
+  };
+  const log = () => {};
+  const deps = {
+    paths: {
+      repoDir: "/work/repo",
+      writableHome: "/tmp/oh",
+      writableConfig: "/tmp/oc",
+      configDir: "/tmp/oc",
+    },
+    spawnFn,
+    log,
+    debug: true,
+  };
+
+  const promise = runOpencode("hi", "{}", deps);
+  fakeProc.stdout.emit("data", "");
+  fakeProc.emit("close", 0);
+  await promise;
+
+  const joined = captured.argv[1];
+  assert.match(joined, /--log-level DEBUG/);
+  assert.match(joined, /--print-logs/);
 });
