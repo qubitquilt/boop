@@ -145,8 +145,15 @@ test("cloneRepo checks out the head SHA", async () => {
   const deps = makeDeps();
   await cloneRepo(makeCtx(), deps);
   const checkoutArgs = deps.execFile.calls[2][1];
-  const sepIdx = checkoutArgs.indexOf("--");
-  assert.deepEqual(checkoutArgs.slice(sepIdx + 1), ["0123456789abcdef0123456789abcdef01234567"]);
+  // The head SHA must be the positional argument to `git checkout`.
+  // Do NOT use `--` between `checkout` and the SHA: `git checkout -- <pathspec>`
+  // interprets the SHA as a filesystem path, not a commit ref. The
+  // checkout command is therefore `git checkout <sha>` — no `--`.
+  assert.deepEqual(checkoutArgs, [
+    "-c", "credential.helper=",
+    "checkout",
+    "0123456789abcdef0123456789abcdef01234567",
+  ]);
 });
 
 test("cloneRepo uses HOME from ctx (not process env)", async () => {
