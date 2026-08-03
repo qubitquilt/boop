@@ -122,6 +122,44 @@ test("parseReviewOutput extracts structured block from older shape (no confidenc
   assert.equal(r.confidence, "medium");
 });
 
+// QUB-84: the Inquiry label uses the `Q-N` ID prefix. The parser
+// doesn't interpret tier prefixes, so we just need to confirm Q-N text
+// survives the round-trip in both the summary body and the inline
+// comment body.
+test("parseReviewOutput passes a Q-N row through the summary verbatim", () => {
+  const out =
+    "=== SUMMARY ===\n" +
+    "## Findings\n" +
+    "| ID | Tier | File : Line | Summary |\n" +
+    "|----|------|-------------|---------|\n" +
+    "| Q1  | 💬 Inquiry | `src/x.ts:5` | Intent check on the catch branch |\n" +
+    "=== INLINE COMMENTS ===\n" +
+    "=== CONFIDENCE ===\n" +
+    "medium\n" +
+    "=== END ===\n";
+  const r = parseReviewOutput(out);
+  assert.match(r.summary, /Q1/);
+  assert.match(r.summary, /Inquiry/);
+  assert.match(r.summary, /src\/x\.ts:5/);
+  assert.equal(r.confidence, "medium");
+  assert.deepEqual(r.inlineComments, []);
+});
+
+test("parseReviewOutput preserves a Q-N ID in the inline comment body", () => {
+  const out =
+    "=== SUMMARY ===\n" +
+    "body\n" +
+    "=== INLINE COMMENTS ===\n" +
+    "src/x.ts:5: Curious if intentional: this `catch` returns the old value (Q1)\n" +
+    "=== CONFIDENCE ===\n" +
+    "medium\n" +
+    "=== END ===\n";
+  const r = parseReviewOutput(out);
+  assert.deepEqual(r.inlineComments, [
+    { path: "src/x.ts", line: 5, body: "Curious if intentional: this `catch` returns the old value (Q1)" },
+  ]);
+});
+
 // --- shellQuote ---------------------------------------------------------
 
 test("shellQuote escapes embedded single quotes", () => {

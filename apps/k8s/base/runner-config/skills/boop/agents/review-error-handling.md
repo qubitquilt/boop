@@ -29,8 +29,10 @@ does this re-introduce?** A fallback that returns the same value as
 the pre-fix path under any realistic input is the highest-priority
 finding — it means if the original bug recurs, this path quietly hands
 back the buggy answer. Treat as **Blocking by default**. The
-test-quality and deep lenses perform the same check; the finding ID is
-global, so deduplicate if multiple lenses flag it.
+`review-test-quality.md` and `review-deep.md` lenses perform the same
+check from different angles (test coverage and end-to-end scenario
+walk); the finding ID is global, so deduplicate if multiple lenses
+flag the same fallback.
 
 Report findings using the **tier-prefixed, globally-numbered** ID
 scheme defined in `SKILL.md`: `B-N` for Blocking, `F-N` for Follow-up,
@@ -177,7 +179,7 @@ noisy log line. Tier accordingly.
 - Does the app handle `SIGTERM` gracefully (drain in-flight requests,
   flush logs) or does it cut off immediately?
 
-## 7. Silent fallback bug-shape check
+## 7. Silent fallback bug-shape check (highest priority)
 
 For every silent fallback (`?? defaultValue`, `catch { return old }`,
 `|| fallback`, `if (!x) return safeDefault`), ask:
@@ -191,7 +193,11 @@ For every silent fallback (`?? defaultValue`, `catch { return old }`,
 
 This is the same check the test-quality and deep lenses perform. The
 audit is global — if multiple lenses flag the same fallback, the
-synthesis step merges them into one finding with a single ID.
+synthesis step merges them into one finding with a single ID. A
+Blocking finding here is the highest-priority trigger for SKILL.md
+Step 3 §5 (the bug-report scenario walk): if the fallback re-introduces
+the original bug and no test reproduces the reported path, the fix is
+not approval-ready.
 
 ---
 
