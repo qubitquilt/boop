@@ -491,7 +491,9 @@ export function runOpencode(prompt, configContent, deps) {
 }
 
 // runOpenCodeSkill is the orchestrator over buildBoopPrompt + opencode
-// subprocess invocation. Returns { summary, inlineComments, confidence }.
+// subprocess invocation. Returns { summary, inlineComments, confidence }
+// plus, when the JSON-mode run is used, a telemetry object (cost +
+// tokens). The TUI mode returns the same shape with telemetry=null.
 export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
   const config = await materializeConfig(openrouterApiKey, deps);
   const configContent = JSON.stringify(config);
@@ -509,13 +511,49 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
   });
   await deps.postStatus("review");
 
-  const { stdout, stderr, code, killed, timeoutMs } = await runOpencode(prompt, configContent, deps);
+  // When the dashboard is configured, run in JSON mode so we
+  // can surface token usage + cost. Otherwise the TUI mode is
+  // unchanged. The two modes share the same parseReviewOutput
+  // for the structured block, so the rest of the pipeline
+  // (postReview, postInlineComments) doesn't care which one
+  // fired.
+  const useJSON = !!(ctx.dashboardUrl && ctx.dashboardToken);
+  let stdout, stderr, code, killed, timeoutMs, review, telemetry;
+  if (useJSON) {
+    const jsonResult = await deps.runOpencodeJSON
+      ? deps.runOpencodeJSON(prompt, configContent, { ...deps, parseReviewOutput })
+      : await importRunOpencodeJSON(prompt, configContent, { ...deps, parseReviewOutput });
+    ({ stdout, stderr, code, killed, timeoutMs, review, telemetry } = jsonResult);
+  } else {
+    const r = await runOpencode(prompt, configContent, deps);
+    stdout = r.stdout; stderr = r.stderr; code = r.code; killed = r.killed; timeoutMs = r.timeoutMs;
+    if (timeoutMs) {
+      throw new Error(`opencode run exceeded ${OPENCODE_TIMEOUT_MS / 60000}-min timeout`);
+    }
+    if (code !== 0) {
+      const tail = stderr.split("\n").slice(-30).join("\n");
+      throw new Error(`opencode run exited with code ${code};\n${tail}`);
+    }
+    if (!stdout.trim()) {
+      throw new Error("opencode returned empty stdout");
+    }
+    review = parseReviewOutput(stripAnsi(stdout.trim()));
+    telemetry = null;
+  }
+
   deps.log("opencode", "exit", {
     code,
     killed,
     timeoutMs: timeoutMs || 0,
+    mode: useJSON ? "json" : "tty",
     stdoutBytes: stdout.length,
     stderrBytes: stderr.length,
+    ...(telemetry ? {
+      tokens_in: telemetry.inputTokens,
+      tokens_out: telemetry.outputTokens,
+      cost_usd: telemetry.costUsd,
+      step_count: telemetry.stepCount,
+    } : {}),
   });
 
   if (timeoutMs) {
@@ -525,18 +563,22 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
     const tail = stderr.split("\n").slice(-30).join("\n");
     throw new Error(`opencode run exited with code ${code};\n${tail}`);
   }
-  if (!stdout.trim()) {
+  if (!review.summary && !stdout.trim()) {
     throw new Error("opencode returned empty stdout");
   }
-  const clean = stripAnsi(stdout.trim());
 
-  // Parse the structured SUMMARY / INLINE COMMENTS / CONFIDENCE / END
-  // block the model is required to emit. We strip the TUI transcript
-  // (everything before the SUMMARY marker) and return:
-  //   { summary, inlineComments: [{path, line, body}, ...], confidence }
-  // so the caller can post one summary comment + N inline comments
-  // via GitHub's PR review comments API, and surface the confidence
-  // badge in the summary footer.
-  return parseReviewOutput(clean);
+  // Attach the telemetry onto the review so the runner can
+  // POST it to the dashboard in a single call.
+  return { ...review, telemetry };
+}
+
+// importRunOpencodeJSON is the lazy-import path for the JSON
+// mode. Kept as a tiny wrapper so the import is a single line
+// in the test fixtures; the lazy form is here for the
+// production runner, which loads index.mjs without the JSON
+// module to keep cold-start cheap on tests.
+async function importRunOpencodeJSON(prompt, configContent, deps) {
+  const mod = await import("./opencode_json.mjs");
+  return mod.runOpencodeJSON(prompt, configContent, deps);
 }
 // temporary verify mark 1785624554

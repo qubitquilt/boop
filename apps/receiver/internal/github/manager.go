@@ -29,9 +29,11 @@ type Manager struct {
 	cfg      AppConfig
 	baseHTTP *http.Client
 
-	mu            sync.Mutex
-	clients       map[int64]*Client
-	botLoginCache map[int64]botLoginCacheEntry
+	mu                sync.Mutex
+	clients           map[int64]*Client
+	botLoginCache     map[int64]botLoginCacheEntry
+	installations     []Installation
+	installationsAt   time.Time
 }
 
 // botLoginCacheEntry stores the bot login for one installation,
@@ -178,14 +180,155 @@ func (m *Manager) AppBotLogin(ctx context.Context, installationID int64) (string
 	return login, nil
 }
 
+// Installation is the slice of the GitHub App installation object
+// the receiver persists. We keep only the fields the dashboard
+// reads; the full payload is on the wire but storing the rest is
+// wasted bytes and a slow SELECT.
+//
+// AccountType is the canonical GitHub field ("User" or
+// "Organization") so the dashboard can show a different icon per
+// type. RepositorySelection is "all" or "selected"; the dashboard
+// uses this to annotate a repo as "App installed on the whole org"
+// vs "App installed on this one repo only".
+type Installation struct {
+	ID                  int64     `json:"id"`
+	AccountLogin        string    `json:"account_login"`
+	AccountType         string    `json:"account_type"`
+	RepositorySelection string    `json:"repository_selection,omitempty"`
+	InstalledAt         time.Time `json:"installed_at,omitempty"`
+}
+
+// ListInstallations returns every installation of the App,
+// cached for installationsCacheTTL so the dashboard's poll does
+// not hammer the GitHub API.
+//
+// The call is App-level (uses an App JWT, not an installation
+// token) because we need every installation, not the one
+// attached to the current webhook. We page through GitHub's
+// response, which returns up to 100 installations per page.
+//
+// On any API error, the cache is left untouched and the error
+// returned. The caller (the receiver's background poller) logs
+// and retries on the next tick.
+func (m *Manager) ListInstallations(ctx context.Context) ([]Installation, error) {
+	m.mu.Lock()
+	if time.Since(m.installationsAt) < installationsCacheTTL && len(m.installations) > 0 {
+		cached := m.installations
+		m.mu.Unlock()
+		return cached, nil
+	}
+	m.mu.Unlock()
+
+	now := time.Now()
+	jwtStr, err := m.appJWT(now)
+	if err != nil {
+		return nil, fmt.Errorf("mint app jwt: %w", err)
+	}
+
+	// Walk pages. GitHub's pagination caps at 100 per page; the
+	// dashboard needs every installation, so the loop is
+	// unconditional until the API stops handing out next links.
+	var out []Installation
+	for page := 1; ; page++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, installationsListURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+jwtStr)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		req.Header.Set("User-Agent", "boop-receiver")
+
+		q := req.URL.Query()
+		q.Set("per_page", "100")
+		q.Set("page", fmt.Sprintf("%d", page))
+		req.URL.RawQuery = q.Encode()
+
+		res, err := m.baseHTTP.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("fetch installations page %d: %w", page, err)
+		}
+		body, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		res.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read installations page %d: %w", page, err)
+		}
+		if res.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("fetch installations page %d: %d %s", page, res.StatusCode, string(body))
+		}
+
+		var pageInstalls []struct {
+			ID                  int64     `json:"id"`
+			Account             *struct {
+				Login string `json:"login"`
+				Type  string `json:"type"`
+			} `json:"account"`
+			RepositorySelection string    `json:"repository_selection"`
+			CreatedAt           time.Time `json:"created_at"`
+		}
+		if err := json.Unmarshal(body, &pageInstalls); err != nil {
+			return nil, fmt.Errorf("decode installations page %d: %w", page, err)
+		}
+		for _, ins := range pageInstalls {
+			if ins.Account == nil {
+				continue
+			}
+			out = append(out, Installation{
+				ID:                  ins.ID,
+				AccountLogin:        ins.Account.Login,
+				AccountType:         ins.Account.Type,
+				RepositorySelection: ins.RepositorySelection,
+				InstalledAt:         ins.CreatedAt,
+			})
+		}
+		// The `Link` header is the only signal GitHub gives for
+		// the next page; if it's missing or has no `rel="next"`,
+		// we're done. Parsing the header in-house avoids
+		// pulling in net/http's link parsing for a single use.
+		if !hasNextPage(res.Header.Get("Link")) {
+			break
+		}
+	}
+
+	m.mu.Lock()
+	m.installations = out
+	m.installationsAt = time.Now()
+	m.mu.Unlock()
+
+	return out, nil
+}
+
+// hasNextPage parses GitHub's Link header and reports whether
+// the next page is present. GitHub uses the standard RFC 5988
+// shape: `<url>; rel="next", <url>; rel="last"`. We only care
+// about "next".
+func hasNextPage(link string) bool {
+	if link == "" {
+		return false
+	}
+	for _, part := range strings.Split(link, ",") {
+		if strings.Contains(part, `rel="next"`) {
+			return true
+		}
+	}
+	return false
+}
+
 const (
 	httpTimeout     = 15 * time.Second
 	tokenTTLRefresh = 5 * time.Minute
 	appJWTTTL       = 10 * time.Minute
 	appJWTLeeway    = 30 * time.Second
+	installationsCacheTTL = 5 * time.Minute
 )
 
 // appInfoURL is the endpoint AppBotLogin queries. It is a var (not a
 // const) so tests can point it at a httptest.Server without standing
 // up a TLS terminator.
 var appInfoURL = "https://api.github.com/app"
+
+// installationsListURL is the App endpoint that returns every
+// installation of the App. Paged by GitHub; we walk pages until
+// NextPage is zero. Like appInfoURL it's a var so tests can
+// point it at an httptest.Server.
+var installationsListURL = "https://api.github.com/app/installations"

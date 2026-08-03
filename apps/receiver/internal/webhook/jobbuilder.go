@@ -302,6 +302,17 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 								// referencing the path.
 								{Name: "BOOP_GITHUB_APP_PRIVATE_KEY_PATH", Value: privateKeyMountPath},
 								{Name: "BOOP_OPENROUTER_API_KEY_PATH", Value: openrouterKeyMountPath},
+								// Dashboard data layer. Both env vars are
+								// empty when the operator hasn't opted in
+								// (RUNNER_TOKEN unset); the runner treats
+								// the empty pair as "no telemetry" and
+								// falls back to the TUI mode in opencode.mjs.
+								// The URL is the in-cluster Service DNS so
+								// the runner cannot be pointed at a public
+								// endpoint by a misconfigured overlay.
+								{Name: "BOOP_DASHBOARD_URL", Value: v.DashboardURL},
+								{Name: "BOOP_DASHBOARD_TOKEN", Value: v.DashboardToken},
+								{Name: "BOOP_JOB_NAME", Value: v.JobName},
 							},
 							SecurityContext: contSec,
 							Resources: corev1.ResourceRequirements{
