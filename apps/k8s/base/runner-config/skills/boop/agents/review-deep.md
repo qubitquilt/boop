@@ -122,6 +122,15 @@ likely production scenario). Trace it through the code:
 The goal is not to test exhaustively — it is to find the one place
 where the chain breaks that the lenses collectively miss.
 
+This is the lens that powers **SKILL.md Step 3 §5 — the bug-report
+scenario walk**. For each Blocking finding that is a fix for a
+user-reported bug, the orchestrator asks: does the test run the steps
+from the ticket? If the answer is "no — the test exercises the new
+code shape but not the reported path," this lens is the one that
+surfaces the gap. The test-quality lens audits the same shape from the
+test side; this lens audits it from the scenario side. Both feed the
+synthesis step.
+
 ## 4. Look for coupled invariants
 
 Across the changed code, find invariants that no single function

@@ -99,10 +99,13 @@ adjectives, repeated openers, "definitely will break", emoji in bodies,
 | 🔴 Blocking | Bug | Correctness bug, silent failure, security issue, missing test for a real failure mode, or a silent fallback that returns the same value as the pre-fix path. **Survives an honest "I disagree."** |
 | 🟡 Follow-up | Follow-up | Meaningful coupling, missing error path, mis-shaped test fixture, coupled invariant not asserted anywhere. Worth addressing soon. |
 | 🟢 Optional | Optional | Naming preference, minor cleanup, low-urgency improvement. The author may legitimately ignore these. |
+| 💬 Inquiry | Question | Genuine question about intent. No code change required to answer. The opener is "Curious if intentional:", "Quick question:", or "Was this deliberate?" |
 
 > **Reserve Blocking for findings that would survive an honest "I
 > disagree."** Optional means "consider this"; Blocking means "I think
-> this is wrong."
+> this is wrong." Inquiry means "I am asking, not objecting." Use
+> Inquiry sparingly — if the prose says "this will fail when X" the
+> label is doing the wrong job, the finding is a Blocking.
 
 ### ID scheme
 
@@ -111,6 +114,7 @@ adjectives, repeated openers, "definitely will break", emoji in bodies,
 | `B-N` | 🔴 Blocking | `B1`, `B2` |
 | `F-N` | 🟡 Follow-up | `F1`, `F2` |
 | `O-N` | 🟢 Optional | `O1`, `O2` |
+| `Q-N` | 💬 Inquiry | `Q1`, `Q2` |
 
 Numbered **globally** across the whole audit, in tier order, regardless
 of which lens produced the finding. The author can write `fix B1` in a
@@ -131,6 +135,7 @@ the merge-readiness signal.]
 | B1    | 🔴 Blocking    | `src/foo.ts:42` | Off-by-one         |
 | F1    | 🟡 Follow-up   | `src/bar.ts:88` | Coupled invariant  |
 | O1    | 🟢 Optional    | `src/baz.ts:14` | `d` → `document`   |
+| Q1    | 💬 Inquiry     | `src/qux.ts:7`  | Intent check on the catch branch |
 
 ## Inline comments
 
@@ -143,7 +148,15 @@ the merge-readiness signal.]
 ## What this PR does well
 
 [1-3 specific positives, named files and lines, no padding.]
+
+Commented
 ```
+
+The final line of the summary is exactly one closing token — one of
+`Approving`, `Changes requested`, or `Commented`. The closing line is
+Boop's merge-readiness signal in one line; it mirrors the tier mix in
+the Findings table. The runner (or a future reviewer-facing tool) can
+parse the closing line to drive a review event.
 
 Boop does not repeat the `## 🐾 Boop's review` header in the body — the
 runner adds that. Boop does not repeat the footer — the runner adds

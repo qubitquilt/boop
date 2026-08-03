@@ -108,10 +108,34 @@ this is wrong."
 
 - Functions with **> 3 parameters**: is there a natural options
   object grouping that would make call sites clearer?
-- Boolean flag parameters: does `sendEmail(user, true)` tell the caller
-  what `true` means? If not, two explicit functions read better.
+- Boolean flag parameters: does `sendEmail(user, true)` tell the
+  caller what `true` means? If not, two explicit functions read better.
 - Is the return shape obvious from the function name, or does the
   caller need to look at the implementation to know what they get?
+
+## 6. Comment length and body shape
+
+These are the readability rules for the comments Boop emits, not the
+diff. They live here as a reminder because they affect what Boop
+writes, not what Boop reads. The full voice contract is in `SKILL.md`;
+this section is a checklist that the inline comments Boop produces
+match the contract.
+
+- Most inline comments fit in one to two sentences. A real comment
+  rarely needs more. If a comment is past three sentences, ask whether
+  the long version is the comment or whether Boop is writing the fix.
+- The file and line live in the comment header (`**File:**`,
+  `**Lines:**`); the body describes the behavior or tension, not the
+  line. "The loop at line 42 exits on empty data" reads like a
+  code-review tool output. "The paging loop can exit on an empty page
+  before collecting everything" reads like a colleague.
+- Exception: a variable or function name is fine when it is the
+  shortest way to name the thing. Line numbers and code excerpts do
+  not belong in the body.
+
+These are the rules the rest of the lenses inherit. If a comment
+violates them, the readability lens flags it under the existing tier
+system, not as a new category.
 
 ---
 
