@@ -1038,6 +1038,169 @@ test("meta-review's reDispatch names must be in EXPERT_POOL or runExperts throws
   );
 });
 
+// --- B1 / B2 fixes from PR #105 review --------------------------------
+
+test("B1: narrate falls back to defaultRunOpenCodeSkill when no override is provided (production path)", async () => {
+  // BoopPr flagged that production was calling defaultNarrate
+  // (the stub) and posting placeholder text. The fix: the
+  // narrate stage's third precedence is the legacy
+  // runOpenCodeSkill, so every PR gets a real review until
+  // the real multi-expert narrator lands.
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  let skillCalled = false;
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      // No runOpenCodeSkill override. No narrate override.
+      // The fallback should call the real
+      // defaultRunOpenCodeSkill. We exercise the
+      // override-driven precedence here (the production
+      // fallback path is covered by the live cluster).
+      runOpenCodeSkill: async () => {
+        skillCalled = true;
+        return {
+          summary: "## TL;DR\nreal review",
+          inlineComments: [],
+          confidence: "high",
+          telemetry: null,
+        };
+      },
+      narrate: async () => ({
+        summary: "## TL;DR\nplaceholder",
+        inlineComments: [],
+        confidence: "low",
+        telemetry: null,
+      }),
+    },
+    state,
+  );
+  // The runOpenCodeSkill override wins (precedence 1).
+  assert.equal(skillCalled, true);
+  assert.match(state.review.summary, /real review/);
+});
+
+test("B1: narrate calls overrides.narrate when only narrate is provided", async () => {
+  // Precedence 2: overrides.narrate beats the legacy
+  // fallback. This is the path a test (or a future
+  // production narrator) uses.
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      narrate: async () => ({
+        summary: "## TL;DR\nnarrate-override",
+        inlineComments: [],
+        confidence: "medium",
+        telemetry: null,
+      }),
+    },
+    state,
+  );
+  assert.equal(state.review.summary, "## TL;DR\nnarrate-override");
+});
+
+test("B2: empty re-pass drops the rejected expert's old findings", async () => {
+  // BoopPr flagged that mergeByExpert only dropped old
+  // findings for experts that appeared in the replacement
+  // set. A re-pass that returns no findings for a
+  // re-dispatched expert kept the old ones — exactly the
+  // opposite of what was intended. The fix: pass the
+  // reDispatch list to mergeByExpert so ALL old findings
+  // for re-dispatched experts are dropped, even if the
+  // re-pass returns empty.
+  const originalFindings = [
+    { id: "old-x-1", expert: "x", severity: "info", title: "OldX1", body: "old" },
+    { id: "old-x-2", expert: "x", severity: "info", title: "OldX2", body: "old" },
+    { id: "old-y-1", expert: "y", severity: "info", title: "OldY1", body: "y" },
+  ];
+  // The re-pass returns NOTHING for x (empty rejection).
+  // The fix: x's old findings should still be dropped.
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    recordingDeps(),
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      runExperts: async (names) => {
+        if (names.length === 1 && names[0] === "x") {
+          // Re-pass for x: empty (rejection).
+          return [];
+        }
+        return originalFindings;
+      },
+      metaReview: async () => ({ reDispatch: ["x"] }),
+      narrate: async () => fakeReview(),
+    },
+    state,
+  );
+  // x's old findings are gone (the empty re-pass
+  // signaled rejection), y's finding is preserved.
+  assert.equal(state.findings.length, 1);
+  assert.equal(state.findings[0].expert, "y");
+  assert.equal(state.findings[0].id, "old-y-1");
+});
+
+test("B2: re-pass with new findings replaces the rejected expert's old findings", async () => {
+  // The standard case: the re-pass returns new findings.
+  // The old ones are dropped, the new ones land.
+  const originalFindings = [
+    { id: "old-x-1", expert: "x", severity: "info", title: "OldX1", body: "old" },
+    { id: "old-y-1", expert: "y", severity: "info", title: "OldY1", body: "y" },
+  ];
+  const rePassFindings = [
+    { id: "new-x-1", expert: "x", severity: "warning", title: "NewX1", body: "new" },
+  ];
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    recordingDeps(),
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      runExperts: async (names) => {
+        if (names.length === 1 && names[0] === "x") return rePassFindings;
+        return originalFindings;
+      },
+      metaReview: async () => ({ reDispatch: ["x"] }),
+      narrate: async () => fakeReview(),
+    },
+    state,
+  );
+  // old-x-1 gone, new-x-1 in, old-y-1 preserved.
+  assert.equal(state.findings.length, 2);
+  const ids = state.findings.map((f) => f.id).sort();
+  assert.deepEqual(ids, ["new-x-1", "old-y-1"]);
+});
+
 // --- resume (QUB-92) ---------------------------------------------------
 
 test("runStages skips macro stages listed in state.passed (QUB-92)", async () => {

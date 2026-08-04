@@ -50,13 +50,13 @@ import { setTimeout as defaultSleep } from "node:timers/promises";
 import { defaultClassify } from "./classify.mjs";
 import {
   defaultMetaReview,
-  defaultNarrate,
   gather,
   mergeByExpert,
   pickExperts,
   runExperts,
 } from "./experts.mjs";
 import { cloneRepo } from "./git.mjs";
+import { runOpenCodeSkill as defaultRunOpenCodeSkill } from "./opencode.mjs";
 import {
   cleanupPriorReview as defaultCleanupPriorReview,
   makeOctokit,
@@ -682,7 +682,16 @@ async function metaReviewSubStage(ctx, deps, overrides, state) {
   const newFindings = await run(reDispatch, ctx, deps, {
     classification: state.classification,
   });
-  state.findings = mergeByExpert(state.findings || [], newFindings);
+  // Pass the reDispatch list to mergeByExpert so ALL old
+  // findings for the re-dispatched experts are dropped,
+  // even if the re-pass returned no new findings. Without
+  // this, a re-pass that returns empty would silently keep
+  // the old findings it was meant to reject.
+  state.findings = mergeByExpert(
+    state.findings || [],
+    newFindings,
+    new Set(reDispatch),
+  );
   deps.log("meta-review", "re-pass merged", {
     reDispatched: reDispatch,
     total: state.findings.length,
@@ -697,23 +706,31 @@ async function narrateGate(_state, _ctx, _deps) {
 }
 
 async function narrateSubStage(ctx, deps, overrides, state) {
-  // The runner's `overrides.runOpenCodeSkill` hook (the
-  // lib-split PR #71 injection point) still works — a
-  // caller that hasn't migrated to the multi-expert
-  // sub-workflow can inject a canned review via
-  // `overrides.runOpenCodeSkill` and the narrate stage
-  // will use it. The dispatch + gather stages still run
-  // (cheap, no LLM call), but their output is discarded
-  // when the override is in play. The narrate stage's
-  // own `overrides.narrate` hook lets a test inject a
-  // deterministic narrator for the new path.
+  // Narrator precedence:
+  //   1. overrides.runOpenCodeSkill (the lib-split PR #71
+  //      hook) — a caller that hasn't migrated to the
+  //      multi-expert sub-workflow can inject a canned
+  //      review here.
+  //   2. overrides.narrate — a test or future caller
+  //      that has a real narrator for the multi-expert
+  //      sub-workflow injects the new shape.
+  //   3. defaultRunOpenCodeSkill — the legacy single-LLM
+  //      call. The real multi-expert narrator is a
+  //      follow-up; until it lands, production reviews
+  //      still go through the existing reviewer. Without
+  //      this fallback, the narrate stage would post a
+  //      placeholder summary in production.
   if (typeof overrides.runOpenCodeSkill === "function") {
     const skillFn = overrides.runOpenCodeSkill;
     state.review = await skillFn(state.openrouterApiKey, ctx, deps);
+  } else if (typeof overrides.narrate === "function") {
+    state.review = await overrides.narrate(state.findings || [], ctx, deps);
   } else {
-    const narrateFn = overrides.narrate || defaultNarrate;
-    const review = await narrateFn(state.findings || [], ctx, deps);
-    state.review = review;
+    state.review = await defaultRunOpenCodeSkill(
+      state.openrouterApiKey,
+      ctx,
+      deps,
+    );
   }
   const telemetry = state.review.telemetry ?? null;
   deps.log("narrate", "narrator returned", {

@@ -135,10 +135,19 @@ export async function defaultMetaReview(_findings, _classification, _ctx, _deps)
 // experts with the new findings. Other experts' findings
 // are preserved. The merge keeps the result flat (no
 // nesting) and de-duped by id.
-export function mergeByExpert(original, replacement) {
-  const reDispatchedExperts = new Set(
-    (replacement || []).map((f) => f.expert).filter(Boolean),
-  );
+//
+// droppedExperts is the explicit list of expert names to
+// drop from the original. The meta-reviewer signals a
+// re-pass for these experts; ALL old findings from these
+// experts are removed, even if the re-pass returned no new
+// findings for them (an empty re-pass is a valid rejection).
+// When droppedExperts is not provided, the function falls
+// back to the previous behavior: drop the experts that
+// appear in the replacement set.
+export function mergeByExpert(original, replacement, droppedExperts = null) {
+  const reDispatchedExperts =
+    droppedExperts ||
+    new Set((replacement || []).map((f) => f.expert).filter(Boolean));
   const kept = (original || []).filter(
     (f) => !f || !f.expert || !reDispatchedExperts.has(f.expert),
   );
