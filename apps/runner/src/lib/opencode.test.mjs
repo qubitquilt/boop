@@ -823,3 +823,20 @@ test("runOpenCodeSkill falls back to the legacy path when the flag is off", asyn
     /legacy_path_reached/,
   );
 });
+
+test("runOpenCodeSkill throws when the SDK path has no model configured", async () => {
+  // QUB-97 AC #1: the SDK fast-path requires a model name.
+  // Resolution order is ctx.openrouterModel env first, then the
+  // opencode.json mount. With neither available, the function
+  // must throw a clear error so the Job fails fast and the
+  // dashboard's "failed" status lands with a useful message —
+  // rather than silently zeroing the model field.
+  const ctx = { ...SDK_BASE_CTX, openrouterModel: "" };
+  const deps = makeSdkDeps(null, new Error("should not reach callOpenRouter"));
+  // readOpencodeModel returns "" when readFile throws.
+  deps.fs = { readFile: async () => { throw new Error("ENOENT"); } };
+  await assert.rejects(
+    () => runOpenCodeSkill("api-key", ctx, deps),
+    /no model configured/,
+  );
+});

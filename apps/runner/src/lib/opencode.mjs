@@ -582,22 +582,17 @@ export function runOpencode(prompt, configContent, deps) {
   });
 }
 
-// runOpenCodeSkill is the orchestrator over buildBoopPrompt + opencode
-// subprocess invocation. Returns { summary, inlineComments, confidence }
-// plus, when the JSON-mode run is used, a telemetry object (cost +
-// tokens). The TUI mode returns the same shape with telemetry=null.
-//
-// QUB-94: when ctx.openrouterSdkEnabled is set, the function takes
-// the in-process SDK path (callOpenRouter) and skips the opencode
-// subprocess entirely. The old TUI / JSON paths stay intact so a
-// flag flip is the rollback. Both paths return the same review
-// shape so postReview / postInlineComments don't change.
+// runOpenCodeSkill is the orchestrator over buildBoopPrompt + the
+// model invocation. It returns { summary, inlineComments, confidence }
+// plus a telemetry object when telemetry is captured. The legacy
+// opencode subprocess path returns telemetry=null on the TUI mode.
 export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
   // QUB-94: SDK fast-path. The flag defaults to false; production
   // stays on the opencode subprocess until a week of clean runs
   // passes on the SDK path. The branch is the entire difference
   // between the two code paths — once the cutover ships the
-  // subprocess block below can be deleted in QUB-98.
+  // subprocess block below can be deleted in QUB-98. A flag flip
+  // back to 0 is the rollback.
   if (ctx.openrouterSdkEnabled) {
     return await runOpenRouterSkill(openrouterApiKey, ctx, deps);
   }
@@ -709,10 +704,8 @@ async function importRunOpencodeJSON(prompt, configContent, deps) {
 // — no JSON stream parser, no PTY wrap, no opencode.json
 // template.
 //
-// The function lives in opencode.mjs (not openrouter.mjs) so it
-// can reuse buildBoopPrompt + parseReviewOutput without a
-// circular import. The cross-module surface is just one call to
-// callOpenRouter and one call to buildTelemetry.
+// Lives in opencode.mjs (not openrouter.mjs) so it can reuse
+// buildBoopPrompt + parseReviewOutput without a circular import.
 async function runOpenRouterSkill(openrouterApiKey, ctx, deps) {
   const prompt = ctx.skipSkill
     ? `Reply with one sentence: confirm you can see the repo at ${deps.paths.repoDir} on head ${shortSha(ctx.prHeadSha)}.`

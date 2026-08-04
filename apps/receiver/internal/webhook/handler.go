@@ -562,7 +562,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 	// the decision is logged so a job landing on either path is
 	// traceable from the webhook handler logs.
 	sdkEnabled := h.resolveSDKEnabled(labels)
-	h.logger.Debug("sdk flag resolved", "delivery", delivery, "value", sdkEnabled, "label_present", hasLabel(labels, sdkEnabledLabel), "cluster_default", h.cfg.OpenRouterSDKDefault)
+	h.logger.Info("sdk flag resolved", "delivery", delivery, "value", sdkEnabled, "label_present", hasLabel(labels, sdkEnabledLabel), "cluster_default", h.cfg.OpenRouterSDKDefault)
 
 	// Resolve JOB_IMAGE fresh from the boop-config ConfigMap instead
 	// of using the env-var snapshot captured at startup. ArgoCD

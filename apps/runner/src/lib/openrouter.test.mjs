@@ -5,6 +5,7 @@ import {
   buildTelemetry,
   callOpenRouter,
   emptyTelemetry,
+  readOpencodeModel,
 } from "./openrouter.mjs";
 
 // A fake OpenRouter client. Mirrors the shape that the real SDK's
@@ -303,4 +304,67 @@ test("buildTelemetry leaves error absent on a successful call", () => {
     usage: { prompt_tokens: 1, completion_tokens: 1, cost: 0 },
   });
   assert.equal("error" in t, false);
+});
+
+// --- readOpencodeModel ---------------------------------------------------
+
+// QUB-97 AC #4: the SDK path resolves the model name from the
+// opencode.json ConfigMap mount when no env override is set.
+// readOpencodeModel is the file-reading helper. Direct tests
+// pin the failure modes (missing path, read error, malformed
+// JSON, missing model field) so the orchestrator's "no model
+// configured" throw is reachable for the right reason.
+
+function makeFs(json) {
+  return {
+    readFile: async () =>
+      typeof json === "string" ? json : JSON.stringify(json),
+  };
+}
+
+test("readOpencodeModel returns the model field from opencode.json", async () => {
+  const fs = makeFs({ model: "minimax/minimax-m3", small_model: "deepseek/deepseek-v4-flash" });
+  const model = await readOpencodeModel({ fs, paths: { configSrc: "/etc/boop" } });
+  assert.equal(model, "minimax/minimax-m3");
+});
+
+test("readOpencodeModel returns empty string when paths is missing", async () => {
+  const fs = makeFs({ model: "m" });
+  // No paths at all — the helper must short-circuit before any
+  // readFile call, so even a throwing fs works.
+  const model = await readOpencodeModel({ fs: { readFile: () => { throw new Error("nope"); } } });
+  assert.equal(model, "");
+});
+
+test("readOpencodeModel returns empty string when configSrc is missing", async () => {
+  const fs = makeFs({ model: "m" });
+  const model = await readOpencodeModel({ fs, paths: {} });
+  assert.equal(model, "");
+});
+
+test("readOpencodeModel returns empty string when the file is unreadable", async () => {
+  const fs = { readFile: async () => { throw new Error("ENOENT"); } };
+  const model = await readOpencodeModel({ fs, paths: { configSrc: "/etc/boop" } });
+  assert.equal(model, "");
+});
+
+test("readOpencodeModel returns empty string on malformed JSON", async () => {
+  const fs = makeFs("{not json");
+  const model = await readOpencodeModel({ fs, paths: { configSrc: "/etc/boop" } });
+  assert.equal(model, "");
+});
+
+test("readOpencodeModel returns empty string when the model field is absent", async () => {
+  const fs = makeFs({ small_model: "deepseek/deepseek-v4-flash" });
+  const model = await readOpencodeModel({ fs, paths: { configSrc: "/etc/boop" } });
+  assert.equal(model, "");
+});
+
+test("readOpencodeModel returns empty string when the model field is not a string", async () => {
+  // Defensive against a future ConfigMap edit that lands a
+  // non-string model field. The runner must not pass an object
+  // to the SDK.
+  const fs = makeFs({ model: { provider: "openrouter", id: "m" } });
+  const model = await readOpencodeModel({ fs, paths: { configSrc: "/etc/boop" } });
+  assert.equal(model, "");
 });
