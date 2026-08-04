@@ -212,6 +212,27 @@ export async function run(env = process.env, overrides = {}) {
         } : {}),
       });
 
+      if (!review.summary) {
+        // The LLM ran cleanly but produced output the parser could
+        // not turn into a review (no structured block, or a structured
+        // block whose body failed the structure sanity check — JS
+        // string-concat echo, shell transcript, raw error, etc.). The
+        // `summary_parse_failed` log line carries the reason + a
+        // stdout preview. We do NOT post anything to the PR: posting
+        // a half-rendered review is worse than posting nothing, and
+        // we don't want to retire prior review artifacts on a
+        // re-review when the new one didn't actually run.
+        log.log("done", "summary parse failed, skipping post", {
+          reason: reviewResult.parseError,
+          confidence: review.confidence,
+        });
+        await deps.postStatus(
+          "failed",
+          `summary parse failed: ${reviewResult.parseError || "unknown"}`,
+        );
+        return;
+      }
+
       await postReview(currentOctokit, review.summary, ctx.reviewNumber, review.confidence, ctx);
       log.log("done", "summary comment posted", {
         review_number: ctx.reviewNumber,

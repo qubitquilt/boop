@@ -94,25 +94,99 @@ export function stripAnsi(s) {
     .replace(/[\x00-\x08\x0b-\x1f]/g, "");
 }
 
+// looksLikeReviewShape is the structure sanity check applied to the
+// SUMMARY body before the runner posts it. The LLM sometimes echoes
+// patterns from the diff (a test fixture, a fake shell transcript,
+// an error string, the build header) and the parser happily matches
+// a `=== SUMMARY ===` wrapper around the echo. The shape check
+// rejects the obvious garbage patterns so the runner can refuse to
+// post instead of polluting the PR.
+//
+// A real review summary is at least 200 bytes (a short TL;DR plus a
+// findings table is comfortably above this), contains a markdown
+// heading or finding table, and does not look like source code.
+function looksLikeReviewShape(s) {
+  if (!s) {
+    return { ok: false, reason: "summary empty" };
+  }
+  // Pattern checks first: when the body is one of the observed
+  // non-review outputs, surface the specific reason even if the
+  // body is short.
+  // JS string-concat echo: the LLM mirrors a test file's `"...\n" +`
+  // concatenation pattern. Two common giveaways.
+  if (/\\n"\s*\+\s*\n/.test(s) || /^\s*\+[ \t]+"/m.test(s)) {
+    return { ok: false, reason: "JS string-concat echo" };
+  }
+  // Non-review outputs the LLM has been observed to emit as the
+  // "summary" body: fake shell transcripts, raw error strings, and
+  // the opencode build header. The `&& !/^##/m.test(s)` guard lets
+  // a real review that *mentions* `$ git status` in its prose pass.
+  if (/^\s*\$ git /m.test(s) && !/^##/m.test(s)) {
+    return { ok: false, reason: "shell transcript (no markdown heading)" };
+  }
+  if (/^\s*Error: /m.test(s) && !/^##/m.test(s)) {
+    return { ok: false, reason: "raw error string (no markdown heading)" };
+  }
+  if (/^>\s*build\s*·/m.test(s) && !/^##/m.test(s)) {
+    return { ok: false, reason: "build header (no markdown heading)" };
+  }
+  // Length sanity check. A real review is at least 200 bytes —
+  // a short TL;DR plus a one-row finding table is comfortably above
+  // this. The 200-byte floor catches the case where the LLM emits
+  // a tiny stub that happens to contain a heading but no real content.
+  if (s.length < 200) {
+    return { ok: false, reason: "summary too short (< 200 bytes)" };
+  }
+  // Must contain at least one of the standard review sections or a
+  // finding table. Real reviews always have one of these markers;
+  // the LLM that produces prose without them is probably faking it.
+  const hasHeading = /^##\s+(TL;DR|Findings|What this PR does well|Non-Issues)/m.test(s);
+  const hasTable = /^\|.+\|.+\|/m.test(s);
+  if (!hasHeading && !hasTable) {
+    return { ok: false, reason: "no markdown heading or finding table" };
+  }
+  return { ok: true };
+}
+
 // parseReviewOutput extracts the structured block from the opencode
 // output. Anything before "=== SUMMARY ===" (the TUI prompt, bash
 // transcripts, etc.) is dropped. The INLINE COMMENTS section is parsed
 // as one "path:line: body" per line. The optional CONFIDENCE section
 // is parsed as `high`, `medium`, or `low`; missing or unrecognized
 // values default to `medium` so older models keep working.
+//
+// Failure modes (no structured block, or a structured block whose
+// body fails the structure sanity check) return
+// { summary: "", confidence: "low", parseError: "<reason>" }. The
+// caller MUST check `!result.summary` and skip the post. Returning a
+// non-empty summary in either failure mode is what allowed the
+// 2026-08-03 "garbage on the PR" regression (PR #90 / #92).
 export function parseReviewOutput(output) {
   const summaryMatch = output.match(
     /===\s*SUMMARY\s*===\s*([\s\S]*?)\s*===[\s\S]*?INLINE COMMENTS\s*===\s*([\s\S]*?)\s*===\s*(?:CONFIDENCE\s*===\s*([\s\S]*?)\s*===\s*)?END\s*===/i,
   );
   if (!summaryMatch) {
-    // Fallback: no structured block found. Treat the whole output
-    // as the summary.
-    return { summary: output, inlineComments: [], confidence: "medium" };
+    return {
+      summary: "",
+      inlineComments: [],
+      confidence: "low",
+      parseError: "no structured block",
+    };
   }
 
   const summary = summaryMatch[1].trim();
   const inlineBlock = summaryMatch[2].trim();
   const confidenceRaw = (summaryMatch[3] || "").trim().toLowerCase();
+
+  const shape = looksLikeReviewShape(summary);
+  if (!shape.ok) {
+    return {
+      summary: "",
+      inlineComments: [],
+      confidence: "low",
+      parseError: shape.reason,
+    };
+  }
 
   const inlineComments = [];
   for (const rawLine of inlineBlock.split("\n")) {
@@ -132,7 +206,7 @@ export function parseReviewOutput(output) {
     ? confidenceRaw
     : "medium";
 
-  return { summary, inlineComments, confidence };
+  return { summary, inlineComments, confidence, parseError: null };
 }
 
 // confidenceBadge renders Boop's merge-signal badge for the summary
@@ -565,6 +639,22 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
   }
   if (!review.summary && !stdout.trim()) {
     throw new Error("opencode returned empty stdout");
+  }
+
+if (!review.summary && !stdout.trim()) {
+    throw new Error("opencode returned empty stdout");
+  }
+
+  if (review.parseError) {
+    // The model produced something the parser could not turn into a
+    // review. Surface the reason + a stdout preview in the runner log
+    // so the next debugging pass can see exactly what the LLM emitted.
+    // The caller checks `!review.summary` and skips the post.
+    deps.log("review", "summary_parse_failed", {
+      reason: review.parseError,
+      stdoutBytes: stdout.length,
+      preview: stripAnsi(stdout.trim()).slice(0, 200),
+    });
   }
 
   // Attach the telemetry onto the review so the runner can
