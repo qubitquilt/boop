@@ -335,6 +335,75 @@ test("run: botLogin unset → skip cleanupPriorReview on re-review", async () =>
   assert.equal(cleanupCalled, false);
 });
 
+// --- summary parse failure path -----------------------------------------
+// 2026-08-03 incident: the LLM emitted a structured block whose body
+// was the JS string-concat echo of the test fixture in the diff
+// (PR #90, #92). The old runner posted that body to the PR. Now:
+// the parser returns an empty summary, the runner logs the parse
+// failure, the status timeline shows a "chased tail" entry with the
+// reason, and no comment is posted.
+
+test("run: parse failure skips postReview + postInlineComments + cleanupPriorReview", async () => {
+  const octokit = fakeOctokit();
+  let cleanupCalled = false;
+  const overrides = standardOverrides({
+    makeOctokit: () => octokit,
+    runOpenCodeSkill: async () => ({
+      summary: "",
+      inlineComments: [],
+      confidence: "low",
+      parseError: "JS string-concat echo",
+    }),
+    cleanupPriorReview: async () => {
+      cleanupCalled = true;
+      return { resolved: 0, minimized: 0, errors: 0 };
+    },
+  });
+  // Re-review #3 so we can prove cleanupPriorReview would have
+  // been called if the run had succeeded.
+  await run({ ...env, BOOP_REVIEW_NUMBER: "3" }, overrides);
+  // No summary comment posted.
+  assert.equal(octokit.calls.createComment.length, 0);
+  // No inline comments posted.
+  assert.equal(octokit.calls.createReviewComment.length, 0);
+  // No prior artifacts retired (the new review never landed; the
+  // prior one is still the current one on the PR).
+  assert.equal(cleanupCalled, false);
+  // Status timeline shows the parse failure with the reason in the
+  // "chased tail" entry's details block.
+  const statuses = octokit.calls.updateComment.map((c) => c.body);
+  assert.ok(
+    statuses.some((s) => /chased tail/.test(s)),
+    "expected a 'chased tail' status entry on parse failure",
+  );
+  assert.ok(
+    statuses.some((s) => /summary parse failed: JS string-concat echo/.test(s)),
+    "expected the parseError reason in the status details",
+  );
+});
+
+test("run: parse failure on first review also skips the post (no cleanup either way)", async () => {
+  // Same shape as the re-review case but on a first review — there
+  // is no cleanupPriorReview to gate, but the assertion is the same:
+  // no comment, no inline comments, status shows the failure.
+  const octokit = fakeOctokit();
+  const overrides = standardOverrides({
+    makeOctokit: () => octokit,
+    runOpenCodeSkill: async () => ({
+      summary: "",
+      inlineComments: [],
+      confidence: "low",
+      parseError: "no structured block",
+    }),
+  });
+  await run(env, overrides);
+  assert.equal(octokit.calls.createComment.length, 0);
+  assert.equal(octokit.calls.createReviewComment.length, 0);
+  const statuses = octokit.calls.updateComment.map((c) => c.body);
+  assert.ok(statuses.some((s) => /chased tail/.test(s)));
+  assert.ok(statuses.some((s) => /summary parse failed: no structured block/.test(s)));
+});
+
 // --- module surface -----------------------------------------------------
 
 test("run is exported as a named function from index.mjs", async () => {

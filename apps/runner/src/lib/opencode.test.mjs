@@ -37,7 +37,14 @@ test("parseReviewOutput extracts summary, inline comments, and confidence=high",
   const out =
     "ignored TUI transcript\n" +
     "=== SUMMARY ===\n" +
-    "## TL;DR\nLooks good.\n" +
+    "## TL;DR\n" +
+    "Looks good. The change is small, scoped, and the tests cover the new behavior. Two nits worth addressing but nothing blocking.\n" +
+    "\n" +
+    "## Findings\n" +
+    "\n" +
+    "| ID | Tier | File : Line | Summary |\n" +
+    "|----|------|-------------|---------|\n" +
+    "| O1 | 🟢 Optional | `src/x.ts:5` | consider renaming for clarity |\n" +
     "=== INLINE COMMENTS ===\n" +
     "src/foo.ts:42: heads up on line 42\n" +
     "src/bar.ts:7: nice\n" +
@@ -46,7 +53,8 @@ test("parseReviewOutput extracts summary, inline comments, and confidence=high",
     "=== END ===\n";
   const r = parseReviewOutput(out);
   assert.equal(r.confidence, "high");
-  assert.equal(r.summary, "## TL;DR\nLooks good.");
+  assert.match(r.summary, /## TL;DR/);
+  assert.match(r.summary, /Looks good/);
   assert.deepEqual(r.inlineComments, [
     { path: "src/foo.ts", line: 42, body: "heads up on line 42" },
     { path: "src/bar.ts", line: 7, body: "nice" },
@@ -68,30 +76,215 @@ test("parseReviewOutput normalises confidence to medium|low|high", () => {
 });
 
 test("parseReviewOutput defaults confidence to medium when block is missing", () => {
+  // Body is a real-shaped review (TL;DR + findings table) so the
+  // structure check passes; the test's purpose is "missing CONFIDENCE
+  // defaults to medium".
   const r = parseReviewOutput(
-    "=== SUMMARY ===\nbody\n=== INLINE COMMENTS ===\n=== END ===\n",
+    "=== SUMMARY ===\n" +
+      "## TL;DR\n" +
+      "Looks good overall. The diff is small, the change is well-scoped, and the tests cover the new code shape. No blockers, one follow-up worth addressing before the next change.\n" +
+      "\n" +
+      "## Findings\n" +
+      "\n" +
+      "| ID | Tier | File : Line | Summary |\n" +
+      "|----|------|-------------|---------|\n" +
+      "| F1 | 🟡 Follow-up | `src/x.ts:10` | nit on naming |\n" +
+      "=== INLINE COMMENTS ===\n=== END ===\n",
   );
   assert.equal(r.confidence, "medium");
+  assert.equal(r.parseError, null);
 });
 
 test("parseReviewOutput defaults confidence to medium when value is unrecognised", () => {
   const r = parseReviewOutput(
-    "=== SUMMARY ===\nbody\n=== INLINE COMMENTS ===\n=== CONFIDENCE ===\n" +
+    "=== SUMMARY ===\n" +
+      "## TL;DR\n" +
+      "Looks good overall. The diff is small, the change is well-scoped, and the tests cover the new code shape. No blockers, one follow-up worth addressing before the next change.\n" +
+      "\n" +
+      "## Findings\n" +
+      "\n" +
+      "| ID | Tier | File : Line | Summary |\n" +
+      "|----|------|-------------|---------|\n" +
+      "| F1 | 🟡 Follow-up | `src/x.ts:10` | nit on naming |\n" +
+      "=== INLINE COMMENTS ===\n=== CONFIDENCE ===\n" +
       "probably fine\n=== END ===\n",
   );
   assert.equal(r.confidence, "medium");
+  assert.equal(r.parseError, null);
 });
 
-test("parseReviewOutput falls back to whole output when no structured block", () => {
+test("parseReviewOutput returns empty summary + low confidence when no structured block", () => {
+  // 2026-08-03 incident: the old "whole output as summary" fallback
+  // posted the LLM's raw stdout to the PR. That turned "the model
+  // produced garbage" into "the runner posted garbage to the PR." Now:
+  // no structured block → empty summary, low confidence, parseError set.
+  // The caller must check `!r.summary` and skip the post.
   const r = parseReviewOutput("the model went off-script entirely");
-  assert.equal(r.summary, "the model went off-script entirely");
+  assert.equal(r.summary, "");
   assert.deepEqual(r.inlineComments, []);
+  assert.equal(r.confidence, "low");
+  assert.equal(r.parseError, "no structured block");
+});
+
+// --- structure sanity check --------------------------------------------
+// 2026-08-03 incidents: the LLM emitted a clean `=== SUMMARY ===`
+// wrapper around a non-review body and the parser happily matched it.
+// Pin the four observed failure shapes so the runner cannot regress
+// to posting them to the PR.
+
+test("parseReviewOutput rejects JS string-concat echo (PR #90, #92)", () => {
+  // The model mirrored the test file's `"...\n" + "..."` pattern.
+  // Two giveaways: literal `\n"` and a line beginning with `+    "`.
+  const out = [
+    "=== SUMMARY ===",
+    '"## Findings\\n" +',
+    '+    "| Q1  | 💬 Inquiry | `src/x.ts:5` | Intent check on the catch branch |\\n" +',
+    '""',
+    "=== INLINE COMMENTS ===",
+    "=== CONFIDENCE ===",
+    "medium",
+    "=== END ===",
+  ].join("\n");
+  const r = parseReviewOutput(out);
+  assert.equal(r.summary, "");
+  assert.equal(r.confidence, "low");
+  assert.match(r.parseError, /JS string-concat/);
+});
+
+test("parseReviewOutput rejects fake shell transcript (PR #71, #73, #75)", () => {
+  // The LLM pretended to run `git log` and dumped fake output as
+  // the "summary" body. No markdown heading → rejected.
+  const out = [
+    "=== SUMMARY ===",
+    "$ git log --oneline -20",
+    "30ecf71 test: verify ConfigMap re-read works end-to-end",
+    "5a5c82b chore(deps): update image digests (#88)",
+    "ae35967 chore(deps): update image digests (#87)",
+    "e3bce86 chore: trigger digest sync to test re-read",
+    "=== INLINE COMMENTS ===",
+    "=== CONFIDENCE ===",
+    "medium",
+    "=== END ===",
+  ].join("\n");
+  const r = parseReviewOutput(out);
+  assert.equal(r.summary, "");
+  assert.equal(r.confidence, "low");
+  assert.match(r.parseError, /shell transcript/);
+});
+
+test("parseReviewOutput rejects raw error string (PR #80)", () => {
+  // The opencode CLI emitted an error; the runner used to post it
+  // as the review. Now: parseError set, summary empty.
+  const out = [
+    "=== SUMMARY ===",
+    "Error: Failed to change directory to /work/repo",
+    "=== INLINE COMMENTS ===",
+    "=== CONFIDENCE ===",
+    "medium",
+    "=== END ===",
+  ].join("\n");
+  const r = parseReviewOutput(out);
+  assert.equal(r.summary, "");
+  assert.equal(r.confidence, "low");
+  assert.match(r.parseError, /raw error/);
+});
+
+test("parseReviewOutput rejects build header + shell transcript combo (PR #89)", () => {
+  // The LLM echoed the opencode build header and a fake git log.
+  // The check order picks "shell transcript" first because the
+  // `$ git log` line precedes the build-header section. The point
+  // of the test is to pin "this kind of body is rejected"; the
+  // specific reason is one of the observed failure shapes.
+  const out = [
+    "=== SUMMARY ===",
+    "> build · minimax/minimax-m3",
+    "",
+    "$ git log --oneline -20",
+    "0ed713b fix(runner): point footer link to qubitquilt/boop",
+    "507bde6 fix(receiver): re-review diffs only the delta",
+    "=== INLINE COMMENTS ===",
+    "=== CONFIDENCE ===",
+    "medium",
+    "=== END ===",
+  ].join("\n");
+  const r = parseReviewOutput(out);
+  assert.equal(r.summary, "");
+  assert.equal(r.confidence, "low");
+  assert.match(
+    r.parseError,
+    /build header|shell transcript/,
+  );
+});
+
+test("parseReviewOutput rejects summary shorter than 200 bytes", () => {
+  // A 100-byte body is too short to be a real review. Catches the
+  // case where the LLM emits a tiny stub that happens to contain a
+  // heading but no real content.
+  const out = [
+    "=== SUMMARY ===",
+    "## TL;DR",
+    "Looks good.",
+    "=== INLINE COMMENTS ===",
+    "=== CONFIDENCE ===",
+    "high",
+    "=== END ===",
+  ].join("\n");
+  const r = parseReviewOutput(out);
+  assert.equal(r.summary, "");
+  assert.equal(r.confidence, "low");
+  assert.match(r.parseError, /too short/);
+});
+
+test("parseReviewOutput accepts a real review with required structure", () => {
+  // Positive control: a real review summary with TL;DR, a findings
+  // table, a Non-Issues section, and a What-this-PR-does-well
+  // section must pass the structure check and round-trip.
+  const out = [
+    "=== SUMMARY ===",
+    "## TL;DR",
+    "Adds a bug-report scenario walk to the orchestrator and a Q-N Inquiry tier. The deep lens now powers the synthesis check; readability adds comment-length and no-line-numbers rules. The change is in skill + docs only; the runner image does not need a rebuild.",
+    "",
+    "## Findings",
+    "",
+    "| ID | Tier | File : Line | Summary |",
+    "|----|------|-------------|---------|",
+    "| B1 | 🔴 Blocking | `apps/k8s/base/runner-config/skills/boop/SKILL.md:117` | Tier-order text in the ID-scheme table omits Q-N despite the Step 3 §Number globally text including it. |",
+    "| F1 | 🟡 Follow-up | `apps/k8s/base/runner-config/skills/boop/SKILL.md:301` | The closing-line token table could be referenced from the TL;DR block. |",
+    "",
+    "## Non-Issues (explicitly verified)",
+    "- The runner image does not need a rebuild for the SKILL.md or lens changes; the parser is already a passthrough on Q-N text.",
+    "- The 2 new Q-N tests in `opencode.test.mjs` round-trip the structured block in both summary and inline positions.",
+    "",
+    "## What this PR does well",
+    "The Q-N tier fills a real gap — the runner already passed Q-N through verbatim, so the new tests pin existing behavior, not aspirational behavior. The bug-report scenario walk makes the deep lens load-bearing in synthesis, not optional.",
+    "=== INLINE COMMENTS ===",
+    "apps/k8s/base/runner-config/skills/boop/SKILL.md:117: tier-order text and the table row disagree on whether Q-N is in the audit order",
+    "=== CONFIDENCE ===",
+    "medium",
+    "=== END ===",
+  ].join("\n");
+  const r = parseReviewOutput(out);
+  assert.equal(r.parseError, null);
+  assert.match(r.summary, /## TL;DR/);
+  assert.match(r.summary, /## Findings/);
   assert.equal(r.confidence, "medium");
+  assert.equal(r.inlineComments.length, 1);
+  assert.equal(r.inlineComments[0].path, "apps/k8s/base/runner-config/skills/boop/SKILL.md");
+  assert.equal(r.inlineComments[0].line, 117);
 });
 
 test("parseReviewOutput skips inline lines that do not match path:line: body", () => {
   const r = parseReviewOutput(
-    "=== SUMMARY ===\nbody\n=== INLINE COMMENTS ===\n" +
+    "=== SUMMARY ===\n" +
+      "## TL;DR\n" +
+      "Looks good overall. The diff is small, the change is well-scoped, and the tests cover the new code shape. No blockers, one follow-up worth addressing before the next change.\n" +
+      "\n" +
+      "## Findings\n" +
+      "\n" +
+      "| ID | Tier | File : Line | Summary |\n" +
+      "|----|------|-------------|---------|\n" +
+      "| F1 | 🟡 Follow-up | `src/x.ts:10` | nit on naming |\n" +
+      "=== INLINE COMMENTS ===\n" +
       "not a real comment line\n" +
       "src/foo.ts:42: a real one\n" +
       "src/foo.ts:notanumber: bad line number\n" +
@@ -101,35 +294,52 @@ test("parseReviewOutput skips inline lines that do not match path:line: body", (
     { path: "src/foo.ts", line: 42, body: "a real one" },
   ]);
   assert.equal(r.confidence, "low");
+  assert.equal(r.parseError, null);
 });
 
 test("parseReviewOutput extracts structured block from older shape (no confidence)", () => {
+  // The summary body here is a real-shaped review (TL;DR + findings
+  // table) so it passes the structure sanity check; the test's
+  // purpose is to pin that missing CONFIDENCE defaults to "medium".
   const out = [
     "TUI noise line 1",
     "TUI noise line 2",
     "=== SUMMARY ===",
-    "Looks good overall.",
+    "## TL;DR",
+    "Looks good overall. The diff is small, the change is well-scoped, and the tests cover the new code shape. No blockers, one follow-up worth addressing before the next change.",
+    "",
+    "## Findings",
+    "",
+    "| ID | Tier | File : Line | Summary |",
+    "|----|------|-------------|---------|",
+    "| F1 | 🟡 Follow-up | `src/x.ts:10` | nit on naming |",
+    "| F2 | 🟡 Follow-up | `src/bar.go:42` | handle error |",
     "=== INLINE COMMENTS ===",
     "src/foo.ts:10: nit on naming",
     "src/bar.go:42: handle error",
     "=== END ===",
   ].join("\n");
   const r = parseReviewOutput(out);
-  assert.equal(r.summary, "Looks good overall.");
+  assert.match(r.summary, /Looks good overall/);
   assert.equal(r.inlineComments.length, 2);
   assert.deepEqual(r.inlineComments[0], { path: "src/foo.ts", line: 10, body: "nit on naming" });
   assert.deepEqual(r.inlineComments[1], { path: "src/bar.go", line: 42, body: "handle error" });
   assert.equal(r.confidence, "medium");
+  assert.equal(r.parseError, null);
 });
 
 // QUB-84: the Inquiry label uses the `Q-N` ID prefix. The parser
 // doesn't interpret tier prefixes, so we just need to confirm Q-N text
 // survives the round-trip in both the summary body and the inline
-// comment body.
+// comment body. The summary body is padded to a real-shaped review so
+// the structure sanity check passes; the Q-N row + the surrounding
+// prose are what we're actually pinning.
 test("parseReviewOutput passes a Q-N row through the summary verbatim", () => {
   const out =
     "=== SUMMARY ===\n" +
-    "## Findings\n" +
+    "## TL;DR\n" +
+    "Adds a Q-N Inquiry tier to the boop skill; the parser is a passthrough for tier prefixes.\n\n" +
+    "## Findings\n\n" +
     "| ID | Tier | File : Line | Summary |\n" +
     "|----|------|-------------|---------|\n" +
     "| Q1  | 💬 Inquiry | `src/x.ts:5` | Intent check on the catch branch |\n" +
@@ -143,12 +353,18 @@ test("parseReviewOutput passes a Q-N row through the summary verbatim", () => {
   assert.match(r.summary, /src\/x\.ts:5/);
   assert.equal(r.confidence, "medium");
   assert.deepEqual(r.inlineComments, []);
+  assert.equal(r.parseError, null);
 });
 
 test("parseReviewOutput preserves a Q-N ID in the inline comment body", () => {
   const out =
     "=== SUMMARY ===\n" +
-    "body\n" +
+    "## TL;DR\n" +
+    "Adds a Q-N Inquiry tier to the boop skill; the parser is a passthrough for tier prefixes.\n\n" +
+    "## Findings\n\n" +
+    "| ID | Tier | File : Line | Summary |\n" +
+    "|----|------|-------------|---------|\n" +
+    "| F1 | 🟡 Follow-up | `src/x.ts:1` | placeholder |\n" +
     "=== INLINE COMMENTS ===\n" +
     "src/x.ts:5: Curious if intentional: this `catch` returns the old value (Q1)\n" +
     "=== CONFIDENCE ===\n" +
@@ -158,6 +374,7 @@ test("parseReviewOutput preserves a Q-N ID in the inline comment body", () => {
   assert.deepEqual(r.inlineComments, [
     { path: "src/x.ts", line: 5, body: "Curious if intentional: this `catch` returns the old value (Q1)" },
   ]);
+  assert.equal(r.parseError, null);
 });
 
 // --- shellQuote ---------------------------------------------------------

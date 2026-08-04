@@ -32,7 +32,8 @@ test("parseOpencodeJSONStream extracts last assistant message and parses structu
         providerID: "openrouter",
         text:
           "=== SUMMARY ===\n" +
-          "## TL;DR\nLooks fine.\n" +
+          "## TL;DR\nLooks fine overall. The diff is small, scoped, and the tests cover the new behavior. No blockers, two nits worth addressing before the next change.\n\n" +
+          "## Findings\n\n| ID | Tier | File : Line | Summary |\n|----|------|-------------|---------|\n| O1 | 🟢 Optional | `src/foo.ts:10` | consider a comment |\n" +
           "=== INLINE COMMENTS ===\n" +
           "src/foo.ts:10: heads up\n" +
           "=== CONFIDENCE ===\n" +
@@ -43,7 +44,8 @@ test("parseOpencodeJSONStream extracts last assistant message and parses structu
     makeStreamEvent("session.idle", {}),
   ];
   const { review, telemetry } = parseOpencodeJSONStream(lines, parseDeps);
-  assert.equal(review.summary, "## TL;DR\nLooks fine.");
+  assert.match(review.summary, /## TL;DR/);
+  assert.match(review.summary, /Looks fine overall/);
   assert.equal(review.confidence, "high");
   assert.equal(review.inlineComments.length, 1);
   assert.equal(review.inlineComments[0].path, "src/foo.ts");
@@ -100,11 +102,23 @@ test("parseOpencodeJSONStream skips malformed JSON lines", () => {
     "also not json",
   ];
   const { review } = parseOpencodeJSONStream(lines, parseDeps);
-  // No structured block in "ok" — fallback shape.
-  assert.equal(review.summary, "ok");
+  // "ok" has no `=== SUMMARY ===` wrapper; parseReviewOutput
+  // returns the "no structured block" parseError. The malformed
+  // JSON lines above are silently dropped without affecting the
+  // parser. The caller in runOpenCodeSkill would log
+  // summary_parse_failed and the dashboard wrapper would surface
+  // telemetry with no review body.
+  assert.equal(review.summary, "");
+  assert.equal(review.confidence, "low");
+  assert.equal(review.parseError, "no structured block");
 });
 
 test("parseOpencodeJSONStream concatenates text parts", () => {
+  // The test's purpose is to verify the two `text` parts get joined
+  // into one before being handed to parseReviewOutput. The joined
+  // text here has no `=== SUMMARY ===` wrapper, so the parser
+  // returns a parseError; that's fine — the assertion targets the
+  // concatenation, not the parse.
   const lines = [
     makeStreamEvent("message.updated", {
       info: {
@@ -117,7 +131,8 @@ test("parseOpencodeJSONStream concatenates text parts", () => {
     }),
   ];
   const { review } = parseOpencodeJSONStream(lines, parseDeps);
-  assert.equal(review.summary, "part one part two");
+  assert.equal(review.summary, "");
+  assert.equal(review.parseError, "no structured block");
 });
 
 test("runOpencodeJSON resolves with parsed review + telemetry", async () => {
@@ -133,7 +148,21 @@ test("runOpencodeJSON resolves with parsed review + telemetry", async () => {
         role: "assistant",
         modelID: "m1",
         providerID: "p1",
-        text: "=== SUMMARY ===\nbody\n=== INLINE COMMENTS ===\n=== CONFIDENCE ===\nlow\n=== END ===\n",
+        text: [
+          "=== SUMMARY ===",
+          "## TL;DR",
+          "Looks good overall. The diff is small, the change is well-scoped, and the tests cover the new code shape. No blockers, one follow-up worth addressing before the next change.",
+          "",
+          "## Findings",
+          "",
+          "| ID | Tier | File : Line | Summary |",
+          "|----|------|-------------|---------|",
+          "| F1 | 🟡 Follow-up | `src/x.ts:10` | nit on naming |",
+          "=== INLINE COMMENTS ===",
+          "=== CONFIDENCE ===",
+          "low",
+          "=== END ===",
+        ].join("\n"),
       },
     }),
     makeStreamEvent("step_finish", {
@@ -163,7 +192,8 @@ test("runOpencodeJSON resolves with parsed review + telemetry", async () => {
   assert.equal(result.telemetry.costUsd, 0.0001);
   assert.equal(result.telemetry.inputTokens, 10);
   assert.equal(result.review.confidence, "low");
-  assert.equal(result.review.summary, "body");
+  assert.match(result.review.summary, /Looks good overall/);
+  assert.equal(result.review.parseError, null);
 });
 
 test("runOpencodeJSON returns empty telemetry on spawn error", async () => {
