@@ -7,7 +7,7 @@
 //
 // The `sniff` macro-stage wraps a review sub-workflow. The
 // sub-workflow is itself a list of sub-stages walked by
-// `runSubWorkflow`. The sub-stages land incrementally:
+// runSubWorkflow. The sub-stages land incrementally:
 //
 //   - QUB-89: one placeholder sub-stage that calls the current
 //     runOpenCodeSkill, so the sub-workflow is structurally
@@ -16,38 +16,37 @@
 //   - QUB-95: dispatch + gather + narrate (parallel experts)
 //   - QUB-96: meta-review (bounded re-pass)
 //
-// Both executors share the gate / retry / resume machinery
-// (QUB-90 / QUB-91 / QUB-92). The gate is the first piece: a
-// per-stage precondition check that runs before `run`. A failed
-// gate posts the "failed" status with the gate's reason and
-// aborts the run; QUB-91 will introduce bounded retry on top.
-//
-// Each stage (macro or sub) has the same contract:
+// Each macro and sub stage has the same contract:
 //
 //   id          the workflow-internal name. Pinned by the
 //               status-stage mapping and by the gate logic.
 //   statusStage the status label that gets PATCHed to the GitHub
-//               comment for this stage. null = silent (no new
-//               status line). The user-visible surface is pinned
-//               by QUB-93; do not change these without a
-//               follow-up ticket.
-//   description short prose so a future reader can scan the
-//               table of contents without reading the code.
-//   input       what the stage reads from `state` / `ctx`.
-//   output      what the stage writes to `state`.
-//   idempotent  whether re-running the stage is safe (re-posts
-//               to the PR, re-clones, etc.). Drives the resume
-//               logic in QUB-92.
+//               comment. null = silent. The user-visible surface
+//               is pinned by QUB-93.
+//   description short prose.
+//   input       what the stage reads.
+//   output      what the stage writes.
+//   idempotent  whether re-running is safe. Drives QUB-92.
+//   retryable   whether a gate failure or run-time error is
+//               worth retrying. Default true; parse failure
+//               and auth-style stages set false.
 //   gate        async (state, ctx, deps) -> {ok: true} |
-//               {ok: false, reason: "..."}. The executor calls
-//               gate before run. A failed gate posts "failed"
-//               and aborts the run.
-//   run         the async function that does the work. Receives
-//               (ctx, deps, state) and mutates `state` in
-//               place. Throwing also aborts the run. The run
-//               assumes the gate passed; the gate is the
-//               contract for "this stage is allowed to run".
+//               {ok: false, reason: "..."}. The executor
+//               calls gate before run. A failed gate posts
+//               "failed" and aborts the run (after retries,
+//               see QUB-91).
+//   run         async (ctx, deps, overrides, state) -> void.
+//               Mutates state. Throwing aborts the run (after
+//               retries if retryable).
+//
+// The executors (runStages, runSubWorkflow) walk the stage list
+// with bounded retry: a failed gate or a thrown run retries up
+// to N times with exponential backoff. The retry policy lives
+// in deps (stageMaxAttempts, stageBackoffBaseMs,
+// stageBackoffMaxMs) so a test can collapse it to one attempt
+// and exercise the failure path immediately.
 
+import { setTimeout as defaultSleep } from "node:timers/promises";
 import { cloneRepo } from "./git.mjs";
 import { runOpenCodeSkill as defaultRunOpenCodeSkill } from "./opencode.mjs";
 import {
@@ -59,6 +58,15 @@ import {
 } from "./github.mjs";
 import { readSecretFile } from "./security.mjs";
 
+// Default retry policy. The receiver passes overrides via the
+// runner's env (BOOP_STAGE_MAX_ATTEMPTS, BOOP_STAGE_BACKOFF_BASE_MS,
+// BOOP_STAGE_BACKOFF_MAX_MS) once QUB-91's follow-up lands;
+// loadConfig will pick them up. For now the defaults apply.
+// Exported so workflow.test.mjs can assert on the exact values.
+export const DEFAULT_MAX_ATTEMPTS = 3;
+export const DEFAULT_BACKOFF_BASE_MS = 1000;
+export const DEFAULT_BACKOFF_MAX_MS = 30000;
+
 export const STAGES = [
   {
     id: "handshake",
@@ -69,6 +77,7 @@ export const STAGES = [
     output:
       "state.installationToken, state.openrouterApiKey, state.octokit",
     idempotent: false,
+    retryable: false, // auth-style: a retry will hit the same broken creds
     gate: handshakeGate,
     run: handshakeStage,
   },
@@ -80,6 +89,7 @@ export const STAGES = [
     input: "ctx, state.octokit (for the token)",
     output: "/work/repo populated at PR_HEAD_SHA",
     idempotent: false,
+    retryable: true, // network blip on a clone is worth a retry
     gate: fetchGate,
     run: fetchStage,
   },
@@ -87,10 +97,11 @@ export const STAGES = [
     id: "sniff",
     statusStage: "review",
     description:
-      "Run the review sub-workflow. Today this is a single sub-stage (sniff-legacy) that calls the existing runOpenCodeSkill; QUB-94 through QUB-96 expand it into classify / dispatch / gather / meta-review / narrate.",
+      "Run the review sub-workflow. Today a single sub-stage (sniff-legacy) that calls the existing runOpenCodeSkill; QUB-94 through QUB-96 expand it into classify / dispatch / gather / meta-review / narrate.",
     input: "ctx, state.openrouterApiKey, /work/repo",
     output: "state.review (and state.findings, state.classification as the sub-stages land)",
     idempotent: false,
+    retryable: true, // LLM calls + clone can be transient
     gate: sniffGate,
     run: sniffStage,
   },
@@ -102,6 +113,7 @@ export const STAGES = [
     input: "state.review.summary, state.review.confidence, ctx",
     output: "a new PR comment with the summary + head-SHA marker",
     idempotent: false,
+    retryable: false, // the gate is the summary gate; a parse failure isn't transient
     gate: summaryGate,
     run: summaryStage,
   },
@@ -113,6 +125,7 @@ export const STAGES = [
     input: "state.review.inlineComments, ctx, state.octokit",
     output: "N review comments on the PR",
     idempotent: false,
+    retryable: true, // GitHub rate-limit / 5xx is worth a retry
     gate: inlinesGate,
     run: inlinesStage,
   },
@@ -124,6 +137,7 @@ export const STAGES = [
     input: "state.installationToken, ctx, state.botLogin",
     output: "state.cleanup = { resolved, minimized, errors } (or null on skip)",
     idempotent: true,
+    retryable: true,
     gate: cleanupGate,
     run: cleanupStage,
   },
@@ -149,6 +163,7 @@ export const REVIEW_SUB_STAGES = [
     input: "ctx, state.openrouterApiKey, /work/repo",
     output: "state.review",
     idempotent: false,
+    retryable: true, // LLM calls can be transient
     gate: sniffLegacyGate,
     run: sniffLegacySubStage,
   },
@@ -164,59 +179,138 @@ export function statusStageFor(id) {
   return stage ? stage.statusStage : null;
 }
 
-// runStages walks the macro-stage list in order. For each stage:
-//   1. Call gate(state, ctx, deps). If it returns {ok: false},
-//      log + post "failed" with the reason, set
-//      state.parseFailed = true, and return. The orchestrator
-//      in index.mjs checks state.parseFailed and short-circuits
-//      cleanup / telemetry / done. The executor does NOT throw
-//      on gate failure — a parse failure or a missing-input
-//      failure is "expected" (the LLM might not produce a
-//      structured block; we should not waste a Job exit on it).
-//      QUB-91 (retry) will introduce bounded retry on top;
-//      the retry's per-stage wrapper can check the gate's
-//      return value directly without needing a throw.
-//   2. Call run(ctx, deps, overrides, state). A throw is treated
-//      as a hard failure and propagates to the orchestrator
-//      catch in index.mjs (same as before the gate refactor).
-//
-// The gate + run split is the foundation QUB-91 (retry) and
-// QUB-92 (resume) build on.
+// runStages walks the macro-stage list in order. Each stage is
+// invoked through withRetry, which applies the bounded-attempt /
+// exponential-backoff policy. A failed gate (after retries) is
+// "soft" — the executor sets state.parseFailed and returns; the
+// orchestrator in index.mjs short-circuits the lifecycle. A
+// thrown run (after retries) is "hard" — it propagates to the
+// orchestrator catch.
 export async function runStages(ctx, deps, overrides, state) {
   for (const stage of STAGES) {
-    const pre = await stage.gate(state, ctx, deps);
-    if (!pre.ok) {
-      await onGateFailure(stage.id, pre.reason, state, deps);
-      return state;
-    }
-    await stage.run(ctx, deps, overrides, state);
+    await withRetry(stage, ctx, deps, overrides, state);
+    if (state.parseFailed) return state;
   }
   return state;
 }
 
 // runSubWorkflow walks a sub-workflow stage list in order. Same
-// shape as runStages (gate + run per stage). A gate failure
-// inside the sub-workflow sets state.parseFailed and returns;
-// the macro `sniff` stage's run sees the flag (via the next
-// stage's gate) and short-circuits downstream.
+// shape as runStages. A gate failure inside the sub-workflow
+// sets state.parseFailed; the macro `sniff` stage's run sees
+// the flag on the next iteration and short-circuits.
 export async function runSubWorkflow(stages, ctx, deps, overrides, state) {
   for (const stage of stages) {
-    const pre = await stage.gate(state, ctx, deps);
-    if (!pre.ok) {
-      await onGateFailure(stage.id, pre.reason, state, deps);
-      return state;
-    }
-    await stage.run(ctx, deps, overrides, state);
+    await withRetry(stage, ctx, deps, overrides, state);
+    if (state.parseFailed) return state;
   }
 }
 
-// onGateFailure is the executor's response to a failed gate.
-// It logs the failure, posts the "failed" status, and marks
-// state.parseFailed so the orchestrator (and the cleanup stage)
-// can short-circuit downstream work. The status message is the
-// gate's reason verbatim, so a "summary parse failed: <X>"
-// reason surfaces as a "summary parse failed: <X>" status line
-// (matching the pre-QUB-90 user-visible surface).
+// withRetry applies the bounded-attempt / exponential-backoff
+// policy to a single stage. The shape:
+//
+//   1. Call gate(state, ctx, deps).
+//   2. If gate returns {ok: false} AND the stage is retryable
+//      AND there are attempts left, log + sleep + retry.
+//   3. If gate returns {ok: false} and we are out of attempts
+//      (or the stage is not retryable), call onGateFailure
+//      (log + post "failed" + set state.parseFailed) and
+//      return. The executor's loop sees state.parseFailed and
+//      stops.
+//   4. If gate passes, call run(ctx, deps, overrides, state).
+//   5. If run throws and the error is non-retryable (err.nonRetryable
+//      === true), rethrow immediately. The orchestrator catch
+//      in index.mjs translates it to a dashboard "failed" +
+//      "failed" status PATCH + a rethrow.
+//   6. If run throws and there are attempts left, log + sleep
+//      + retry. The retry re-calls gate (cheap), then run.
+//   7. If run throws and we are out of attempts, rethrow.
+//
+// The sleep is exponential: base * 2^(attempt-1), capped at
+// stageBackoffMaxMs. The default sleep is setTimeout-based;
+// tests inject a no-op to skip the wait.
+async function withRetry(stage, ctx, deps, overrides, state) {
+  const maxAttempts =
+    typeof deps.stageMaxAttempts === "number"
+      ? deps.stageMaxAttempts
+      : DEFAULT_MAX_ATTEMPTS;
+  const baseMs =
+    typeof deps.stageBackoffBaseMs === "number"
+      ? deps.stageBackoffBaseMs
+      : DEFAULT_BACKOFF_BASE_MS;
+  const capMs =
+    typeof deps.stageBackoffMaxMs === "number"
+      ? deps.stageBackoffMaxMs
+      : DEFAULT_BACKOFF_MAX_MS;
+  const sleep = deps.sleep || defaultSleep;
+
+  const attempts = stage.retryable ? maxAttempts : 1;
+  let lastGateReason = null;
+  let lastRunError = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const pre = await stage.gate(state, ctx, deps);
+    if (!pre.ok) {
+      lastGateReason = pre.reason;
+      if (attempt < attempts) {
+        deps.log("retry", `${stage.id} gate failed, retrying`, {
+          attempt,
+          max: attempts,
+          reason: pre.reason,
+        });
+        await sleep(backoff(attempt, baseMs, capMs));
+        continue;
+      }
+      // Out of attempts (or non-retryable): soft fail.
+      await onGateFailure(stage.id, pre.reason, state, deps);
+      return;
+    }
+    try {
+      await stage.run(ctx, deps, overrides, state);
+      return;
+    } catch (err) {
+      lastRunError = err;
+      if (err && err.nonRetryable === true) {
+        // Re-throw immediately. The orchestrator catch in
+        // index.mjs will surface it.
+        throw err;
+      }
+      if (attempt < attempts) {
+        deps.log("retry", `${stage.id} run threw, retrying`, {
+          attempt,
+          max: attempts,
+          err: String(err?.message ?? err),
+        });
+        await sleep(backoff(attempt, baseMs, capMs));
+        continue;
+      }
+      // Out of attempts: rethrow.
+      throw err;
+    }
+  }
+
+  // If we got here, we exhausted attempts on a gate failure
+  // (the run-throw path returns via throw above). The soft
+  // fail was already handled in the loop; this is just a
+  // backstop for the linter.
+  if (lastRunError) throw lastRunError;
+  if (lastGateReason) {
+    await onGateFailure(stage.id, lastGateReason, state, deps);
+  }
+}
+
+function backoff(attempt, baseMs, capMs) {
+  const ms = baseMs * Math.pow(2, attempt - 1);
+  return Math.min(ms, capMs);
+}
+
+// onGateFailure is the executor's response to a failed gate
+// after retries. It logs the failure, posts the "failed"
+// status, and marks state.parseFailed so the orchestrator
+// (and the cleanup stage) can short-circuit downstream work.
+// The status message is the gate's reason verbatim, so a
+// "summary parse failed: <X>" reason surfaces as a
+// "summary parse failed: <X>" status line (matching the
+// pre-QUB-90 user-visible surface).
 async function onGateFailure(stageId, reason, state, deps) {
   deps.log("gate", `${stageId} gate failed`, { reason });
   await deps.postStatus("failed", reason);
@@ -224,24 +318,12 @@ async function onGateFailure(stageId, reason, state, deps) {
 }
 
 // --- macro-stage gates --------------------------------------------------
-//
-// Each gate is a small async function. The gate is the
-// precondition for the run; the run assumes the gate passed.
-// The gate's `reason` is the verbatim string the executor
-// surfaces in the "failed" status.
 
 async function handshakeGate(_state, _ctx, _deps) {
-  // handshake has no precondition; the run reads the secrets
-  // and mints the token. A failure surfaces as a thrown error
-  // from the run, not a gate failure.
   return { ok: true };
 }
 
 async function fetchGate(state, _ctx, _deps) {
-  // fetch needs the Octokit (for the token) and the clone
-  // path constants. Without the Octokit the clone would use a
-  // stale token from a prior run; the gate catches that
-  // misconfiguration at the boundary instead of mid-clone.
   if (!state.octokit) {
     return { ok: false, reason: "handshake did not populate state.octokit" };
   }
@@ -249,20 +331,10 @@ async function fetchGate(state, _ctx, _deps) {
 }
 
 async function sniffGate(_state, _ctx, _deps) {
-  // sniff (the macro stage) needs the opencode API key. The
-  // sub-workflow executor is responsible for surfacing
-  // sub-stage gate failures; this gate is the boundary check
-  // before the sub-workflow starts.
   return { ok: true };
 }
 
 async function summaryGate(state, _ctx, _deps) {
-  // Summary is the first stage that consumes the review
-  // output. The original inline code did this check too, in
-  // the summary run, with a "summary parse failed: <reason>"
-  // status message. The gate moves the check to the boundary
-  // and preserves the message verbatim so the user-visible
-  // surface is identical.
   if (!state.review) {
     return { ok: false, reason: "no review produced" };
   }
@@ -274,21 +346,13 @@ async function summaryGate(state, _ctx, _deps) {
 }
 
 async function inlinesGate(state, _ctx, _deps) {
-  // Inlines also needs a real review. On a parse failure the
-  // summary gate has already aborted; this gate is a defense-
-  // in-depth check in case a future caller runs the
-  // sub-workflow out of order.
   if (!state.review || !state.review.summary) {
     return { ok: false, reason: "no review summary; nothing to post" };
   }
   return { ok: true };
 }
 
-async function cleanupGate(state, ctx, _deps) {
-  // Cleanup is best-effort. The gate only short-circuits when
-  // there is no review to clean up after (parse failure or no
-  // review at all). The first-review / no-botLogin skip lives
-  // in the run (it's not a failure, just a no-op).
+async function cleanupGate(state, _ctx, _deps) {
   if (!state.review || !state.review.summary) {
     return { ok: false, reason: "no review landed; nothing to clean up" };
   }
@@ -335,18 +399,10 @@ async function fetchStage(ctx, deps, _overrides, _state) {
 }
 
 async function sniffStage(ctx, deps, overrides, state) {
-  // Macro stage: walk the sub-workflow. Today the sub-workflow
-  // is a single placeholder sub-stage that calls the existing
-  // runOpenCodeSkill, so behavior is unchanged from the inline
-  // pipeline. The sub-workflow shape exists so QUB-94 / QUB-95 /
-  // QUB-96 can push sub-stages onto the list without changing
-  // the macro executor.
   await runSubWorkflow(REVIEW_SUB_STAGES, ctx, deps, overrides, state);
 }
 
 async function summaryStage(ctx, deps, _overrides, state) {
-  // The summary gate (summaryGate) has already verified
-  // state.review.summary is non-empty. Just call postReview.
   await postReview(
     state.octokit,
     state.review.summary,
@@ -361,8 +417,6 @@ async function summaryStage(ctx, deps, _overrides, state) {
 }
 
 async function inlinesStage(ctx, deps, _overrides, state) {
-  // The inlines gate (inlinesGate) has already verified
-  // state.review.summary is non-empty.
   await postInlineComments(state.octokit, state.review.inlineComments, ctx, {
     log: deps.log,
     errlog: deps.errlog,
@@ -370,9 +424,6 @@ async function inlinesStage(ctx, deps, _overrides, state) {
 }
 
 async function cleanupStage(ctx, deps, overrides, state) {
-  // Best-effort. The cleanup gate has already verified there
-  // is a real review to clean up after. The remaining skips
-  // (first review, no botLogin) are no-ops, not failures.
   if (ctx.reviewNumber <= 1 || !ctx.botLogin) {
     state.cleanup = null;
     return;
@@ -398,11 +449,6 @@ async function cleanupStage(ctx, deps, overrides, state) {
 // --- sub-stage gate + function -----------------------------------------
 
 async function sniffLegacyGate(state, _ctx, _deps) {
-  // Placeholder sub-stage needs the opencode key + the cloned
-  // repo (deps.paths.repoDir). The macro fetch stage has
-  // already populated /work/repo; the handshake stage has
-  // populated state.openrouterApiKey. The gate is a
-  // defense-in-depth check.
   if (!state.openrouterApiKey) {
     return { ok: false, reason: "no openrouter api key" };
   }
@@ -410,9 +456,6 @@ async function sniffLegacyGate(state, _ctx, _deps) {
 }
 
 async function sniffLegacySubStage(ctx, deps, overrides, state) {
-  // Placeholder sub-stage that calls the existing runOpenCodeSkill.
-  // QUB-95 will replace this with the multi-expert sub-workflow
-  // (classify / dispatch / gather / narrate).
   const skillFn = overrides.runOpenCodeSkill || defaultRunOpenCodeSkill;
   state.review = await skillFn(state.openrouterApiKey, ctx, deps);
   const telemetry = state.review.telemetry ?? null;

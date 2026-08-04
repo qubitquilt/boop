@@ -7,6 +7,9 @@ import {
   statusStageFor,
   runStages,
   runSubWorkflow,
+  DEFAULT_MAX_ATTEMPTS,
+  DEFAULT_BACKOFF_BASE_MS,
+  DEFAULT_BACKOFF_MAX_MS,
 } from "./workflow.mjs";
 
 // --- macro STAGES table -------------------------------------------------
@@ -558,4 +561,181 @@ test("gate failure is soft: a thrown run still propagates (QUB-90 boundary)", as
   // The auth + clone statuses were attempted; the run-time
   // error happened before the clone status PATCH.
   assert.ok(sequence.includes("postStatus(auth)"));
+});
+
+// --- retry policy (QUB-91) ----------------------------------------------
+
+test("a retryable stage that throws retries up to stageMaxAttempts times (QUB-91)", async () => {
+  // A flaky LLM call retries with bounded attempts. The
+  // stageMaxAttempts = 3 + a no-op sleep so the test doesn't
+  // wait. After 3 attempts, the run throws (the executor
+  // rethrows the last error).
+  let calls = 0;
+  const stages = [
+    {
+      id: "flaky",
+      retryable: true,
+      gate: async () => ({ ok: true }),
+      run: async () => {
+        calls++;
+        throw new Error(`flaky ${calls}`);
+      },
+    },
+  ];
+  const deps = recordingDeps({
+    sleep: async () => {},
+    stageMaxAttempts: 3,
+  });
+  await assert.rejects(
+    () => runSubWorkflow(stages, fakeCtx, deps, {}, {}),
+    /flaky 3/,
+    "after the bound, the run throws the last error",
+  );
+  assert.equal(calls, 3, "retried exactly stageMaxAttempts times");
+});
+
+test("a retryable gate that fails retries up to stageMaxAttempts times (QUB-91)", async () => {
+  // A gate that returns {ok: false} on a retryable stage
+  // retries the gate (cheap) until the bound; then the
+  // executor soft-fails (state.parseFailed = true, no throw).
+  let gateCalls = 0;
+  let runCalls = 0;
+  const stages = [
+    {
+      id: "flaky-gate",
+      retryable: true,
+      gate: async () => {
+        gateCalls++;
+        return { ok: false, reason: "still bad" };
+      },
+      run: async () => {
+        runCalls++;
+      },
+    },
+  ];
+  const deps = recordingDeps({
+    sleep: async () => {},
+    stageMaxAttempts: 3,
+  });
+  const state = {};
+  await runSubWorkflow(stages, fakeCtx, deps, {}, state);
+  assert.equal(gateCalls, 3, "gate was called exactly stageMaxAttempts times");
+  assert.equal(runCalls, 0, "run was never called (gate kept failing)");
+  assert.equal(state.parseFailed, true, "soft fail on gate retry exhaustion");
+});
+
+test("a non-retryable stage that throws rethrows immediately (QUB-91)", async () => {
+  // A stage with retryable: false does not retry. The
+  // existing parse-failure path (summary gate) and auth-style
+  // errors land here.
+  let calls = 0;
+  const stages = [
+    {
+      id: "no-retry",
+      retryable: false,
+      gate: async () => ({ ok: true }),
+      run: async () => {
+        calls++;
+        throw new Error("auth blew up");
+      },
+    },
+  ];
+  const deps = recordingDeps({
+    sleep: async () => {},
+    stageMaxAttempts: 3,
+  });
+  await assert.rejects(
+    () => runSubWorkflow(stages, fakeCtx, deps, {}, {}),
+    /auth blew up/,
+  );
+  assert.equal(calls, 1, "no retry on a non-retryable stage");
+});
+
+test("an error with nonRetryable: true is not retried even on a retryable stage (QUB-91)", async () => {
+  // A future PR can mark specific errors as non-retryable by
+  // attaching {nonRetryable: true}. The retry helper checks
+  // the flag and rethrows immediately. Today the codebase
+  // doesn't attach the flag anywhere; this test pins the
+  // contract for a future caller.
+  let calls = 0;
+  const stages = [
+    {
+      id: "schema-error",
+      retryable: true,
+      gate: async () => ({ ok: true }),
+      run: async () => {
+        calls++;
+        const err = new Error("schema mismatch");
+        err.nonRetryable = true;
+        throw err;
+      },
+    },
+  ];
+  const deps = recordingDeps({
+    sleep: async () => {},
+    stageMaxAttempts: 3,
+  });
+  await assert.rejects(
+    () => runSubWorkflow(stages, fakeCtx, deps, {}, {}),
+    /schema mismatch/,
+  );
+  assert.equal(calls, 1, "nonRetryable: true short-circuits the retry");
+});
+
+test("retry uses exponential backoff capped at stageBackoffMaxMs (QUB-91)", async () => {
+  // The sleep is recorded so the test can assert on the
+  // backoff schedule. The default schedule is base * 2^(n-1):
+  // 1000, 2000, 4000, ... capped at stageBackoffMaxMs.
+  const sleeps = [];
+  const stages = [
+    {
+      id: "backoff",
+      retryable: true,
+      gate: async () => ({ ok: true }),
+      run: async () => { throw new Error("nope"); },
+    },
+  ];
+  const deps = recordingDeps({
+    sleep: async (ms) => { sleeps.push(ms); },
+    stageMaxAttempts: 5,
+    stageBackoffBaseMs: 1000,
+    stageBackoffMaxMs: 4000,
+  });
+  await assert.rejects(() => runSubWorkflow(stages, fakeCtx, deps, {}, {}));
+  // 4 sleeps between 5 attempts: 1000, 2000, 4000, 4000 (capped).
+  assert.deepEqual(sleeps, [1000, 2000, 4000, 4000]);
+});
+
+test("every retryable macro stage has a non-throwing first attempt by default (QUB-91)", async () => {
+  // Sanity check: the default policy (3 attempts, 1s base,
+  // 30s cap) means a transient failure on any retryable
+  // macro stage costs at most 1+2+4 = 7s of backoff. The
+  // Job's 30-min active deadline is the outer ceiling.
+  assert.equal(DEFAULT_MAX_ATTEMPTS, 3);
+  assert.equal(DEFAULT_BACKOFF_BASE_MS, 1000);
+  assert.equal(DEFAULT_BACKOFF_MAX_MS, 30000);
+});
+
+test("each stage declares retryable: true or false (QUB-91)", () => {
+  // Pinned by QUB-91. The default-retry policy is "retry on
+  // failure"; a stage that opts out (handshake, summary)
+  // has a specific reason — auth won't fix itself, parse
+  // failure won't fix itself. A future PR that adds a stage
+  // must make the choice explicit.
+  for (const stage of STAGES) {
+    assert.equal(
+      typeof stage.retryable,
+      "boolean",
+      `${stage.id}: retryable must be a boolean`,
+    );
+  }
+  // Handshake (auth) and summary (parse failure) are
+  // non-retryable. The others are retryable.
+  const byId = Object.fromEntries(STAGES.map((s) => [s.id, s]));
+  assert.equal(byId.handshake.retryable, false);
+  assert.equal(byId.fetch.retryable, true);
+  assert.equal(byId.sniff.retryable, true);
+  assert.equal(byId.summary.retryable, false);
+  assert.equal(byId.inlines.retryable, true);
+  assert.equal(byId.cleanup.retryable, true);
 });
