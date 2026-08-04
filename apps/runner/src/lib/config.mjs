@@ -120,6 +120,19 @@ export function loadConfig(env = process.env) {
     dashboardUrl: env.BOOP_DASHBOARD_URL || null,
     dashboardToken: env.BOOP_DASHBOARD_TOKEN || null,
     jobName: env.BOOP_JOB_NAME || null,
+    // QUB-94: feature flag for the in-process OpenRouter SDK path.
+    // When set to "1", runOpenCodeSkill takes the new code path
+    // (apps/runner/src/lib/openrouter.mjs) and skips the
+    // opencode subprocess entirely. The old path stays unchanged
+    // so a flag flip is the rollback. Default is "0" until the
+    // cutover PR lands and a week of clean runs passes.
+    openrouterSdkEnabled: env.BOOP_USE_OPENROUTER_SDK === "1",
+    // QUB-94: optional model override for the SDK path. When set,
+    // overrides the value read from the opencode.json ConfigMap
+    // (which still mounts during the cutover). After QUB-98
+    // deletes the ConfigMap, this becomes the only source of
+    // the model name.
+    openrouterModel: env.OPENROUTER_MODEL || null,
   };
 }
 

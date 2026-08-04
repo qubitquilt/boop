@@ -11,6 +11,7 @@ import {
   confidenceBadge,
   buildBoopPrompt,
   runOpencode,
+  runOpenCodeSkill,
 } from "./opencode.mjs";
 
 // --- stripAnsi ----------------------------------------------------------
@@ -678,4 +679,164 @@ test("runOpencode adds --log-level DEBUG when deps.debug is true", async () => {
   const joined = captured.argv[1];
   assert.match(joined, /--log-level DEBUG/);
   assert.match(joined, /--print-logs/);
+});
+
+// --- runOpenCodeSkill SDK branch (QUB-94) -------------------------------
+
+// Tests for the BOOP_USE_OPENROUTER_SDK fast-path. The SDK call is
+// mocked via deps.callOpenRouter so the tests don't depend on the
+// network or the real @openrouter/sdk binary. The branch is the
+// only difference between the SDK path and the legacy subprocess
+// path; both paths must return the same review shape.
+
+const SDK_REVIEW_BODY =
+  "=== SUMMARY ===\n" +
+  "## TL;DR\nLooks good overall. The diff is small, scoped, and covered by tests. No blockers, one follow-up worth addressing.\n\n" +
+  "## Findings\n\n| ID | Tier | File : Line | Summary |\n|----|------|-------------|---------|\n| F1 | 🟢 Optional | `src/x.ts:10` | nit on naming |\n" +
+  "=== INLINE COMMENTS ===\n" +
+  "src/x.ts:10: heads up\n" +
+  "=== CONFIDENCE ===\n" +
+  "medium\n" +
+  "=== END ===\n";
+
+function makeSdkDeps(callResult, callError) {
+  const logCalls = [];
+  const statusCalls = [];
+  return {
+    log: (tag, msg, meta) => logCalls.push({ tag, msg, meta }),
+    errlog: () => {},
+    postStatus: async (stage) => statusCalls.push(stage),
+    paths: { repoDir: "/work/repo" },
+    callOpenRouter: async (_prompt, opts) => {
+      if (callError) throw callError;
+      return {
+        text: callResult.text,
+        usage: callResult.usage,
+        model: callResult.model,
+        ...opts,
+        _args: opts,
+      };
+    },
+    _logCalls: logCalls,
+    _statusCalls: statusCalls,
+  };
+}
+
+const SDK_BASE_CTX = {
+  prOwner: "qubitquilt",
+  prRepo: "boop",
+  prNumber: 42,
+  prHeadSha: "0123456789abcdef0123456789abcdef01234567",
+  prBaseRef: "main",
+  previousHeadSha: null,
+  skipSkill: true, // bypasses the file-reading prompt builder
+  openrouterSdkEnabled: true,
+  openrouterModel: "minimax/minimax-m3",
+  dashboardUrl: null,
+  dashboardToken: null,
+};
+
+test("runOpenCodeSkill takes the SDK branch when the flag is on", async () => {
+  const deps = makeSdkDeps({
+    text: SDK_REVIEW_BODY,
+    usage: { prompt_tokens: 100, completion_tokens: 50, cost: 0.002 },
+    model: "minimax/minimax-m3",
+  });
+  const review = await runOpenCodeSkill("api-key", SDK_BASE_CTX, deps);
+  assert.equal(review.summary.includes("Looks good overall"), true);
+  assert.equal(review.confidence, "medium");
+  assert.equal(review.inlineComments.length, 1);
+  assert.equal(review.inlineComments[0].path, "src/x.ts");
+  // Telemetry: SDK response is rolled into the runner's shape.
+  assert.equal(review.telemetry.provider, "openrouter");
+  assert.equal(review.telemetry.model, "minimax/minimax-m3");
+  assert.equal(review.telemetry.inputTokens, 100);
+  assert.equal(review.telemetry.outputTokens, 50);
+  assert.equal(review.telemetry.costUsd, 0.002);
+  assert.equal(review.telemetry.stepCount, 1);
+});
+
+test("runOpenCodeSkill posts status review and logs the SDK path", async () => {
+  const deps = makeSdkDeps({
+    text: SDK_REVIEW_BODY,
+    usage: { prompt_tokens: 1, completion_tokens: 1, cost: 0.0001 },
+    model: "minimax/minimax-m3",
+  });
+  await runOpenCodeSkill("api-key", SDK_BASE_CTX, deps);
+  assert.deepEqual(deps._statusCalls, ["review"]);
+  const startLog = deps._logCalls.find(
+    (l) => l.tag === "opencode" && l.msg === "starting",
+  );
+  assert.ok(startLog, "expected an opencode/starting log line");
+  assert.equal(startLog.meta.path, "openrouter-sdk");
+  assert.equal(startLog.meta.model, "minimax/minimax-m3");
+});
+
+test("runOpenCodeSkill returns empty telemetry on SDK call failure", async () => {
+  const deps = makeSdkDeps(null, new Error("network blip"));
+  const review = await runOpenCodeSkill("api-key", SDK_BASE_CTX, deps);
+  // Empty summary, low confidence, telemetry zero — the dashboard
+  // still gets a row, the postReview step refuses to post.
+  assert.equal(review.summary, "");
+  assert.equal(review.confidence, "low");
+  assert.equal(review.telemetry.inputTokens, 0);
+  assert.equal(review.telemetry.outputTokens, 0);
+  assert.equal(review.telemetry.costUsd, 0);
+  assert.equal(review.telemetry.provider, "openrouter");
+});
+
+test("runOpenCodeSkill throws when the SDK call is aborted (timeout)", async () => {
+  const aborted = Object.assign(new Error("aborted"), { name: "AbortError" });
+  const deps = makeSdkDeps(null, aborted);
+  await assert.rejects(
+    () => runOpenCodeSkill("api-key", SDK_BASE_CTX, deps),
+    /exceeded 25-min timeout/,
+  );
+});
+
+test("runOpenCodeSkill falls back to the legacy path when the flag is off", async () => {
+  // When the flag is off, runOpenCodeSkill must NOT call
+  // deps.callOpenRouter. We assert this by injecting a callOpenRouter
+  // that would throw a unique error, then expecting the legacy path
+  // (materializeConfig) to fail first with its own error — proving
+  // the SDK branch was skipped.
+  const deps = makeSdkDeps(null, new Error("SDK_BRANCH_INVOKED"));
+  // Provide minimal fs so materializeConfig reaches the
+  // readFile step (which is what we expect to fail).
+  deps.fs = {
+    rm: async () => {},
+    mkdir: async () => {},
+    readFile: async () => {
+      throw new Error("legacy_path_reached");
+    },
+    writeFile: async () => {},
+    unlink: async () => {},
+  };
+  deps.execFile = async () => ({ stdout: "", stderr: "" });
+  await assert.rejects(
+    () =>
+      runOpenCodeSkill(
+        "api-key",
+        { ...SDK_BASE_CTX, openrouterSdkEnabled: false },
+        deps,
+      ),
+    /legacy_path_reached/,
+  );
+});
+
+test("runOpenCodeSkill throws when the SDK path has no model configured", async () => {
+  // QUB-97 AC #1: the SDK fast-path requires a model name.
+  // Resolution order is ctx.openrouterModel env first, then the
+  // opencode.json mount. With neither available, the function
+  // must throw a clear error so the Job fails fast and the
+  // dashboard's "failed" status lands with a useful message —
+  // rather than silently zeroing the model field.
+  const ctx = { ...SDK_BASE_CTX, openrouterModel: "" };
+  const deps = makeSdkDeps(null, new Error("should not reach callOpenRouter"));
+  // readOpencodeModel returns "" when readFile throws.
+  deps.fs = { readFile: async () => { throw new Error("ENOENT"); } };
+  await assert.rejects(
+    () => runOpenCodeSkill("api-key", ctx, deps),
+    /no model configured/,
+  );
 });

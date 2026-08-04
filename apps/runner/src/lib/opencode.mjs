@@ -9,6 +9,11 @@
 
 import { LENS_FILES, OPENCODE_TIMEOUT_MS } from "./config.mjs";
 import { assertSafeRef, shortSha } from "./security.mjs";
+import {
+  buildTelemetry,
+  callOpenRouter,
+  readOpencodeModel,
+} from "./openrouter.mjs";
 
 // materializeConfig copies the read-only opencode config from the
 // ConfigMap mount into a writable tmp location and templates the
@@ -577,11 +582,21 @@ export function runOpencode(prompt, configContent, deps) {
   });
 }
 
-// runOpenCodeSkill is the orchestrator over buildBoopPrompt + opencode
-// subprocess invocation. Returns { summary, inlineComments, confidence }
-// plus, when the JSON-mode run is used, a telemetry object (cost +
-// tokens). The TUI mode returns the same shape with telemetry=null.
+// runOpenCodeSkill is the orchestrator over buildBoopPrompt + the
+// model invocation. It returns { summary, inlineComments, confidence }
+// plus a telemetry object when telemetry is captured. The legacy
+// opencode subprocess path returns telemetry=null on the TUI mode.
 export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
+  // QUB-94: SDK fast-path. The flag defaults to false; production
+  // stays on the opencode subprocess until a week of clean runs
+  // passes on the SDK path. The branch is the entire difference
+  // between the two code paths — once the cutover ships the
+  // subprocess block below can be deleted in QUB-98. A flag flip
+  // back to 0 is the rollback.
+  if (ctx.openrouterSdkEnabled) {
+    return await runOpenRouterSkill(openrouterApiKey, ctx, deps);
+  }
+
   const config = await materializeConfig(openrouterApiKey, deps);
   const configContent = JSON.stringify(config);
 
@@ -654,10 +669,6 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
     throw new Error("opencode returned empty stdout");
   }
 
-if (!review.summary && !stdout.trim()) {
-    throw new Error("opencode returned empty stdout");
-  }
-
   if (review.parseError) {
     // The model produced something the parser could not turn into a
     // review. Surface the reason + a stdout preview in the runner log
@@ -683,5 +694,121 @@ if (!review.summary && !stdout.trim()) {
 async function importRunOpencodeJSON(prompt, configContent, deps) {
   const mod = await import("./opencode_json.mjs");
   return mod.runOpencodeJSON(prompt, configContent, deps);
+}
+
+// runOpenRouterSkill is the SDK fast-path used when
+// ctx.openrouterSdkEnabled is true. It builds the same boop
+// prompt as the subprocess path, sends it through the OpenRouter
+// SDK in-process, and runs the existing parseReviewOutput on the
+// assistant text. Telemetry comes straight from the SDK response
+// — no JSON stream parser, no PTY wrap, no opencode.json
+// template.
+//
+// Lives in opencode.mjs (not openrouter.mjs) so it can reuse
+// buildBoopPrompt + parseReviewOutput without a circular import.
+async function runOpenRouterSkill(openrouterApiKey, ctx, deps) {
+  const prompt = ctx.skipSkill
+    ? `Reply with one sentence: confirm you can see the repo at ${deps.paths.repoDir} on head ${shortSha(ctx.prHeadSha)}.`
+    : await buildBoopPrompt(ctx, deps);
+
+  // Model resolution order:
+  //   1. ctx.openrouterModel (env override, used for tests and
+  //      for the post-QUB-98 cutover when the ConfigMap is gone)
+  //   2. opencode.json's `model` field, read from the read-only
+  //      ConfigMap mount. During the cutover the ConfigMap still
+  //      mounts, so we keep reading from it. After QUB-98 the
+  //      ctx.openrouterModel env override is the only path.
+  let model = ctx.openrouterModel || "";
+  if (!model) {
+    model = await readOpencodeModel(deps);
+  }
+  if (!model) {
+    throw new Error(
+      "openrouter SDK path: no model configured (set OPENROUTER_MODEL or mount opencode.json)",
+    );
+  }
+
+  deps.log("opencode", "starting", {
+    dir: deps.paths.repoDir,
+    model,
+    mode: ctx.skipSkill ? "minimal" : "full",
+    path: "openrouter-sdk",
+  });
+  await deps.postStatus("review");
+
+  let callResult;
+  let killed = false;
+  let timeoutMs = 0;
+  const startMs = Date.now();
+  // Test injection point: deps.callOpenRouter overrides the
+  // real SDK call. Production code calls the SDK directly.
+  const callFn = deps.callOpenRouter || callOpenRouter;
+  try {
+    callResult = await callFn(prompt, {
+      ...deps,
+      model,
+      // The API key is loaded from the mounted Secret file by
+      // index.mjs; the SDK reads it from `env.OPENROUTER_API_KEY`
+      // so we forward the loaded value through an env-shaped
+      // object. The subprocess path (runOpencode) does the
+      // opposite — it scrubs env to keep secrets away from the
+      // child — but the SDK runs in-process, so passing the
+      // key in a local object is fine.
+      env: { OPENROUTER_API_KEY: openrouterApiKey },
+    });
+  } catch (err) {
+    const elapsed = Date.now() - startMs;
+    // The SDK uses AbortError for our timeout path (we pass
+    // controller.signal into client.chat.send). Anything else is
+    // a genuine SDK failure — 4xx, 5xx, network, etc. — and
+    // should surface in the error pipeline, not the info one.
+    const isAbort = err?.name === "AbortError";
+    if (isAbort) {
+      killed = true;
+      timeoutMs = OPENCODE_TIMEOUT_MS;
+    }
+    deps.errlog("opencode", "sdk call failed", {
+      killed,
+      timeoutMs,
+      mode: "openrouter-sdk",
+      error: String(err?.message ?? err),
+      errorName: err?.name,
+      elapsedMs: elapsed,
+    });
+    if (killed) {
+      throw new Error(`openrouter run exceeded ${OPENCODE_TIMEOUT_MS / 60000}-min timeout`);
+    }
+    const review = parseReviewOutput("");
+    review.parseError = review.parseError || "sdk call failed";
+    // Stamp the error on the telemetry so the dashboard can
+    // distinguish a failed SDK call from a successful call that
+    // happened to produce an empty summary.
+    return { ...review, telemetry: buildTelemetry(null, err) };
+  }
+
+  const review = parseReviewOutput(callResult.text);
+  const telemetry = buildTelemetry(callResult);
+
+  deps.log("opencode", "exit", {
+    killed: false,
+    timeoutMs: 0,
+    mode: "openrouter-sdk",
+    model: callResult.model,
+    stdoutBytes: callResult.text.length,
+    tokens_in: telemetry.inputTokens,
+    tokens_out: telemetry.outputTokens,
+    cost_usd: telemetry.costUsd,
+    step_count: telemetry.stepCount,
+  });
+
+  if (review.parseError) {
+    deps.log("review", "summary_parse_failed", {
+      reason: review.parseError,
+      stdoutBytes: callResult.text.length,
+      preview: callResult.text.slice(0, 200),
+    });
+  }
+
+  return { ...review, telemetry };
 }
 // temporary verify mark 1785624554

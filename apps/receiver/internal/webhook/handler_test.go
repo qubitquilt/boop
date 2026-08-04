@@ -176,6 +176,63 @@ func TestDuplicateReviewReply(t *testing.T) {
 	}
 }
 
+func TestResolveSDKEnabled(t *testing.T) {
+	makeH := func(clusterDefault string) *Handler {
+		return &Handler{cfg: Config{OpenRouterSDKDefault: clusterDefault}}
+	}
+	cases := []struct {
+		name           string
+		clusterDefault string
+		labels         []string
+		want           string
+	}{
+		{"cluster default 0, no label", "0", nil, "0"},
+		{"cluster default 0, unrelated label", "0", []string{"bug", "feature"}, "0"},
+		{"cluster default 0, sdk label opts in", "0", []string{"boop:openrouter-sdk"}, "1"},
+		{"cluster default 0, sdk label case-insensitive", "0", []string{"Boop:OpenRouter-SDK"}, "1"},
+		{"cluster default 1, no label", "1", nil, "1"},
+		{"cluster default 1, unrelated label", "1", []string{"bug"}, "1"},
+		{"cluster default 1, sdk label is redundant", "1", []string{"boop:openrouter-sdk"}, "1"},
+		{"cluster default unset, no label", "", nil, "0"},
+		{"cluster default unset, sdk label opts in", "", []string{"boop:openrouter-sdk"}, "1"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := makeH(c.clusterDefault)
+			if got := h.resolveSDKEnabled(c.labels); got != c.want {
+				t.Errorf("resolveSDKEnabled(%q, %v) = %q, want %q", c.clusterDefault, c.labels, got, c.want)
+			}
+		})
+	}
+}
+
+func TestBuildJobForwardsOpenRouterSDKEnabled(t *testing.T) {
+	job, err := buildJob(templateVars{
+		Owner:                "o",
+		Repo:                 "r",
+		Number:               "1",
+		SHA:                  "0123456789abcdef",
+		SHA7:                 "0123456",
+		BaseRef:              "main",
+		Image:                "img",
+		InstallationID:       "1",
+		OpenRouterSDKEnabled: "1",
+	})
+	if err != nil {
+		t.Fatalf("buildJob: %v", err)
+	}
+	env := job.Spec.Template.Spec.Containers[0].Env
+	var got string
+	for _, e := range env {
+		if e.Name == "BOOP_USE_OPENROUTER_SDK" {
+			got = e.Value
+		}
+	}
+	if got != "1" {
+		t.Errorf("BOOP_USE_OPENROUTER_SDK = %q, want %q", got, "1")
+	}
+}
+
 func TestBuildJob(t *testing.T) {
 	job, err := buildJob(templateVars{
 		Owner:           "michaelruelas",
@@ -789,6 +846,7 @@ func TestSubmitJob_FallsBackOnConfigMapReadFailure(t *testing.T) {
 		5153677875,                        // statusCommentID (validates the Job runs the status thread)
 		12345,                             // installationID
 		1,                                 // reviewNumber
+		nil,                               // labels (no per-PR SDK opt-in)
 	)
 
 	// Pull the Job the handler created and assert its image.
@@ -858,6 +916,7 @@ func TestSubmitJob_UsesLiveConfigMapWhenAvailable(t *testing.T) {
 		5153677875,
 		12345,
 		1,
+		nil,
 	)
 	jobs, err := client.BatchV1().Jobs("dev-tools").List(context.Background(), metav1.ListOptions{})
 	if err != nil {

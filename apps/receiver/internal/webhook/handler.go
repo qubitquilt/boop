@@ -82,6 +82,13 @@ type Config struct {
 	DBPath          string // sqlite path; empty disables the data layer (legacy mode)
 	RunnerToken     string // shared secret for the runner's POST endpoints; empty rejects all runner posts
 	InstallPollInterval time.Duration // how often to refresh installations from GitHub; 0 = 5m default
+	// QUB-94: cluster-wide default for the OpenRouter SDK feature
+	// flag. The runner takes the in-process SDK path when
+	// BOOP_USE_OPENROUTER_SDK=1; otherwise it falls back to the
+	// opencode subprocess. Per-PR overrides win over this default
+	// (see sdkEnabledLabel). Default "0" until the cutover PR
+	// ships and a week of clean runs passes.
+	OpenRouterSDKDefault string
 }
 
 type Handler struct {
@@ -325,7 +332,7 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
 		// Non-fatal — the Job still runs.
 	}
-	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("pull_request.%s", pr.Action), 0, statusID, installationID, reviewNumber)
+	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("pull_request.%s", pr.Action), 0, statusID, installationID, reviewNumber, pr.Labels)
 }
 
 func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter, delivery string, installationID int64, body []byte) {
@@ -410,7 +417,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
 	}
 
-	h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, statusID, installationID, reviewNumber)
+	h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, statusID, installationID, reviewNumber, nil)
 }
 
 // computeReviewNumber returns the 1-based index of the review this
@@ -547,8 +554,15 @@ func duplicateReviewReply(status, headSHA string) string {
 	}
 }
 
-func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID, installationID int64, reviewNumber int) {
+func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID, installationID int64, reviewNumber int, labels []string) {
 	jobName := buildJobName(owner, repo, number, headSHA)
+
+	// QUB-94: resolve the BOOP_USE_OPENROUTER_SDK value for this
+	// PR. The cluster default + the per-PR label form the value;
+	// the decision is logged so a job landing on either path is
+	// traceable from the webhook handler logs.
+	sdkEnabled := h.resolveSDKEnabled(labels)
+	h.logger.Info("sdk flag resolved", "delivery", delivery, "value", sdkEnabled, "label_present", hasLabel(labels, sdkEnabledLabel), "cluster_default", h.cfg.OpenRouterSDKDefault)
 
 	// Resolve JOB_IMAGE fresh from the boop-config ConfigMap instead
 	// of using the env-var snapshot captured at startup. ArgoCD
@@ -584,6 +598,10 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		// runner at a public URL (where the token would leak).
 		DashboardURL:   "http://boop-receiver.dev-tools.svc.cluster.local:8080",
 		DashboardToken: h.cfg.RunnerToken,
+		// QUB-94: forwarded into BOOP_USE_OPENROUTER_SDK so the
+		// runner takes the in-process SDK path. Defaults to "0"
+		// (opencode subprocess) until the cutover.
+		OpenRouterSDKEnabled: sdkEnabled,
 	})
 	if err != nil {
 		// Base-ref or installation-id validation failure: this is a
@@ -754,6 +772,11 @@ type templateVars struct {
 	DashboardURL      string // receiver Service URL the runner POSTs telemetry to; empty disables telemetry capture
 	DashboardToken    string // shared secret for the runner's POSTs; empty disables telemetry capture
 	JobName           string // the K8s Job name, which the runner reports back as the run id
+	// QUB-94: BOOP_USE_OPENROUTER_SDK value forwarded to the
+	// runner. "1" → in-process OpenRouter SDK path; "0" →
+	// opencode subprocess. Resolved at submitJob time from the
+	// cluster default + the boop:openrouter-sdk per-PR label.
+	OpenRouterSDKEnabled string
 }
 
 type prMeta struct {
@@ -772,6 +795,17 @@ type prMeta struct {
 // schedules a review Job.
 const skipReviewLabel = "skip-review"
 
+// sdkEnabledLabel is the GitHub label that opts a PR into the
+// OpenRouter SDK path for its next review. The cluster-wide
+// default (Config.OpenRouterSDKDefault, sourced from
+// BOOP_USE_OPENROUTER_SDK on the receiver) still applies; the
+// label is a per-PR override. During the QUB-94 rollout the
+// cluster default stays at "0" (opencode subprocess) and the
+// label is how operators flip a single PR to the SDK path for
+// smoke-testing. After the cutover the cluster default flips to
+// "1" and the label becomes a no-op opt-in.
+const sdkEnabledLabel = "boop:openrouter-sdk"
+
 func hasLabel(labels []string, name string) bool {
 	for _, l := range labels {
 		if strings.EqualFold(l, name) {
@@ -779,6 +813,25 @@ func hasLabel(labels []string, name string) bool {
 		}
 	}
 	return false
+}
+
+// resolveSDKEnabled picks the BOOP_USE_OPENROUTER_SDK value for
+// the next review Job on a PR. The cluster default
+// (h.cfg.OpenRouterSDKDefault) sets the floor; the per-PR label
+// is an opt-in. There is no opt-out label today: during the
+// rollout, the cluster default is "0" (opencode) and a label
+// switches a single PR to "1" (SDK). After the cutover, the
+// cluster default flips to "1" and the label becomes redundant.
+// The decision is logged so the operator can see why a given
+// Job landed on either path.
+func (h *Handler) resolveSDKEnabled(labels []string) string {
+	if hasLabel(labels, sdkEnabledLabel) {
+		return "1"
+	}
+	if h.cfg.OpenRouterSDKDefault == "1" {
+		return "1"
+	}
+	return "0"
 }
 
 // parseInstallationID reads the X-GitHub-Installation-ID header and

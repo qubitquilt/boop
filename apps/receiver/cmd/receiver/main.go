@@ -48,6 +48,13 @@ func main() {
 		BotLogin:        os.Getenv("BOT_LOGIN"), // optional; if empty, the receiver ignores all issue_comment events with sender == self check
 		DBPath:          getenv("DB_PATH", "/data/boop.db"),
 		RunnerToken:     os.Getenv("RUNNER_TOKEN"),
+		// QUB-94: cluster-wide default for the OpenRouter SDK
+		// feature flag. "1" tells every new review Job to take the
+		// in-process SDK path; "0" keeps the opencode subprocess.
+		// Per-PR labels (boop:openrouter-sdk) override this for a
+		// single review. Default "0" until the cutover PR lands
+		// and a week of clean runs passes.
+		OpenRouterSDKDefault: getenv("BOOP_USE_OPENROUTER_SDK", "0"),
 	}
 
 	if cfg.WebhookSecret == "" {
