@@ -696,6 +696,18 @@ async function importRunOpencodeJSON(prompt, configContent, deps) {
   return mod.runOpencodeJSON(prompt, configContent, deps);
 }
 
+// Strip the opencode-internal `openrouter/` prefix from a model
+// ID so the value is acceptable to OpenRouter's own API. The
+// opencode.json ConfigMap stores models as `openrouter/<id>`
+// because opencode uses the leading segment to pick the provider.
+// The SDK calls OpenRouter directly, so the prefix must go.
+// Returns "" for an empty input (the caller treats that as a
+// misconfiguration and throws).
+function stripOpenRouterPrefix(model) {
+  if (!model) return "";
+  return model.startsWith("openrouter/") ? model.slice("openrouter/".length) : model;
+}
+
 // runOpenRouterSkill is the SDK fast-path used when
 // ctx.openrouterSdkEnabled is true. It builds the same boop
 // prompt as the subprocess path, sends it through the OpenRouter
@@ -725,6 +737,19 @@ async function runOpenRouterSkill(openrouterApiKey, ctx, deps) {
   if (!model) {
     throw new Error(
       "openrouter SDK path: no model configured (set OPENROUTER_MODEL or mount opencode.json)",
+    );
+  }
+  // opencode.json stores the model as `openrouter/<id>` (the
+  // `openrouter/` prefix is opencode-specific routing). OpenRouter's
+  // own API expects the bare `provider/model` format, so the SDK
+  // path strips the prefix. The legacy opencode path is left alone
+  // — it knows how to interpret the prefixed form. The cutover
+  // (QUB-98) deletes the opencode.json file, so this normalization
+  // is a transitional concern.
+  model = stripOpenRouterPrefix(model);
+  if (!model) {
+    throw new Error(
+      "openrouter SDK path: model is empty after stripping the openrouter/ prefix",
     );
   }
 
