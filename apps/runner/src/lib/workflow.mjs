@@ -48,8 +48,8 @@
 
 import { setTimeout as defaultSleep } from "node:timers/promises";
 import { defaultClassify } from "./classify.mjs";
+import { defaultNarrate, gather, pickExperts, runExperts } from "./experts.mjs";
 import { cloneRepo } from "./git.mjs";
-import { runOpenCodeSkill as defaultRunOpenCodeSkill } from "./opencode.mjs";
 import {
   cleanupPriorReview as defaultCleanupPriorReview,
   makeOctokit,
@@ -145,13 +145,10 @@ export const STAGES = [
 ];
 
 // REVIEW_SUB_STAGES is the list of sub-stages inside the `sniff`
-// macro-stage. Today it has:
-//   - classify (QUB-94): identify the PR type. Informational;
-//     state.classification is written but the downstream
-//     pipeline does not yet read it. QUB-95's dispatcher will.
-//   - sniff-legacy: placeholder that calls the existing
-//     runOpenCodeSkill. QUB-95 replaces this with
-//     dispatch / gather / narrate; QUB-96 adds meta-review.
+// macro-stage. QUB-95 replaces the sniff-legacy placeholder
+// with the multi-expert sub-workflow: classify (QUB-94) ->
+// dispatch -> gather -> narrate. QUB-96 will add meta-review
+// between gather and narrate.
 //
 // Sub-stages are silent on the status thread (statusStage: null).
 // The "review" status line is posted once at the start of the
@@ -162,7 +159,7 @@ export const REVIEW_SUB_STAGES = [
     id: "classify",
     statusStage: null,
     description:
-      "Identify the PR type (bug fix, feature, refactor, docs, test-only, infra) to drive the expert selection in dispatch (QUB-95). Today the classifier is a stub; a follow-up wires the real LLM call.",
+      "Identify the PR type (bug fix, feature, refactor, docs, test-only, infra) to drive the expert selection in dispatch.",
     input: "ctx, state.openrouterApiKey, /work/repo",
     output: "state.classification = { type, confidence }",
     idempotent: false,
@@ -171,16 +168,40 @@ export const REVIEW_SUB_STAGES = [
     run: classifySubStage,
   },
   {
-    id: "sniff-legacy",
+    id: "dispatch",
     statusStage: null,
     description:
-      "Placeholder sub-stage that calls the existing runOpenCodeSkill. QUB-95 replaces this with dispatch / gather / narrate.",
-    input: "ctx, state.openrouterApiKey, /work/repo",
-    output: "state.review",
+      "Pick the experts for this PR type and run them in parallel. Each expert is an independent LLM call with a tailored prompt + tool surface (bash, file reads, test runner) scoped to the cloned repo.",
+    input: "state.classification, /work/repo",
+    output: "state.findings = [Finding, ...]",
     idempotent: false,
     retryable: true,
-    gate: sniffLegacyGate,
-    run: sniffLegacySubStage,
+    gate: dispatchGate,
+    run: dispatchSubStage,
+  },
+  {
+    id: "gather",
+    statusStage: null,
+    description:
+      "De-duplicate and flatten the expert findings into a single list the narrator can consume.",
+    input: "state.findings",
+    output: "state.findings (de-duped in place)",
+    idempotent: true,
+    retryable: true,
+    gate: gatherGate,
+    run: gatherSubStage,
+  },
+  {
+    id: "narrate",
+    statusStage: null,
+    description:
+      "Produce the cohesive summary + inline-comment set from the gathered findings. The output shape is identical to the single-LLM-call path so the downstream summary + inlines stages are unaffected.",
+    input: "state.findings, ctx, /work/repo",
+    output: "state.review = { summary, inlineComments, confidence, telemetry }",
+    idempotent: false,
+    retryable: true,
+    gate: narrateGate,
+    run: narrateSubStage,
   },
 ];
 
@@ -550,18 +571,82 @@ async function classifySubStage(ctx, deps, overrides, state) {
   });
 }
 
-async function sniffLegacyGate(state, _ctx, _deps) {
-  if (!state.openrouterApiKey) {
-    return { ok: false, reason: "no openrouter api key" };
-  }
+async function dispatchGate(_state, _ctx, _deps) {
+  // Dispatch needs the openrouter key (for the real expert
+  // LLM calls) and the classification (from QUB-94). The
+  // classify stage has populated both.
   return { ok: true };
 }
 
-async function sniffLegacySubStage(ctx, deps, overrides, state) {
-  const skillFn = overrides.runOpenCodeSkill || defaultRunOpenCodeSkill;
-  state.review = await skillFn(state.openrouterApiKey, ctx, deps);
+async function dispatchSubStage(ctx, deps, overrides, state) {
+  // Pick the experts for this PR type and run them in
+  // parallel. Each expert is an independent LLM call (or
+  // stub, in tests); the dispatcher does not serialize.
+  //
+  // The pickExperts + runExperts pair is overridable so a
+  // test can inject a deterministic expert pool (e.g.,
+  // one expert that returns a canned finding). The
+  // defaults live in lib/experts.mjs.
+  const pick = overrides.pickExperts || pickExperts;
+  const run = overrides.runExperts || runExperts;
+  const names = pick(state.classification || { type: "unknown" });
+  deps.log("dispatch", "picked experts", { names });
+  const findings = await run(names, ctx, deps, { classification: state.classification });
+  state.findings = findings;
+  deps.log("dispatch", "experts returned", {
+    count: findings.length,
+    names,
+  });
+}
+
+async function gatherGate(_state, _ctx, _deps) {
+  // Gather needs the findings from dispatch. The dispatch
+  // stage has populated them.
+  return { ok: true };
+}
+
+async function gatherSubStage(_ctx, deps, overrides, state) {
+  // De-duplicate the findings. The default is the in-place
+  // gather in lib/experts.mjs; a test can override (e.g., to
+  // assert on the gather call without mutating state).
+  if (typeof overrides.gather === "function") {
+    state.findings = overrides.gather(state.findings || []);
+  } else {
+    state.findings = gather(state.findings || []);
+  }
+  deps.log("gather", "de-duplicated findings", {
+    count: (state.findings || []).length,
+  });
+}
+
+async function narrateGate(_state, _ctx, _deps) {
+  // Narrate runs after gather. The findings are required
+  // (the narrator reads them). An empty findings list is
+  // allowed — the narrator returns a placeholder.
+  return { ok: true };
+}
+
+async function narrateSubStage(ctx, deps, overrides, state) {
+  // The runner's `overrides.runOpenCodeSkill` hook (the
+  // lib-split PR #71 injection point) still works — a
+  // caller that hasn't migrated to the multi-expert
+  // sub-workflow can inject a canned review via
+  // `overrides.runOpenCodeSkill` and the narrate stage
+  // will use it. The dispatch + gather stages still run
+  // (cheap, no LLM call), but their output is discarded
+  // when the override is in play. The narrate stage's
+  // own `overrides.narrate` hook lets a test inject a
+  // deterministic narrator for the new path.
+  if (typeof overrides.runOpenCodeSkill === "function") {
+    const skillFn = overrides.runOpenCodeSkill;
+    state.review = await skillFn(state.openrouterApiKey, ctx, deps);
+  } else {
+    const narrateFn = overrides.narrate || defaultNarrate;
+    const review = await narrateFn(state.findings || [], ctx, deps);
+    state.review = review;
+  }
   const telemetry = state.review.telemetry ?? null;
-  deps.log("review", "opencode returned", {
+  deps.log("narrate", "narrator returned", {
     summaryBytes: state.review.summary ? state.review.summary.length : 0,
     inlineCount: state.review.inlineComments
       ? state.review.inlineComments.length
