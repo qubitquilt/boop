@@ -43,6 +43,7 @@ to the diff. A final status update marks the run ✅ or ❌.
 7. **[deployment.md](./deployment.md)** — K8s overlays, CI, image tags, ArgoCD, release lifecycle.
 8. **[secrets.md](./secrets.md)** — GitHub App credentials, OpenBao secret store.
 9. **[development.md](./development.md)** — local dev, build, test.
+10. **[workflow-engine.md](./workflow-engine.md)** — engine choice for the staged PR review (QUB-87).
 
 The component READMEs (`apps/receiver/README.md`, `apps/runner/README.md`,
 `apps/k8s/base/runner-config/README.md`) are scoped to that component and stay
