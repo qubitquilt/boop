@@ -116,6 +116,36 @@ export async function runExperts(names, ctx, deps, shared = {}) {
   return findings;
 }
 
+// defaultMetaReview is the stub. It accepts every finding
+// and requests no re-pass. A follow-up PR wires the real
+// meta-reviewer LLM call: an `opencode run` that scans the
+// gathered findings for things that "stick out as
+// potentially wrong" (false positives, contradictions,
+// missing context) and returns the list of experts to
+// re-dispatch.
+//
+// The return shape is { reDispatch: string[] } — the names
+// of the experts whose findings need a re-pass. An empty
+// list means "all findings are fine; narrate them as-is."
+export async function defaultMetaReview(_findings, _classification, _ctx, _deps) {
+  return { reDispatch: [] };
+}
+
+// mergeByExpert replaces the findings from the re-dispatched
+// experts with the new findings. Other experts' findings
+// are preserved. The merge keeps the result flat (no
+// nesting) and de-duped by id.
+export function mergeByExpert(original, replacement) {
+  const reDispatchedExperts = new Set(
+    (replacement || []).map((f) => f.expert).filter(Boolean),
+  );
+  const kept = (original || []).filter(
+    (f) => !f || !f.expert || !reDispatchedExperts.has(f.expert),
+  );
+  const all = [...kept, ...(replacement || [])];
+  return gather(all);
+}
+
 // gather flattens expert findings into a unified, de-duped
 // list. Two findings are "the same" if they share the same
 // id (the expert names the id; collisions indicate a
