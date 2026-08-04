@@ -278,8 +278,14 @@ both sides pin this.
 ```
 cd apps/runner
 make build                              # node --check src/index.mjs
-npm test                                # node --test src/*.test.mjs src/lib/*.test.mjs
+make test                               # bun test src/*.test.mjs src/lib/*.test.mjs
 ```
+
+`make test` runs the local test loop under Bun. The production
+runner image still uses Node 22; this is a local-iteration
+acceleration. `make test-node` falls back to `node --test` for
+the rare case Bun disagrees with node on a test. See
+[QUB-10](https://linear.app/qubit-quilt/issue/QUB-10/convert-runner-to-using-bun).
 
 Tests are granular — one file per module under `src/lib/`:
 

@@ -9,6 +9,9 @@ See also: [receiver.md](./receiver.md), [runner.md](./runner.md),
 
 - Go 1.23 (`go version`).
 - Node 22 (`node --version`).
+- Bun (for the runner's local test loop — `bun --version`). The
+  production runner image still runs Node; the local test loop runs
+  under Bun for fast iteration. See [QUB-10](https://linear.app/qubit-quilt/issue/QUB-10/convert-runner-to-using-bun).
 - A kubeconfig with permissions to submit Jobs in a `dev-tools`
   namespace (for receiver end-to-end).
 - A GitHub App's `app-id`, `installation-id`, and `private-key` (for any
@@ -67,8 +70,13 @@ make docker-push
 cd apps/runner
 make install        # npm install
 make build          # node --check src/index.mjs (syntax check)
-npm test            # node --test src/*.test.mjs src/lib/*.test.mjs
+make test           # bun test src/*.test.mjs src/lib/*.test.mjs
 ```
+
+`make test` runs under Bun. `make test-node` falls back to
+`node --test` for the rare case Bun disagrees with node on a test.
+See [QUB-10](https://linear.app/qubit-quilt/issue/QUB-10/convert-runner-to-using-bun)
+for the rationale.
 
 ### Run locally (no cluster, no LLM)
 
@@ -76,9 +84,9 @@ For the header format and other pure helpers, the test suite is the only check:
 
 ```
 cd apps/runner
-npm test                                                  # all tests
-node --test src/review-header.test.mjs                    # just the header fixtures
-node --test src/lib/github.test.mjs                       # GitHub API surface
+make test                                              # all tests, under Bun
+bun test src/review-header.test.mjs                    # just the header fixtures
+bun test src/lib/github.test.mjs                       # GitHub API surface
 node --test src/lib/opencode.test.mjs                     # parser, prompt builder
 ```
 
