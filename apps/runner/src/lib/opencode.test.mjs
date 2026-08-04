@@ -840,3 +840,51 @@ test("runOpenCodeSkill throws when the SDK path has no model configured", async 
     /no model configured/,
   );
 });
+
+test("stripOpenRouterPrefix drops the opencode-internal openrouter/ prefix", async () => {
+  // The smoke test on PR #33 surfaced a real bug: opencode.json
+  // stores models as `openrouter/<id>`, which OpenRouter's API
+  // does not accept. The SDK path strips the prefix; the legacy
+  // path is left alone. Verified end-to-end through a Job that
+  // logged `error: openrouter/minimax/minimax-m3 is not a valid
+  // model ID` before the fix.
+  const { runOpenCodeSkill } = await import("./opencode.mjs");
+  const deps = makeSdkDeps({
+    text: "ok",
+    usage: { prompt_tokens: 1, completion_tokens: 1, cost: 0.0001 },
+    model: "minimax/minimax-m3", // SDK normalizes the prefix BEFORE the call
+  });
+  const ctx = { ...SDK_BASE_CTX, openrouterModel: "openrouter/minimax/minimax-m3" };
+  const review = await runOpenCodeSkill("api-key", ctx, deps);
+  // The callResult.model is what the SDK returned (echoed by the
+  // fake). The fact that the run completed without throwing proves
+  // the prefix was stripped before the SDK call.
+  assert.equal(review.telemetry.model, "minimax/minimax-m3");
+});
+
+test("stripOpenRouterPrefix leaves already-bare model IDs untouched", async () => {
+  // An env override that doesn't carry the prefix (e.g. set
+  // directly via OPENROUTER_MODEL) must pass through unchanged.
+  const { runOpenCodeSkill } = await import("./opencode.mjs");
+  const deps = makeSdkDeps({
+    text: "ok",
+    usage: { prompt_tokens: 1, completion_tokens: 1, cost: 0.0001 },
+    model: "anthropic/claude-3.5-sonnet",
+  });
+  const ctx = { ...SDK_BASE_CTX, openrouterModel: "anthropic/claude-3.5-sonnet" };
+  const review = await runOpenCodeSkill("api-key", ctx, deps);
+  assert.equal(review.telemetry.model, "anthropic/claude-3.5-sonnet");
+});
+
+test("stripOpenRouterPrefix throws when the stripped value is empty", async () => {
+  // Defensive: a misconfigured opencode.json with just the
+  // prefix and no ID must fail fast, not silently call OpenRouter
+  // with an empty model.
+  const { runOpenCodeSkill } = await import("./opencode.mjs");
+  const deps = makeSdkDeps(null, new Error("should not reach"));
+  const ctx = { ...SDK_BASE_CTX, openrouterModel: "openrouter/" };
+  await assert.rejects(
+    () => runOpenCodeSkill("api-key", ctx, deps),
+    /empty after stripping/,
+  );
+});
