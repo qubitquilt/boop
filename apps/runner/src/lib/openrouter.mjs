@@ -109,6 +109,28 @@ export async function callOpenRouter(prompt, deps = {}) {
         err && typeof err === "object" && "contentType" in err
           ? String(err.contentType)
           : undefined;
+      // The SDK's typed error classes (OpenRouterError, etc.)
+      // carry statusCode / body / contentType. Some failure
+      // paths (network drops, aborts surfaced through the
+      // underlying fetch, transport-level rejections) throw a
+      // plain `Error` with none of those fields. The smoke test
+      // on PR #33 ran into that exact shape — `errorName: "Error"`,
+      // no statusCode, no body. The `raw` field is the escape
+      // hatch: JSON-serializes whatever the SDK actually handed
+      // back, so the next failure surfaces the underlying
+      // transport error rather than the silent "undefined" we
+      // got before.
+      const raw = (() => {
+        try {
+          return JSON.stringify(err, Object.getOwnPropertyNames(err ?? {}));
+        } catch {
+          return undefined;
+        }
+      })();
+      const stack =
+        err && typeof err === "object" && typeof err.stack === "string"
+          ? err.stack.split("\n").slice(0, 5).join("\n")
+          : undefined;
       // Surface the SDK's own failure in the error pipeline so a
       // 4xx/5xx doesn't look like a successful empty review in
       // the log. The throw below is the contract the runner
@@ -119,6 +141,8 @@ export async function callOpenRouter(prompt, deps = {}) {
         errorName: err?.name,
         contentType,
         body,
+        raw,
+        stack,
       });
       throw new Error(
         `OpenRouter chat completion failed${status ? ` (${status})` : ""}: ${message}`,
