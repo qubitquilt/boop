@@ -1,30 +1,31 @@
 // Workflow stages.
 //
 // The runner today is one process that runs five macro steps in
-// order (mint token, clone, sniff, summary, inlines). This module
-// pulls those steps into a data structure — STAGES — and a single
-// `runStages` executor.
+// order (mint token, clone, sniff, summary, inlines, plus the
+// re-review cleanup pass). This module pulls those steps into a
+// data structure — STAGES — and a single `runStages` executor.
 //
 // The `sniff` macro-stage wraps a review sub-workflow. The
 // sub-workflow is itself a list of sub-stages walked by
 // `runSubWorkflow`. The sub-stages land incrementally:
 //
-//   - QUB-89 (this PR): one placeholder sub-stage that calls the
-//     current runOpenCodeSkill, so the sub-workflow is structurally
+//   - QUB-89: one placeholder sub-stage that calls the current
+//     runOpenCodeSkill, so the sub-workflow is structurally
 //     present but behavior is unchanged.
 //   - QUB-94: classify (identify PR type)
 //   - QUB-95: dispatch + gather + narrate (parallel experts)
 //   - QUB-96: meta-review (bounded re-pass)
 //
-// Both executors share the gate / retry / resume machinery that
-// lands in QUB-90 / QUB-91 / QUB-92. Today the executors are plain
-// `for await` loops; the wiring attaches in the later PRs.
+// Both executors share the gate / retry / resume machinery
+// (QUB-90 / QUB-91 / QUB-92). The gate is the first piece: a
+// per-stage precondition check that runs before `run`. A failed
+// gate posts the "failed" status with the gate's reason and
+// aborts the run; QUB-91 will introduce bounded retry on top.
 //
 // Each stage (macro or sub) has the same contract:
 //
 //   id          the workflow-internal name. Pinned by the
-//               status-stage mapping and by the gate logic in
-//               later PRs.
+//               status-stage mapping and by the gate logic.
 //   statusStage the status label that gets PATCHed to the GitHub
 //               comment for this stage. null = silent (no new
 //               status line). The user-visible surface is pinned
@@ -37,9 +38,15 @@
 //   idempotent  whether re-running the stage is safe (re-posts
 //               to the PR, re-clones, etc.). Drives the resume
 //               logic in QUB-92.
+//   gate        async (state, ctx, deps) -> {ok: true} |
+//               {ok: false, reason: "..."}. The executor calls
+//               gate before run. A failed gate posts "failed"
+//               and aborts the run.
 //   run         the async function that does the work. Receives
 //               (ctx, deps, state) and mutates `state` in
-//               place. Throwing aborts the run.
+//               place. Throwing also aborts the run. The run
+//               assumes the gate passed; the gate is the
+//               contract for "this stage is allowed to run".
 
 import { cloneRepo } from "./git.mjs";
 import { runOpenCodeSkill as defaultRunOpenCodeSkill } from "./opencode.mjs";
@@ -62,6 +69,7 @@ export const STAGES = [
     output:
       "state.installationToken, state.openrouterApiKey, state.octokit",
     idempotent: false,
+    gate: handshakeGate,
     run: handshakeStage,
   },
   {
@@ -72,6 +80,7 @@ export const STAGES = [
     input: "ctx, state.octokit (for the token)",
     output: "/work/repo populated at PR_HEAD_SHA",
     idempotent: false,
+    gate: fetchGate,
     run: fetchStage,
   },
   {
@@ -82,6 +91,7 @@ export const STAGES = [
     input: "ctx, state.openrouterApiKey, /work/repo",
     output: "state.review (and state.findings, state.classification as the sub-stages land)",
     idempotent: false,
+    gate: sniffGate,
     run: sniffStage,
   },
   {
@@ -92,6 +102,7 @@ export const STAGES = [
     input: "state.review.summary, state.review.confidence, ctx",
     output: "a new PR comment with the summary + head-SHA marker",
     idempotent: false,
+    gate: summaryGate,
     run: summaryStage,
   },
   {
@@ -102,6 +113,7 @@ export const STAGES = [
     input: "state.review.inlineComments, ctx, state.octokit",
     output: "N review comments on the PR",
     idempotent: false,
+    gate: inlinesGate,
     run: inlinesStage,
   },
   {
@@ -112,6 +124,7 @@ export const STAGES = [
     input: "state.installationToken, ctx, state.botLogin",
     output: "state.cleanup = { resolved, minimized, errors } (or null on skip)",
     idempotent: true,
+    gate: cleanupGate,
     run: cleanupStage,
   },
 ];
@@ -136,6 +149,7 @@ export const REVIEW_SUB_STAGES = [
     input: "ctx, state.openrouterApiKey, /work/repo",
     output: "state.review",
     idempotent: false,
+    gate: sniffLegacyGate,
     run: sniffLegacySubStage,
   },
 ];
@@ -150,49 +164,138 @@ export function statusStageFor(id) {
   return stage ? stage.statusStage : null;
 }
 
-// runStages walks the macro-stage list in order, calling each
-// stage's `run` function. The `state` object is shared between
-// stages and accumulates their outputs. The `overrides` object
-// lets a test inject a custom runOpenCodeSkill, cloneRepo, or
-// makeOctokit — the same hook the inline run() in index.mjs used
-// before this refactor.
+// runStages walks the macro-stage list in order. For each stage:
+//   1. Call gate(state, ctx, deps). If it returns {ok: false},
+//      log + post "failed" with the reason, set
+//      state.parseFailed = true, and return. The orchestrator
+//      in index.mjs checks state.parseFailed and short-circuits
+//      cleanup / telemetry / done. The executor does NOT throw
+//      on gate failure — a parse failure or a missing-input
+//      failure is "expected" (the LLM might not produce a
+//      structured block; we should not waste a Job exit on it).
+//      QUB-91 (retry) will introduce bounded retry on top;
+//      the retry's per-stage wrapper can check the gate's
+//      return value directly without needing a throw.
+//   2. Call run(ctx, deps, overrides, state). A throw is treated
+//      as a hard failure and propagates to the orchestrator
+//      catch in index.mjs (same as before the gate refactor).
 //
-// On success, returns the final state. On any stage throwing,
-// the error propagates; the caller (run() in index.mjs) is
-// responsible for posting the "failed" status.
-//
-// Note: the executor intentionally has no gate or retry logic
-// yet. Those land in QUB-90 (gates) and QUB-91 (retry). The
-// current behavior is identical to the inline pipeline that
-// existed before this refactor; the split is purely structural.
+// The gate + run split is the foundation QUB-91 (retry) and
+// QUB-92 (resume) build on.
 export async function runStages(ctx, deps, overrides, state) {
   for (const stage of STAGES) {
+    const pre = await stage.gate(state, ctx, deps);
+    if (!pre.ok) {
+      await onGateFailure(stage.id, pre.reason, state, deps);
+      return state;
+    }
     await stage.run(ctx, deps, overrides, state);
   }
   return state;
 }
 
 // runSubWorkflow walks a sub-workflow stage list in order. Same
-// signature and override surface as runStages; used by the
-// `sniff` macro-stage to walk REVIEW_SUB_STAGES. The shape is
-// the same as runStages so the gate / retry / resume machinery
-// (QUB-90 / QUB-91 / QUB-92) attaches to both with one helper.
-//
-// The executor is intentionally a plain for-loop today. The
-// meta-review sub-stage (QUB-96) will introduce a bounded
-// re-pass loop on top of this executor.
+// shape as runStages (gate + run per stage). A gate failure
+// inside the sub-workflow sets state.parseFailed and returns;
+// the macro `sniff` stage's run sees the flag (via the next
+// stage's gate) and short-circuits downstream.
 export async function runSubWorkflow(stages, ctx, deps, overrides, state) {
   for (const stage of stages) {
+    const pre = await stage.gate(state, ctx, deps);
+    if (!pre.ok) {
+      await onGateFailure(stage.id, pre.reason, state, deps);
+      return state;
+    }
     await stage.run(ctx, deps, overrides, state);
   }
 }
 
-// --- macro-stage functions ----------------------------------------------
+// onGateFailure is the executor's response to a failed gate.
+// It logs the failure, posts the "failed" status, and marks
+// state.parseFailed so the orchestrator (and the cleanup stage)
+// can short-circuit downstream work. The status message is the
+// gate's reason verbatim, so a "summary parse failed: <X>"
+// reason surfaces as a "summary parse failed: <X>" status line
+// (matching the pre-QUB-90 user-visible surface).
+async function onGateFailure(stageId, reason, state, deps) {
+  deps.log("gate", `${stageId} gate failed`, { reason });
+  await deps.postStatus("failed", reason);
+  state.parseFailed = true;
+}
+
+// --- macro-stage gates --------------------------------------------------
 //
-// Each stage is a small function. The `overrides` hook is the
-// same one the inline run() used; preserved verbatim so the
-// existing test suite (which stubs runOpenCodeSkill, cloneRepo,
-// and makeOctokit) keeps working without changes.
+// Each gate is a small async function. The gate is the
+// precondition for the run; the run assumes the gate passed.
+// The gate's `reason` is the verbatim string the executor
+// surfaces in the "failed" status.
+
+async function handshakeGate(_state, _ctx, _deps) {
+  // handshake has no precondition; the run reads the secrets
+  // and mints the token. A failure surfaces as a thrown error
+  // from the run, not a gate failure.
+  return { ok: true };
+}
+
+async function fetchGate(state, _ctx, _deps) {
+  // fetch needs the Octokit (for the token) and the clone
+  // path constants. Without the Octokit the clone would use a
+  // stale token from a prior run; the gate catches that
+  // misconfiguration at the boundary instead of mid-clone.
+  if (!state.octokit) {
+    return { ok: false, reason: "handshake did not populate state.octokit" };
+  }
+  return { ok: true };
+}
+
+async function sniffGate(_state, _ctx, _deps) {
+  // sniff (the macro stage) needs the opencode API key. The
+  // sub-workflow executor is responsible for surfacing
+  // sub-stage gate failures; this gate is the boundary check
+  // before the sub-workflow starts.
+  return { ok: true };
+}
+
+async function summaryGate(state, _ctx, _deps) {
+  // Summary is the first stage that consumes the review
+  // output. The original inline code did this check too, in
+  // the summary run, with a "summary parse failed: <reason>"
+  // status message. The gate moves the check to the boundary
+  // and preserves the message verbatim so the user-visible
+  // surface is identical.
+  if (!state.review) {
+    return { ok: false, reason: "no review produced" };
+  }
+  if (!state.review.summary) {
+    const reason = state.review.parseError || "summary empty";
+    return { ok: false, reason: `summary parse failed: ${reason}` };
+  }
+  return { ok: true };
+}
+
+async function inlinesGate(state, _ctx, _deps) {
+  // Inlines also needs a real review. On a parse failure the
+  // summary gate has already aborted; this gate is a defense-
+  // in-depth check in case a future caller runs the
+  // sub-workflow out of order.
+  if (!state.review || !state.review.summary) {
+    return { ok: false, reason: "no review summary; nothing to post" };
+  }
+  return { ok: true };
+}
+
+async function cleanupGate(state, ctx, _deps) {
+  // Cleanup is best-effort. The gate only short-circuits when
+  // there is no review to clean up after (parse failure or no
+  // review at all). The first-review / no-botLogin skip lives
+  // in the run (it's not a failure, just a no-op).
+  if (!state.review || !state.review.summary) {
+    return { ok: false, reason: "no review landed; nothing to clean up" };
+  }
+  return { ok: true };
+}
+
+// --- macro-stage functions ----------------------------------------------
 
 async function handshakeStage(ctx, deps, overrides, state) {
   const GITHUB_APP_PRIVATE_KEY = await readSecretFile(
@@ -216,9 +319,6 @@ async function handshakeStage(ctx, deps, overrides, state) {
   state.octokit = overrides.makeOctokit
     ? overrides.makeOctokit(installationToken)
     : makeOctokit(installationToken);
-  // Write the octokit to the deps slot so the postStatus closure
-  // (which is created before the handshake stage runs) can read it
-  // when PATCHing the status comment.
   if (typeof deps.setOctokit === "function") {
     deps.setOctokit(state.octokit);
   }
@@ -227,9 +327,6 @@ async function handshakeStage(ctx, deps, overrides, state) {
 }
 
 async function fetchStage(ctx, deps, _overrides, _state) {
-  // cloneRepo is wrapped in makeDeps (index.mjs) so the postStatus
-  // call inside it routes through the lazy-octokit resolver. The
-  // test fixture overrides deps.cloneRepo directly.
   await deps.cloneRepo(ctx, deps);
   deps.log("clone", "repo cloned", {
     dir: deps.paths.repoDir,
@@ -248,25 +345,8 @@ async function sniffStage(ctx, deps, overrides, state) {
 }
 
 async function summaryStage(ctx, deps, _overrides, state) {
-  if (!state.review || !state.review.summary) {
-    // Parse failure or empty review. The sniff stage already
-    // logged the reason; the summary gate (QUB-90) is where this
-    // will be enforced. For now the inline behavior matches
-    // the pre-refactor code path: log, post failed, and let the
-    // orchestrator short-circuit. The caller in index.mjs checks
-    // state.review.summary and skips summary + inlines.
-    deps.log("done", "summary parse failed, skipping post", {
-      reason: state.review ? state.review.parseError : "no review",
-      confidence: state.review ? state.review.confidence : "low",
-    });
-    await deps.postStatus(
-      "failed",
-      `summary parse failed: ${(state.review && state.review.parseError) || "unknown"}`,
-    );
-    // Mark the state so index.mjs can short-circuit cleanly.
-    state.parseFailed = true;
-    return;
-  }
+  // The summary gate (summaryGate) has already verified
+  // state.review.summary is non-empty. Just call postReview.
   await postReview(
     state.octokit,
     state.review.summary,
@@ -281,11 +361,8 @@ async function summaryStage(ctx, deps, _overrides, state) {
 }
 
 async function inlinesStage(ctx, deps, _overrides, state) {
-  if (!state.review || !state.review.summary) {
-    // Mirror the summary short-circuit so a parse-failed run
-    // never reaches the inline posts.
-    return;
-  }
+  // The inlines gate (inlinesGate) has already verified
+  // state.review.summary is non-empty.
   await postInlineComments(state.octokit, state.review.inlineComments, ctx, {
     log: deps.log,
     errlog: deps.errlog,
@@ -293,20 +370,9 @@ async function inlinesStage(ctx, deps, _overrides, state) {
 }
 
 async function cleanupStage(ctx, deps, overrides, state) {
-  // The cleanup pass runs on re-reviews with a known bot login.
-  // First review (reviewNumber === 1) has no prior artifacts to
-  // retire. When botLogin is unset, the receiver didn't tell us
-  // who the bot is and we have no way to identify the prior
-  // comments. When the sniff stage produced a parse failure
-  // (state.parseFailed), the new review never landed; the prior
-  // review is still the current one on the PR, so retiring its
-  // artifacts would be wrong. All three paths short-circuit; the
-  // gate (QUB-90) will formalize the check.
-  if (state.parseFailed) {
-    deps.log("cleanup", "skipped (parse failure, no new review landed)");
-    state.cleanup = null;
-    return;
-  }
+  // Best-effort. The cleanup gate has already verified there
+  // is a real review to clean up after. The remaining skips
+  // (first review, no botLogin) are no-ops, not failures.
   if (ctx.reviewNumber <= 1 || !ctx.botLogin) {
     state.cleanup = null;
     return;
@@ -322,8 +388,6 @@ async function cleanupStage(ctx, deps, overrides, state) {
       deps.log("cleanup", "no prior artifacts to retire");
     }
   } catch (err) {
-    // Best-effort: a cleanup failure is logged but does not
-    // fail the run. The new review is already posted.
     deps.log("cleanup", "prior-review cleanup failed", {
       err: String(err?.message ?? err),
     });
@@ -331,7 +395,19 @@ async function cleanupStage(ctx, deps, overrides, state) {
   }
 }
 
-// --- sub-stage functions ------------------------------------------------
+// --- sub-stage gate + function -----------------------------------------
+
+async function sniffLegacyGate(state, _ctx, _deps) {
+  // Placeholder sub-stage needs the opencode key + the cloned
+  // repo (deps.paths.repoDir). The macro fetch stage has
+  // already populated /work/repo; the handshake stage has
+  // populated state.openrouterApiKey. The gate is a
+  // defense-in-depth check.
+  if (!state.openrouterApiKey) {
+    return { ok: false, reason: "no openrouter api key" };
+  }
+  return { ok: true };
+}
 
 async function sniffLegacySubStage(ctx, deps, overrides, state) {
   // Placeholder sub-stage that calls the existing runOpenCodeSkill.

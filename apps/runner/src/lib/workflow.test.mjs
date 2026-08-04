@@ -350,6 +350,10 @@ test("runSubWorkflow walks every sub-stage in order", async () => {
   // The sub-workflow executor is the primitive that the macro
   // sniff stage uses. Today it walks a single placeholder; the
   // shape is in place so QUB-95 can push more entries.
+  // The sub-stage gate (sniffLegacyGate) requires
+  // state.openrouterApiKey; the macro handshake stage
+  // populates it, so we set it here for the direct
+  // runSubWorkflow call.
   const sequence = [];
   const deps = recordingDeps();
   const overrides = {
@@ -358,7 +362,9 @@ test("runSubWorkflow walks every sub-stage in order", async () => {
       return fakeReview();
     },
   };
-  await runSubWorkflow(REVIEW_SUB_STAGES, fakeCtx, deps, overrides, {});
+  await runSubWorkflow(REVIEW_SUB_STAGES, fakeCtx, deps, overrides, {
+    openrouterApiKey: "fake",
+  });
   assert.deepEqual(sequence, ["runOpenCodeSkill"]);
 });
 
@@ -368,10 +374,188 @@ test("runSubWorkflow supports a custom sub-stage list (test seam)", async () => 
   // the module-level REVIEW_SUB_STAGES export.
   const calls = [];
   const stages = [
-    { id: "a", run: async () => { calls.push("a"); } },
-    { id: "b", run: async () => { calls.push("b"); } },
-    { id: "c", run: async () => { calls.push("c"); } },
+    { id: "a", gate: async () => ({ ok: true }), run: async () => { calls.push("a"); } },
+    { id: "b", gate: async () => ({ ok: true }), run: async () => { calls.push("b"); } },
+    { id: "c", gate: async () => ({ ok: true }), run: async () => { calls.push("c"); } },
   ];
   await runSubWorkflow(stages, fakeCtx, recordingDeps(), {}, {});
   assert.deepEqual(calls, ["a", "b", "c"]);
+});
+
+// --- gate contract (QUB-90) --------------------------------------------
+
+test("every macro stage has a gate function (QUB-90)", () => {
+  // Pinned by QUB-90. A stage without a gate would silently
+  // skip the precondition check; the run would be invoked
+  // with invalid state and crash downstream.
+  for (const stage of STAGES) {
+    assert.equal(typeof stage.gate, "function", `${stage.id}: gate must be a function`);
+  }
+});
+
+test("every sub-stage has a gate function (QUB-90)", () => {
+  for (const stage of REVIEW_SUB_STAGES) {
+    assert.equal(typeof stage.gate, "function", `${stage.id}: gate must be a function`);
+  }
+});
+
+test("a failed gate sets state.parseFailed and short-circuits the run (QUB-90)", async () => {
+  // The summary gate returns {ok: false, reason: "summary
+  // parse failed: <X>"} when the review has no summary. The
+  // executor must NOT throw (a parse failure is "expected" —
+  // the LLM might not produce a structured block); it sets
+  // state.parseFailed and returns. The orchestrator in
+  // index.mjs checks state.parseFailed and short-circuits
+  // the lifecycle. The status thread sees the gate's reason
+  // verbatim as the "failed" status line.
+  const sequence = [];
+  const deps = recordingDeps({
+    postStatus: async (stage, detail) =>
+      sequence.push(`postStatus(${stage}${detail ? `: ${detail}` : ""})`),
+    setOctokit: () => sequence.push("setOctokit"),
+    cloneRepo: async (_ctx, d) => {
+      sequence.push("cloneRepo");
+      await d.postStatus("clone");
+    },
+  });
+  const overrides = {
+    makeOctokit: () => fakeOctokit(),
+    runOpenCodeSkill: async (_apiKey, _ctx, d) => {
+      sequence.push("runOpenCodeSkill");
+      await d.postStatus("review");
+      return {
+        summary: "",
+        inlineComments: [],
+        confidence: "low",
+        parseError: "no structured block",
+      };
+    },
+  };
+  const state = {};
+  // runStages returns normally (no throw) on a gate failure.
+  const result = await runStages(fakeCtx, deps, overrides, state);
+  assert.equal(result, state);
+  assert.equal(state.parseFailed, true);
+  // The summary stage was never reached (the gate caught the
+  // empty review before the run). The inlines + cleanup
+  // stages were also skipped.
+  assert.deepEqual(sequence, [
+    "setOctokit",
+    "postStatus(auth)",
+    "cloneRepo",
+    "postStatus(clone)",
+    "runOpenCodeSkill",
+    "postStatus(review)",
+    'postStatus(failed: summary parse failed: no structured block)',
+  ]);
+});
+
+test("a passing gate proceeds to the run (QUB-90)", async () => {
+  // Sanity check: a stage whose gate returns {ok: true}
+  // runs normally. The summary stage's gate on a valid
+  // review lets the run call postReview, which calls
+  // createComment on the Octokit.
+  const sequence = [];
+  const calls = { createComment: [], createReviewComment: [] };
+  const octokit = {
+    calls,
+    rest: {
+      issues: {
+        createComment: async (args) => {
+          calls.createComment.push(args);
+          sequence.push("createComment");
+          return { data: { id: 1, body: args.body } };
+        },
+      },
+      pulls: {
+        createReviewComment: async (args) => {
+          calls.createReviewComment.push(args);
+          sequence.push("createReviewComment");
+          return { data: { id: 1 } };
+        },
+      },
+    },
+  };
+  const deps = recordingDeps({
+    postStatus: async (stage) => sequence.push(`postStatus(${stage})`),
+    setOctokit: () => sequence.push("setOctokit"),
+    cloneRepo: async (_ctx, d) => {
+      sequence.push("cloneRepo");
+      await d.postStatus("clone");
+    },
+  });
+  const overrides = {
+    makeOctokit: (token) => {
+      sequence.push(`makeOctokit(${token})`);
+      return octokit;
+    },
+    runOpenCodeSkill: async (_apiKey, _ctx, d) => {
+      sequence.push("runOpenCodeSkill");
+      await d.postStatus("review");
+      return fakeReview();
+    },
+  };
+  const state = {};
+  const result = await runStages(fakeCtx, deps, overrides, state);
+  assert.equal(result, state);
+  assert.equal(state.parseFailed, undefined);
+  // The summary gate passed; postReview was called; the
+  // inlines gate passed; postInlineComments was called.
+  assert.ok(sequence.includes("createComment"));
+  assert.ok(sequence.includes("createReviewComment"));
+  // No "failed" status was posted.
+  assert.ok(!sequence.some((s) => s.startsWith("postStatus(failed")));
+});
+
+test("a sub-stage gate failure surfaces as state.parseFailed (QUB-90)", async () => {
+  // The sub-workflow executor returns on a sub-stage gate
+  // failure (same shape as the macro executor). The state
+  // gets parseFailed = true; the macro `sniff` stage's run
+  // returns; the next macro stage's gate (in this test
+  // nothing follows because the sub-stage was the only
+  // sub-stage) sees parseFailed implicitly via the next
+  // gate's check.
+  //
+  // Direct test: call runSubWorkflow on REVIEW_SUB_STAGES
+  // with an empty state. The sub-stage gate fails on the
+  // missing openrouterApiKey; the executor sets
+  // state.parseFailed and returns.
+  const deps = recordingDeps();
+  const state = {};
+  const result = await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {},
+    state,
+  );
+  assert.equal(result, state);
+  assert.equal(state.parseFailed, true);
+  // The sub-stage gate's reason is the "failed" status.
+  const last = deps.calls.postStatus[deps.calls.postStatus.length - 1];
+  assert.equal(last.stage, "failed");
+  assert.equal(last.detail, "no openrouter api key");
+});
+
+test("gate failure is soft: a thrown run still propagates (QUB-90 boundary)", async () => {
+  // Gate failures are "soft" — the executor returns and sets
+  // state.parseFailed. Run-time errors (a thrown stage) are
+  // "hard" — they propagate out of the executor. The
+  // distinction is what QUB-91 (retry) builds on: a hard
+  // throw can be caught and retried; a soft gate failure
+  // is the executor's final answer for that stage.
+  const sequence = [];
+  const deps = recordingDeps({
+    postStatus: async (stage) => sequence.push(`postStatus(${stage})`),
+    setOctokit: () => sequence.push("setOctokit"),
+    cloneRepo: async () => { throw new Error("cloneRepo blew up"); },
+  });
+  await assert.rejects(
+    () => runStages(fakeCtx, deps, {}, {}),
+    /cloneRepo blew up/,
+    "a run-time error from a stage must propagate out of the executor",
+  );
+  // The auth + clone statuses were attempted; the run-time
+  // error happened before the clone status PATCH.
+  assert.ok(sequence.includes("postStatus(auth)"));
 });
