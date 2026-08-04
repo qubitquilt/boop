@@ -4,6 +4,8 @@
 //   - mintInstallationToken: exchange an App JWT for an installation token
 //   - postStatus / postReview / postInlineComment: the public comments
 //   - cleanupPriorReview: resolve outdated threads + minimize prior bot comments
+//   - readWorkflowState / writeWorkflowState: the resume handoff
+//     (QUB-92) — the state lives in the status comment
 //   - graphql + paginated fetches used by cleanup
 //
 // Each function takes the loaded `ctx` and a `deps` bundle (fetch,
@@ -14,6 +16,13 @@ import { Octokit } from "@octokit/rest";
 import { SHORT, STATUS } from "./config.mjs";
 import { shortSha } from "./security.mjs";
 import { reviewHeader } from "../review-header.mjs";
+
+// Re-export STATUS and SHORT so the test suite (workflow.test.mjs)
+// can pin the user-visible surface (QUB-93) without reaching
+// into config.mjs. The runner is the canonical consumer of
+// these maps; the receiver mirrors them in
+// apps/receiver/internal/webhook/handler.go.
+export { STATUS, SHORT };
 
 // mintInstallationToken exchanges an App JWT for an installation
 // token (1h TTL). Used by both status updates and the cleanup

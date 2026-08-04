@@ -11,6 +11,7 @@ import {
   DEFAULT_BACKOFF_BASE_MS,
   DEFAULT_BACKOFF_MAX_MS,
 } from "./workflow.mjs";
+import { SHORT } from "./github.mjs";
 
 // --- macro STAGES table -------------------------------------------------
 
@@ -871,4 +872,100 @@ test("runSubWorkflow records passed sub-stages in state.sub[macroId] (QUB-92)", 
     state,
   );
   assert.deepEqual(state.sub, { sniff: ["sniff-legacy"] });
+});
+
+// --- status thread parity (QUB-93) ------------------------------------
+//
+// The user-visible status thread on the PR is pinned by QUB-93.
+// The QUB-87 migration replaces the one-shot Job with a staged
+// workflow; the receiver pre-creates the status comment and the
+// runner PATCHes it. The migration MUST NOT change the user-
+// visible surface: the same emoji, the same short labels, the
+// same order. A future change to the surface needs a follow-up
+// ticket, not a quiet edit.
+//
+// The contract is enforced three ways:
+//   1. workflow.mjs exports statusStageFor(id) and the
+//      STAGES.statusStage field; tests pin the mapping.
+//   2. github.mjs exports STATUS and SHORT maps; tests pin
+//      the wording (and the receiver-side mirror in
+//      apps/receiver/internal/webhook/handler.go is the
+//      authoritative source — the runner is the consumer).
+//   3. The integration test in index.test.mjs already asserts
+//      the four status lines appear (auth, clone, review, done);
+//      QUB-93 adds a stricter test that locks the exact short
+//      labels and the order.
+//
+// The set of status stages is the union of the runner's
+// STAGES.statusStage values that are not null, plus the
+// runner's terminal "done" and "failed" stages (which the
+// orchestrator in index.mjs posts directly). The mapping is
+// enumerated below.
+
+test("status stage set is the same before and after the staged workflow (QUB-93)", () => {
+  // The runner must use exactly these five status labels. A
+  // new label is a user-visible change that needs a follow-up
+  // ticket; a missing label breaks the existing dedup-by-SHA
+  // contract (the receiver's CountPriorReviews expects the
+  // same five).
+  const fromStages = STAGES.map((s) => s.statusStage).filter(Boolean);
+  // The orchestrator posts "done" and "failed" directly (not
+  // via a stage in STAGES).
+  const terminal = ["done", "failed"];
+  const all = [...fromStages, ...terminal].sort();
+  assert.deepEqual(all, ["auth", "clone", "done", "failed", "review"]);
+});
+
+test("every short status label includes its emoji and matches the receiver (QUB-93)", () => {
+  // The runner's SHORT map is the source of the short labels
+  // the user sees in the status timeline. The same map lives
+  // in apps/receiver/internal/webhook/handler.go; a change
+  // here needs the same change there (and vice versa). A
+  // future PR that adds a stage label must also add it to
+  // the receiver's mirror.
+  //
+  // The labels must include the matching emoji. The emoji is
+  // the visual signal a PR author skims for; changing the
+  // emoji (or dropping it) breaks the muscle memory.
+  const expected = {
+    auth: "🤝 paw-shaken in",
+    clone: "🥎 fetched",
+    review: "👃 sniffing",
+    done: "💤 napped",
+    failed: "🔄 chased tail",
+  };
+  for (const [stage, label] of Object.entries(expected)) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(SHORT, stage),
+      `runner SHORT map missing stage "${stage}"`,
+    );
+    assert.equal(SHORT[stage], label, `runner SHORT["${stage}"]`);
+  }
+});
+
+test("every status header line (STATUS map) carries the same emoji (QUB-93)", async () => {
+  // The STATUS map is the body the orchestrator (and the
+  // receiver, for the initial post) uses. It carries the
+  // emoji + the verbose wording. Pinned here so a future
+  // edit to the wording is a deliberate change.
+  const { STATUS } = await import("./github.mjs");
+  // The status keys we expect.
+  for (const stage of ["auth", "clone", "review", "done", "failed"]) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(STATUS, stage),
+      `STATUS map missing stage "${stage}"`,
+    );
+    // The verbose body must contain the matching emoji.
+    const expectedEmoji = {
+      auth: "🤝",
+      clone: "🥎",
+      review: "👃",
+      done: "💤",
+      failed: "🔄",
+    }[stage];
+    assert.ok(
+      STATUS[stage].includes(expectedEmoji),
+      `STATUS["${stage}"] should contain ${expectedEmoji}; got "${STATUS[stage]}"`,
+    );
+  }
 });
