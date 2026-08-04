@@ -48,7 +48,14 @@
 
 import { setTimeout as defaultSleep } from "node:timers/promises";
 import { defaultClassify } from "./classify.mjs";
-import { defaultNarrate, gather, pickExperts, runExperts } from "./experts.mjs";
+import {
+  defaultMetaReview,
+  defaultNarrate,
+  gather,
+  mergeByExpert,
+  pickExperts,
+  runExperts,
+} from "./experts.mjs";
 import { cloneRepo } from "./git.mjs";
 import {
   cleanupPriorReview as defaultCleanupPriorReview,
@@ -145,10 +152,14 @@ export const STAGES = [
 ];
 
 // REVIEW_SUB_STAGES is the list of sub-stages inside the `sniff`
-// macro-stage. QUB-95 replaces the sniff-legacy placeholder
-// with the multi-expert sub-workflow: classify (QUB-94) ->
-// dispatch -> gather -> narrate. QUB-96 will add meta-review
-// between gather and narrate.
+// macro-stage. QUB-95 replaced the sniff-legacy placeholder
+// with classify -> dispatch -> gather -> narrate. QUB-96
+// inserts a meta-review sub-stage between gather and
+// narrate: the meta-reviewer scans the gathered findings
+// for things that "stick out as potentially wrong" and
+// requests a bounded re-pass of the specific experts that
+// produced those findings. Bounded to one re-pass per run
+// (the meta-reviewer cannot re-loop).
 //
 // Sub-stages are silent on the status thread (statusStage: null).
 // The "review" status line is posted once at the start of the
@@ -183,7 +194,7 @@ export const REVIEW_SUB_STAGES = [
     id: "gather",
     statusStage: null,
     description:
-      "De-duplicate and flatten the expert findings into a single list the narrator can consume.",
+      "De-duplicate and flatten the expert findings into a single list the meta-reviewer + narrator can consume.",
     input: "state.findings",
     output: "state.findings (de-duped in place)",
     idempotent: true,
@@ -192,10 +203,22 @@ export const REVIEW_SUB_STAGES = [
     run: gatherSubStage,
   },
   {
+    id: "meta-review",
+    statusStage: null,
+    description:
+      "Scan the gathered findings for things that 'stick out as potentially wrong' (false positives, contradictions, missing context). If anything sticks out, request a bounded re-pass of the specific experts that produced those findings. Bounded to one re-pass per run.",
+    input: "state.findings, state.classification",
+    output: "state.findings (with re-passed expert findings replaced in place)",
+    idempotent: false,
+    retryable: true,
+    gate: metaReviewGate,
+    run: metaReviewSubStage,
+  },
+  {
     id: "narrate",
     statusStage: null,
     description:
-      "Produce the cohesive summary + inline-comment set from the gathered findings. The output shape is identical to the single-LLM-call path so the downstream summary + inlines stages are unaffected.",
+      "Produce the cohesive summary + inline-comment set from the (possibly re-reviewed) findings. The output shape is identical to the single-LLM-call path so the downstream summary + inlines stages are unaffected.",
     input: "state.findings, ctx, /work/repo",
     output: "state.review = { summary, inlineComments, confidence, telemetry }",
     idempotent: false,
@@ -616,6 +639,53 @@ async function gatherSubStage(_ctx, deps, overrides, state) {
   }
   deps.log("gather", "de-duplicated findings", {
     count: (state.findings || []).length,
+  });
+}
+
+async function metaReviewGate(_state, _ctx, _deps) {
+  // Meta-review runs after gather. The findings are
+  // required (the meta-reviewer reads them). An empty
+  // findings list is allowed — the meta-reviewer returns
+  // { reDispatch: [] } and the narrate stage proceeds with
+  // a placeholder review.
+  return { ok: true };
+}
+
+async function metaReviewSubStage(ctx, deps, overrides, state) {
+  // The meta-reviewer is overridable so a test can inject a
+  // deterministic re-dispatch decision. The default is the
+  // stub in lib/experts.mjs (no re-pass); a follow-up PR
+  // wires the real LLM call.
+  //
+  // Bounded to one re-pass per run: the meta-reviewer is
+  // called once and cannot re-loop. The merge replaces
+  // findings from the re-dispatched experts in place;
+  // other experts' findings are preserved.
+  const metaReviewFn = overrides.metaReview || defaultMetaReview;
+  const review = await metaReviewFn(
+    state.findings || [],
+    state.classification || { type: "unknown", confidence: "low" },
+    ctx,
+    deps,
+  );
+  const reDispatch = Array.isArray(review.reDispatch)
+    ? review.reDispatch
+    : [];
+  if (reDispatch.length === 0) {
+    deps.log("meta-review", "no re-pass requested", {
+      findings: (state.findings || []).length,
+    });
+    return;
+  }
+  deps.log("meta-review", "re-dispatching experts", { reDispatch });
+  const run = overrides.runExperts || runExperts;
+  const newFindings = await run(reDispatch, ctx, deps, {
+    classification: state.classification,
+  });
+  state.findings = mergeByExpert(state.findings || [], newFindings);
+  deps.log("meta-review", "re-pass merged", {
+    reDispatched: reDispatch,
+    total: state.findings.length,
   });
 }
 
