@@ -11,6 +11,7 @@ import {
   DEFAULT_BACKOFF_BASE_MS,
   DEFAULT_BACKOFF_MAX_MS,
 } from "./workflow.mjs";
+import { SHORT } from "./github.mjs";
 
 // --- macro STAGES table -------------------------------------------------
 
@@ -63,16 +64,19 @@ test("status stage labels match the user-visible surface (QUB-93)", () => {
 
 // --- sub-workflow --------------------------------------------------------
 
-test("REVIEW_SUB_STAGES is the review sub-workflow (initially a single placeholder)", () => {
-  // Pinned by QUB-89. The sub-workflow is structurally present
-  // so QUB-94 / QUB-95 / QUB-96 only need to push entries onto
-  // the list. Today there is exactly one sub-stage: sniff-legacy,
-  // which calls the existing runOpenCodeSkill. The QUB-95 PR
-  // expands the list to {classify, dispatch, gather, narrate} and
-  // QUB-96 adds meta-review.
+test("REVIEW_SUB_STAGES is the review sub-workflow (classify, dispatch, gather, meta-review, narrate)", () => {
+  // Pinned by QUB-96. The sub-workflow is structurally
+  // present. Today the list has the five sub-stages:
+  //   - classify (QUB-94): identify the PR type
+  //   - dispatch (QUB-95): pick + run experts in parallel
+  //   - gather (QUB-95): de-dupe the findings
+  //   - meta-review (QUB-96): bounded re-pass of stuck-out
+  //     expert findings
+  //   - narrate (QUB-95): produce the cohesive summary +
+  //     inline comments
   assert.deepEqual(
     REVIEW_SUB_STAGES.map((s) => s.id),
-    ["sniff-legacy"],
+    ["classify", "dispatch", "gather", "meta-review", "narrate"],
   );
 });
 
@@ -351,24 +355,71 @@ test("runStages passes the opencode overrides through to the sniff stage", async
 
 test("runSubWorkflow walks every sub-stage in order", async () => {
   // The sub-workflow executor is the primitive that the macro
-  // sniff stage uses. Today it walks a single placeholder; the
-  // shape is in place so QUB-95 can push more entries.
-  // The sub-stage gate (sniffLegacyGate) requires
-  // state.openrouterApiKey; the macro handshake stage
-  // populates it, so we set it here for the direct
-  // runSubWorkflow call.
+  // sniff stage uses. QUB-95 expanded the list to four
+  // sub-stages; QUB-96 inserted meta-review between
+  // gather and narrate.
+  //
+  // The sub-stage gates require state.openrouterApiKey; the
+  // macro handshake stage populates it, so we set it here for
+  // the direct runSubWorkflow call.
   const sequence = [];
   const deps = recordingDeps();
   const overrides = {
-    runOpenCodeSkill: async () => {
-      sequence.push("runOpenCodeSkill");
-      return fakeReview();
+    classify: async () => {
+      sequence.push("classify");
+      return { type: "feature", confidence: "high" };
+    },
+    pickExperts: (classification) => {
+      sequence.push("pickExperts");
+      return ["stub-expert"];
+    },
+    runExperts: async () => {
+      sequence.push("runExperts");
+      return [
+        {
+          id: "stub-1",
+          expert: "stub-expert",
+          severity: "info",
+          title: "T",
+          body: "b",
+          path: "src/foo.ts",
+          line: 1,
+        },
+      ];
+    },
+    gather: (findings) => {
+      sequence.push("gather");
+      return findings;
+    },
+    metaReview: async () => {
+      sequence.push("meta-review");
+      return { reDispatch: [] };
+    },
+    narrate: async (findings) => {
+      sequence.push("narrate");
+      return {
+        summary: "## TL;DR\nstub",
+        inlineComments: findings.map((f) => ({
+          path: f.path,
+          line: f.line,
+          body: f.body,
+        })),
+        confidence: "medium",
+        telemetry: null,
+      };
     },
   };
   await runSubWorkflow(REVIEW_SUB_STAGES, fakeCtx, deps, overrides, {
     openrouterApiKey: "fake",
   });
-  assert.deepEqual(sequence, ["runOpenCodeSkill"]);
+  assert.deepEqual(sequence, [
+    "classify",
+    "pickExperts",
+    "runExperts",
+    "gather",
+    "meta-review",
+    "narrate",
+  ]);
 });
 
 test("runSubWorkflow supports a custom sub-stage list (test seam)", async () => {
@@ -740,6 +791,253 @@ test("each stage declares retryable: true or false (QUB-91)", () => {
   assert.equal(byId.cleanup.retryable, true);
 });
 
+// --- classify sub-stage (QUB-94) ---------------------------------------
+
+test("classify sub-stage calls overrides.classify and writes state.classification (QUB-94)", async () => {
+  // The classify sub-stage uses the overrides.classify hook
+  // (same pattern as overrides.runOpenCodeSkill). The
+  // default falls back to the stub in lib/classify.mjs; a
+  // future PR wires the real LLM call.
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => ({ type: "bug-fix", confidence: "high" }),
+      narrate: async () => fakeReview(),
+    },
+    state,
+  );
+  assert.deepEqual(state.classification, { type: "bug-fix", confidence: "high" });
+});
+
+test("classify sub-stage falls back to the default stub when no override is provided (QUB-94)", async () => {
+  // The stub returns { type: "unknown", confidence: "low" }.
+  // The dispatch sub-stage (QUB-95) treats "unknown" as
+  // a default-expert-pool signal.
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    { narrate: async () => fakeReview() },
+    state,
+  );
+  assert.deepEqual(state.classification, { type: "unknown", confidence: "low" });
+});
+
+test("classify sub-stage runs first, before dispatch (QUB-94/95)", async () => {
+  // The classification drives the expert selection in
+  // dispatch. The order is pinned: classify first, then
+  // dispatch / gather / meta-review / narrate.
+  const sequence = [];
+  const deps = recordingDeps();
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => {
+        sequence.push("classify");
+        return { type: "feature", confidence: "high" };
+      },
+      pickExperts: () => {
+        sequence.push("dispatch");
+        return [];
+      },
+      gather: (f) => {
+        sequence.push("gather");
+        return f;
+      },
+      metaReview: async () => {
+        sequence.push("meta-review");
+        return { reDispatch: [] };
+      },
+      narrate: async () => {
+        sequence.push("narrate");
+        return fakeReview();
+      },
+    },
+    { openrouterApiKey: "fake" },
+  );
+  assert.deepEqual(sequence, [
+    "classify",
+    "dispatch",
+    "gather",
+    "meta-review",
+    "narrate",
+  ]);
+});
+
+// --- meta-review (QUB-96) -----------------------------------------------
+
+test("meta-review sub-stage with no re-dispatch leaves findings unchanged (QUB-96)", async () => {
+  // The default metaReview returns { reDispatch: [] }. The
+  // gathered findings pass through unchanged. The test
+  // overrides runExperts to return a single finding so the
+  // assertion is on a known input.
+  const original = [
+    { id: "a", expert: "x", severity: "info", title: "A", body: "a" },
+  ];
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    recordingDeps(),
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      runExperts: async () => original,
+      narrate: async () => fakeReview(),
+    },
+    state,
+  );
+  // Findings are preserved (the default metaReview does not
+  // request a re-pass).
+  assert.equal(state.findings.length, 1);
+  assert.equal(state.findings[0].id, "a");
+});
+
+test("meta-review sub-stage with a re-dispatch replaces the re-dispatched expert's findings (QUB-96)", async () => {
+  // The meta-reviewer requests a re-pass of one expert; the
+  // runner re-dispatches that expert, then merges the
+  // new findings with the old (replacing the old findings
+  // from the same expert, preserving findings from
+  // other experts).
+  const originalFindings = [
+    { id: "old-x-1", expert: "x", severity: "info", title: "OldX1", body: "old" },
+    { id: "old-x-2", expert: "x", severity: "info", title: "OldX2", body: "old" },
+    { id: "old-y-1", expert: "y", severity: "info", title: "OldY1", body: "y" },
+  ];
+  const rePassFindings = [
+    { id: "new-x-1", expert: "x", severity: "warning", title: "NewX1", body: "new" },
+  ];
+  let dispatchCalls = 0;
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  let runExpertsCalls = 0;
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    recordingDeps(),
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      runExperts: async (names) => {
+        dispatchCalls++;
+        // Initial dispatch returns the original findings.
+        // Re-pass returns the new x findings.
+        if (names.length === 1 && names[0] === "x") {
+          runExpertsCalls++;
+          return rePassFindings;
+        }
+        return originalFindings;
+      },
+      metaReview: async () => ({ reDispatch: ["x"] }),
+      narrate: async () => fakeReview(),
+    },
+    state,
+  );
+  assert.equal(dispatchCalls, 2, "runExperts called twice (initial + re-pass)");
+  assert.equal(runExpertsCalls, 1, "re-pass was for 'x' once");
+  // x's old findings are gone, x's new finding is in,
+  // y's finding is preserved.
+  assert.equal(state.findings.length, 2);
+  const ids = state.findings.map((f) => f.id).sort();
+  assert.deepEqual(ids, ["new-x-1", "old-y-1"]);
+  // The x findings are the new ones.
+  const xFindings = state.findings.filter((f) => f.expert === "x");
+  assert.equal(xFindings.length, 1);
+  assert.equal(xFindings[0].id, "new-x-1");
+  assert.equal(xFindings[0].severity, "warning");
+});
+
+test("meta-review sub-stage is bounded: it does not re-loop (QUB-96)", async () => {
+  // Even if a meta-review override requests a re-dispatch and
+  // the re-dispatch would request another re-dispatch, the
+  // sub-stage is called exactly once. The bound is "one
+  // re-pass per run"; future meta-reviewer outputs that
+  // would loop are ignored.
+  let metaReviewCalls = 0;
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+    findings: [],
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    recordingDeps(),
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      metaReview: async () => {
+        metaReviewCalls++;
+        return { reDispatch: ["x"] };
+      },
+      runExperts: async () => [],
+      narrate: async () => fakeReview(),
+    },
+    state,
+  );
+  assert.equal(metaReviewCalls, 1, "meta-review called exactly once");
+});
+
+test("meta-review's reDispatch names must be in EXPERT_POOL or runExperts throws (QUB-96)", async () => {
+  // The meta-reviewer's re-dispatch list must contain
+  // expert names that the runner can resolve. An unknown
+  // name throws (caught by the gate + retry machinery).
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+    findings: [],
+  };
+  await assert.rejects(
+    () =>
+      runSubWorkflow(
+        REVIEW_SUB_STAGES,
+        fakeCtx,
+        recordingDeps(),
+        {
+          classify: async () => ({ type: "feature", confidence: "high" }),
+          metaReview: async () => ({ reDispatch: ["nonexistent-expert"] }),
+          runExperts: async (names) => {
+            // Use the real runExperts to exercise the
+            // "unknown expert" error path.
+            const realExperts = await import("./experts.mjs");
+            return realExperts.runExperts(names, {}, {});
+          },
+          narrate: async () => fakeReview(),
+        },
+        state,
+      ),
+    /unknown expert/,
+  );
+});
+
 // --- resume (QUB-92) ---------------------------------------------------
 
 test("runStages skips macro stages listed in state.passed (QUB-92)", async () => {
@@ -856,19 +1154,124 @@ test("runSubWorkflow records passed sub-stages in state.sub[macroId] (QUB-92)", 
   // Each sub-stage that passes is appended to state.sub[macroId].
   // The orchestrator's onStagePassed callback (at the macro
   // level) reads state.sub and writes it to the comment.
+  //
+  // QUB-96: the sub-workflow now has five sub-stages
+  // (classify, dispatch, gather, meta-review, narrate). All
+  // five are recorded in state.sub.sniff.
   const deps = recordingDeps();
   const state = {
     passed: [],
     sub: {},
     _subWorkflowOf: "sniff",
-    openrouterApiKey: "fake", // seed for the sniff-legacy gate
+    openrouterApiKey: "fake",
   };
   await runSubWorkflow(
     REVIEW_SUB_STAGES,
     fakeCtx,
     deps,
-    { runOpenCodeSkill: async () => fakeReview() },
+    {
+      classify: async () => ({ type: "unknown", confidence: "low" }),
+      narrate: async () => fakeReview(),
+    },
     state,
   );
-  assert.deepEqual(state.sub, { sniff: ["sniff-legacy"] });
+  assert.deepEqual(state.sub, {
+    sniff: ["classify", "dispatch", "gather", "meta-review", "narrate"],
+  });
+});
+
+// --- status thread parity (QUB-93) ------------------------------------
+//
+// The user-visible status thread on the PR is pinned by QUB-93.
+// The QUB-87 migration replaces the one-shot Job with a staged
+// workflow; the receiver pre-creates the status comment and the
+// runner PATCHes it. The migration MUST NOT change the user-
+// visible surface: the same emoji, the same short labels, the
+// same order. A future change to the surface needs a follow-up
+// ticket, not a quiet edit.
+//
+// The contract is enforced three ways:
+//   1. workflow.mjs exports statusStageFor(id) and the
+//      STAGES.statusStage field; tests pin the mapping.
+//   2. github.mjs exports STATUS and SHORT maps; tests pin
+//      the wording (and the receiver-side mirror in
+//      apps/receiver/internal/webhook/handler.go is the
+//      authoritative source — the runner is the consumer).
+//   3. The integration test in index.test.mjs already asserts
+//      the four status lines appear (auth, clone, review, done);
+//      QUB-93 adds a stricter test that locks the exact short
+//      labels and the order.
+//
+// The set of status stages is the union of the runner's
+// STAGES.statusStage values that are not null, plus the
+// runner's terminal "done" and "failed" stages (which the
+// orchestrator in index.mjs posts directly). The mapping is
+// enumerated below.
+
+test("status stage set is the same before and after the staged workflow (QUB-93)", () => {
+  // The runner must use exactly these five status labels. A
+  // new label is a user-visible change that needs a follow-up
+  // ticket; a missing label breaks the existing dedup-by-SHA
+  // contract (the receiver's CountPriorReviews expects the
+  // same five).
+  const fromStages = STAGES.map((s) => s.statusStage).filter(Boolean);
+  // The orchestrator posts "done" and "failed" directly (not
+  // via a stage in STAGES).
+  const terminal = ["done", "failed"];
+  const all = [...fromStages, ...terminal].sort();
+  assert.deepEqual(all, ["auth", "clone", "done", "failed", "review"]);
+});
+
+test("every short status label includes its emoji and matches the receiver (QUB-93)", () => {
+  // The runner's SHORT map is the source of the short labels
+  // the user sees in the status timeline. The same map lives
+  // in apps/receiver/internal/webhook/handler.go; a change
+  // here needs the same change there (and vice versa). A
+  // future PR that adds a stage label must also add it to
+  // the receiver's mirror.
+  //
+  // The labels must include the matching emoji. The emoji is
+  // the visual signal a PR author skims for; changing the
+  // emoji (or dropping it) breaks the muscle memory.
+  const expected = {
+    auth: "🤝 paw-shaken in",
+    clone: "🥎 fetched",
+    review: "👃 sniffing",
+    done: "💤 napped",
+    failed: "🔄 chased tail",
+  };
+  for (const [stage, label] of Object.entries(expected)) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(SHORT, stage),
+      `runner SHORT map missing stage "${stage}"`,
+    );
+    assert.equal(SHORT[stage], label, `runner SHORT["${stage}"]`);
+  }
+});
+
+test("every status header line (STATUS map) carries the same emoji (QUB-93)", async () => {
+  // The STATUS map is the body the orchestrator (and the
+  // receiver, for the initial post) uses. It carries the
+  // emoji + the verbose wording. Pinned here so a future
+  // edit to the wording is a deliberate change.
+  const { STATUS } = await import("./github.mjs");
+  // The status keys we expect.
+  for (const stage of ["auth", "clone", "review", "done", "failed"]) {
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(STATUS, stage),
+      `STATUS map missing stage "${stage}"`,
+    );
+    // The verbose body must contain the matching emoji.
+    const expectedEmoji = {
+      auth: "🤝",
+      clone: "🥎",
+      review: "👃",
+      done: "💤",
+      failed: "🔄",
+    }[stage];
+    assert.ok(
+      STATUS[stage].includes(expectedEmoji),
+      `STATUS["${stage}"] should contain ${expectedEmoji}; got "${STATUS[stage]}"`,
+    );
+  }
 });
