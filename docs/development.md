@@ -182,6 +182,100 @@ This pushes `stable`, `v0.2.0`, `0.2`, `0`. The default overlay pins
 `latest` (main HEAD); override to a specific tag for reproducible
 rollouts.
 
+## OpenRouter SDK rollout (QUB-94)
+
+The runner ships two code paths for the LLM call:
+
+1. **opencode subprocess** (legacy): the runner shells out to the
+   `opencode` CLI wrapped in `script(1)` for a PTY. Telemetry
+   surfaces only as raw TUI output, then a JSON-mode parser rolls
+   it up.
+2. **OpenRouter SDK** (new): the runner calls
+   [`@openrouter/sdk`](https://github.com/openrouterteam/typescript-sdk)
+   in-process. No subprocess, no PTY wrap, no opencode.json
+   template. Telemetry comes straight from the SDK response.
+
+The flag `BOOP_USE_OPENROUTER_SDK` on the **receiver** controls
+which path new review Jobs take. Default is `0` (opencode
+subprocess) until the cutover PR lands and a week of clean runs
+passes.
+
+### Cluster-wide default
+
+Set on the receiver Deployment as an env var:
+
+```yaml
+env:
+  - name: BOOP_USE_OPENROUTER_SDK
+    value: "1"   # 1 = SDK path, 0 = opencode subprocess
+```
+
+A flag flip is the rollback — the opencode code path stays
+unchanged and a flip back to `0` restores it without a redeploy
+of the runner image.
+
+### Per-PR override
+
+Add the label `boop:openrouter-sdk` to a PR to opt it into the
+SDK path even when the cluster default is `0`. The label is a
+no-op once the cluster default is `1`. The override applies to
+the next review only — push a new commit and the flag re-resolves.
+
+The label is honored on the `pull_request` webhook path. The
+`issue_comment` (`@BoopPr review`) path uses the cluster
+default; per-PR overrides from comments land in a follow-up.
+
+### Smoke testing a single PR
+
+1. Add the `boop:openrouter-sdk` label to a test PR.
+2. Push a commit.
+3. Within a few seconds, a 🐾 status comment appears. Within
+   1-3 minutes, a `## 🐾 Boop's review` summary appears.
+4. Verify the runner logs include `path: "openrouter-sdk"` in
+   the `opencode/starting` log line. The `opencode/exit` line
+   carries `mode: "openrouter-sdk"` and the telemetry block
+   (`tokens_in`, `tokens_out`, `cost_usd`, `step_count`).
+
+### Cutover procedure
+
+1. After a week of clean runs on the SDK path, flip
+   `BOOP_USE_OPENROUTER_SDK=1` on the receiver. The label
+   becomes redundant.
+2. Open the QUB-98 PR. It removes the `opencode-ai` npm dep,
+   the `opencode.json` ConfigMap, the `opencode` binary in the
+   runner image, and the PTY wrap code. The SDK path becomes
+   the only path.
+
+### Rollback
+
+Rollback is **cluster-flip-only** today. Set
+`BOOP_USE_OPENROUTER_SDK=0` on the receiver Deployment and
+restart it; the next review Job takes the opencode subprocess.
+No runner image rebuild, no per-PR action.
+
+There is no per-PR opt-out label. The `boop:openrouter-sdk`
+label is an opt-in only: with the cluster default at `0`, a
+labeled PR uses the SDK path; with the default at `1`, every
+PR uses it. If you need a per-PR opt-out (e.g. a single flaky
+PR on the SDK path while the cluster default is `1`), the
+follow-up is a `boop:opencode` label added symmetrically to
+`resolveSDKEnabled` in
+`apps/receiver/internal/webhook/handler.go`.
+
+### Diagnostic queries
+
+```
+# Show the BOOP_USE_OPENROUTER_SDK value the Job was launched with
+kubectl get job -n dev-tools <job-name> -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="BOOP_USE_OPENROUTER_SDK")].value}'
+
+# Show the path the runner took (openrouter-sdk vs the legacy modes)
+kubectl logs -n dev-tools -l app=boop,pr-number=<N> --tail=200 | grep '"stage":"opencode"'
+
+# Confirm the SDK call did not shell out to the opencode binary
+kubectl logs -n dev-tools -l app=boop,pr-number=<N> --tail=200 | grep -i opencode\\.run
+# (should be empty on the SDK path)
+```
+
 ## End-to-end smoke test
 
 1. Pick a test PR in the `qubitquilt` org (or any repo the App is

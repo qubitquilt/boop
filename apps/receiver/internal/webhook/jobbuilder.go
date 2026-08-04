@@ -295,13 +295,22 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 								{Name: "BOOP_REACTION_COMMENT_ID", Value: v.ReactionCommentID},
 								{Name: "BOOP_REVIEW_NUMBER", Value: v.ReviewNumber},
 								{Name: "BOOP_BOT_LOGIN", Value: v.BotLogin},
-								{Name: "BOOP_SKIP_SKILL", Value: "0"},
-								// Tell the runner where on disk to find
-								// each mounted secret. The runner reads
-								// the file at process start and stops
-								// referencing the path.
-								{Name: "BOOP_GITHUB_APP_PRIVATE_KEY_PATH", Value: privateKeyMountPath},
-								{Name: "BOOP_OPENROUTER_API_KEY_PATH", Value: openrouterKeyMountPath},
+							{Name: "BOOP_SKIP_SKILL", Value: "0"},
+							// QUB-94: feature flag for the
+							// in-process OpenRouter SDK path.
+							// Resolved at submitJob time from
+							// the receiver's BOOP_USE_OPENROUTER_SDK
+							// env var + the boop:openrouter-sdk
+							// per-PR label. "0" (default) keeps
+							// the opencode subprocess; "1"
+							// takes the SDK path.
+							{Name: "BOOP_USE_OPENROUTER_SDK", Value: v.OpenRouterSDKEnabled},
+							// Tell the runner where on disk to find
+							// each mounted secret. The runner reads
+							// the file at process start and stops
+							// referencing the path.
+							{Name: "BOOP_GITHUB_APP_PRIVATE_KEY_PATH", Value: privateKeyMountPath},
+							{Name: "BOOP_OPENROUTER_API_KEY_PATH", Value: openrouterKeyMountPath},
 								// Dashboard data layer. Both env vars are
 								// empty when the operator hasn't opted in
 								// (RUNNER_TOKEN unset); the runner treats
