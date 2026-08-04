@@ -47,6 +47,7 @@
 // and exercise the failure path immediately.
 
 import { setTimeout as defaultSleep } from "node:timers/promises";
+import { defaultClassify } from "./classify.mjs";
 import { cloneRepo } from "./git.mjs";
 import { runOpenCodeSkill as defaultRunOpenCodeSkill } from "./opencode.mjs";
 import {
@@ -144,11 +145,13 @@ export const STAGES = [
 ];
 
 // REVIEW_SUB_STAGES is the list of sub-stages inside the `sniff`
-// macro-stage. Today it has one placeholder sub-stage that calls
-// the existing runOpenCodeSkill; the sub-workflow is structurally
-// present (a `runSubWorkflow` executor walks it) so the later
-// QUB-94 / QUB-95 / QUB-96 PRs only need to push entries onto
-// the list, not introduce the executor.
+// macro-stage. Today it has:
+//   - classify (QUB-94): identify the PR type. Informational;
+//     state.classification is written but the downstream
+//     pipeline does not yet read it. QUB-95's dispatcher will.
+//   - sniff-legacy: placeholder that calls the existing
+//     runOpenCodeSkill. QUB-95 replaces this with
+//     dispatch / gather / narrate; QUB-96 adds meta-review.
 //
 // Sub-stages are silent on the status thread (statusStage: null).
 // The "review" status line is posted once at the start of the
@@ -156,14 +159,26 @@ export const STAGES = [
 // QUB-93's user-visible surface stays the same).
 export const REVIEW_SUB_STAGES = [
   {
+    id: "classify",
+    statusStage: null,
+    description:
+      "Identify the PR type (bug fix, feature, refactor, docs, test-only, infra) to drive the expert selection in dispatch (QUB-95). Today the classifier is a stub; a follow-up wires the real LLM call.",
+    input: "ctx, state.openrouterApiKey, /work/repo",
+    output: "state.classification = { type, confidence }",
+    idempotent: false,
+    retryable: true,
+    gate: classifyGate,
+    run: classifySubStage,
+  },
+  {
     id: "sniff-legacy",
     statusStage: null,
     description:
-      "Placeholder sub-stage that calls the existing runOpenCodeSkill. QUB-95 replaces this with classify / dispatch / gather / narrate.",
+      "Placeholder sub-stage that calls the existing runOpenCodeSkill. QUB-95 replaces this with dispatch / gather / narrate.",
     input: "ctx, state.openrouterApiKey, /work/repo",
     output: "state.review",
     idempotent: false,
-    retryable: true, // LLM calls can be transient
+    retryable: true,
     gate: sniffLegacyGate,
     run: sniffLegacySubStage,
   },
@@ -509,6 +524,31 @@ async function cleanupStage(ctx, deps, overrides, state) {
 }
 
 // --- sub-stage gate + function -----------------------------------------
+
+async function classifyGate(state, _ctx, _deps) {
+  // The classifier needs the openrouter key (for the real
+  // LLM call when it lands) and the cloned repo (for the
+  // diff context). The fetch stage has populated both.
+  if (!state.openrouterApiKey) {
+    return { ok: false, reason: "no openrouter api key" };
+  }
+  return { ok: true };
+}
+
+async function classifySubStage(ctx, deps, overrides, state) {
+  // The classifier is overridable so a test can inject a
+  // deterministic classification. The default is the stub
+  // in lib/classify.mjs; a follow-up PR wires the real LLM
+  // call (an `opencode run` invocation with a classification
+  // prompt + the PR diff as context).
+  const classifyFn = overrides.classify || defaultClassify;
+  const classification = await classifyFn(ctx, deps);
+  state.classification = classification;
+  deps.log("classify", "classified PR", {
+    type: classification.type,
+    confidence: classification.confidence,
+  });
+}
 
 async function sniffLegacyGate(state, _ctx, _deps) {
   if (!state.openrouterApiKey) {

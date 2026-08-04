@@ -64,16 +64,17 @@ test("status stage labels match the user-visible surface (QUB-93)", () => {
 
 // --- sub-workflow --------------------------------------------------------
 
-test("REVIEW_SUB_STAGES is the review sub-workflow (initially a single placeholder)", () => {
-  // Pinned by QUB-89. The sub-workflow is structurally present
-  // so QUB-94 / QUB-95 / QUB-96 only need to push entries onto
-  // the list. Today there is exactly one sub-stage: sniff-legacy,
-  // which calls the existing runOpenCodeSkill. The QUB-95 PR
-  // expands the list to {classify, dispatch, gather, narrate} and
-  // QUB-96 adds meta-review.
+test("REVIEW_SUB_STAGES is the review sub-workflow (classify first, then placeholder)", () => {
+  // Pinned by QUB-94. The sub-workflow is structurally
+  // present so QUB-95 / QUB-96 only need to push entries
+  // onto the list. Today the list has the QUB-94 classify
+  // sub-stage (first) and the legacy sniff-legacy
+  // placeholder (second). QUB-95 replaces sniff-legacy
+  // with dispatch / gather / narrate; QUB-96 adds
+  // meta-review.
   assert.deepEqual(
     REVIEW_SUB_STAGES.map((s) => s.id),
-    ["sniff-legacy"],
+    ["classify", "sniff-legacy"],
   );
 });
 
@@ -352,15 +353,20 @@ test("runStages passes the opencode overrides through to the sniff stage", async
 
 test("runSubWorkflow walks every sub-stage in order", async () => {
   // The sub-workflow executor is the primitive that the macro
-  // sniff stage uses. Today it walks a single placeholder; the
-  // shape is in place so QUB-95 can push more entries.
-  // The sub-stage gate (sniffLegacyGate) requires
-  // state.openrouterApiKey; the macro handshake stage
-  // populates it, so we set it here for the direct
-  // runSubWorkflow call.
+  // sniff stage uses. Today it walks the classify +
+  // sniff-legacy sub-stages in order. The shape is in place
+  // so QUB-95 can push more entries.
+  //
+  // The sub-stage gates require state.openrouterApiKey; the
+  // macro handshake stage populates it, so we set it here for
+  // the direct runSubWorkflow call.
   const sequence = [];
   const deps = recordingDeps();
   const overrides = {
+    classify: async () => {
+      sequence.push("classify");
+      return { type: "feature", confidence: "high" };
+    },
     runOpenCodeSkill: async () => {
       sequence.push("runOpenCodeSkill");
       return fakeReview();
@@ -369,7 +375,7 @@ test("runSubWorkflow walks every sub-stage in order", async () => {
   await runSubWorkflow(REVIEW_SUB_STAGES, fakeCtx, deps, overrides, {
     openrouterApiKey: "fake",
   });
-  assert.deepEqual(sequence, ["runOpenCodeSkill"]);
+  assert.deepEqual(sequence, ["classify", "runOpenCodeSkill"]);
 });
 
 test("runSubWorkflow supports a custom sub-stage list (test seam)", async () => {
@@ -741,6 +747,81 @@ test("each stage declares retryable: true or false (QUB-91)", () => {
   assert.equal(byId.cleanup.retryable, true);
 });
 
+// --- classify sub-stage (QUB-94) ---------------------------------------
+
+test("classify sub-stage calls overrides.classify and writes state.classification (QUB-94)", async () => {
+  // The classify sub-stage uses the overrides.classify hook
+  // (same pattern as overrides.runOpenCodeSkill). The
+  // default falls back to the stub in lib/classify.mjs; a
+  // future PR wires the real LLM call.
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => ({ type: "bug-fix", confidence: "high" }),
+      runOpenCodeSkill: async () => fakeReview(),
+    },
+    state,
+  );
+  assert.deepEqual(state.classification, { type: "bug-fix", confidence: "high" });
+});
+
+test("classify sub-stage falls back to the default stub when no override is provided (QUB-94)", async () => {
+  // The stub returns { type: "unknown", confidence: "low" }.
+  // The dispatch sub-stage (QUB-95) will treat "unknown"
+  // as a default-expert-pool signal.
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    { runOpenCodeSkill: async () => fakeReview() },
+    state,
+  );
+  assert.deepEqual(state.classification, { type: "unknown", confidence: "low" });
+});
+
+test("classify sub-stage runs before sniff-legacy (QUB-94)", async () => {
+  // The classification drives the expert selection in
+  // QUB-95's dispatch. The order is pinned: classify first,
+  // then sniff-legacy (today; replaced by dispatch/gather/
+  // narrate in QUB-95). A test failure here means a
+  // future PR reordered the list and broke the contract.
+  const sequence = [];
+  const deps = recordingDeps();
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => {
+        sequence.push("classify");
+        return { type: "feature", confidence: "high" };
+      },
+      runOpenCodeSkill: async () => {
+        sequence.push("sniff-legacy");
+        return fakeReview();
+      },
+    },
+    { openrouterApiKey: "fake" },
+  );
+  assert.deepEqual(sequence, ["classify", "sniff-legacy"]);
+});
+
 // --- resume (QUB-92) ---------------------------------------------------
 
 test("runStages skips macro stages listed in state.passed (QUB-92)", async () => {
@@ -857,12 +938,16 @@ test("runSubWorkflow records passed sub-stages in state.sub[macroId] (QUB-92)", 
   // Each sub-stage that passes is appended to state.sub[macroId].
   // The orchestrator's onStagePassed callback (at the macro
   // level) reads state.sub and writes it to the comment.
+  //
+  // QUB-94: the sub-workflow now has two sub-stages
+  // (classify + sniff-legacy). Both are recorded in
+  // state.sub.sniff.
   const deps = recordingDeps();
   const state = {
     passed: [],
     sub: {},
     _subWorkflowOf: "sniff",
-    openrouterApiKey: "fake", // seed for the sniff-legacy gate
+    openrouterApiKey: "fake",
   };
   await runSubWorkflow(
     REVIEW_SUB_STAGES,
@@ -871,7 +956,7 @@ test("runSubWorkflow records passed sub-stages in state.sub[macroId] (QUB-92)", 
     { runOpenCodeSkill: async () => fakeReview() },
     state,
   );
-  assert.deepEqual(state.sub, { sniff: ["sniff-legacy"] });
+  assert.deepEqual(state.sub, { sniff: ["classify", "sniff-legacy"] });
 });
 
 // --- status thread parity (QUB-93) ------------------------------------
