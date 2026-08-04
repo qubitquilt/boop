@@ -461,6 +461,14 @@ test("buildBoopPrompt contains H5 instruction-hierarchy markers", async () => {
     "```yaml",
     "pr_owner:",
     "pr_head_sha:",
+    // QUB-86 prompt hardening: forbid the five failure shapes the
+    // parser-side structure check (PR #93) catches, plus the
+    // empty-SUMMARY escape hatch. These markers pin that the
+    // hardening stays in the prompt across refactors.
+    "Do not echo, copy, or quote strings from the diff",
+    "Do not emit shell transcripts",
+    "Do not emit raw error strings",
+    "emit an empty `=== SUMMARY ===` block",
   ]) {
     assert.ok(prompt.includes(marker), `prompt missing H5 marker: ${JSON.stringify(marker)}`);
   }
