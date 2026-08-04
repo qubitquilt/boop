@@ -89,6 +89,11 @@ export async function callOpenRouter(prompt, deps = {}) {
 
     if (!result.ok) {
       const err = result.error;
+      // Capture every field the SDK exposes so the runner's
+      // error log has the full picture. The previous shape
+      // dropped the body when the error message was empty
+      // (the smoke test on PR #33 surfaced this with
+      // `error: "OpenRouter chat completion failed: undefined"`).
       const status =
         err && typeof err === "object" && "statusCode" in err
           ? err.statusCode
@@ -96,6 +101,14 @@ export async function callOpenRouter(prompt, deps = {}) {
       const message = err && typeof err === "object" && "message" in err
         ? String(err.message)
         : String(err);
+      const body =
+        err && typeof err === "object" && "body" in err
+          ? String(err.body).slice(0, 500)
+          : undefined;
+      const contentType =
+        err && typeof err === "object" && "contentType" in err
+          ? String(err.contentType)
+          : undefined;
       // Surface the SDK's own failure in the error pipeline so a
       // 4xx/5xx doesn't look like a successful empty review in
       // the log. The throw below is the contract the runner
@@ -103,6 +116,9 @@ export async function callOpenRouter(prompt, deps = {}) {
       errlog("openrouter", "sdk returned non-ok result", {
         status,
         message,
+        errorName: err?.name,
+        contentType,
+        body,
       });
       throw new Error(
         `OpenRouter chat completion failed${status ? ` (${status})` : ""}: ${message}`,
