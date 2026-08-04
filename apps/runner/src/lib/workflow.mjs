@@ -186,22 +186,74 @@ export function statusStageFor(id) {
 // orchestrator in index.mjs short-circuits the lifecycle. A
 // thrown run (after retries) is "hard" — it propagates to the
 // orchestrator catch.
-export async function runStages(ctx, deps, overrides, state) {
+//
+// QUB-92: the executor honors state.passed (an array of macro
+// stage ids). A macro stage whose id is in state.passed is
+// skipped (its run is not called, its gate is not called). The
+// orchestrator in index.mjs populates state.passed from the
+// status comment on startup; on each stage pass, it appends
+// the new id to state.passed and writes the state back.
+//
+// options.onStagePassed is an optional callback the executor
+// fires after every stage that passes. The orchestrator uses
+// it to persist state to the status comment so a pod kill
+// mid-run does not lose progress.
+export async function runStages(ctx, deps, overrides, state, options = {}) {
+  const onStagePassed = options.onStagePassed || (() => {});
   for (const stage of STAGES) {
+    if (state.passed && state.passed.includes(stage.id)) {
+      deps.log("resume", `${stage.id} already passed; skipping`, {
+        passed: state.passed,
+      });
+      continue;
+    }
+    const wasPassed = state.parseFailed;
     await withRetry(stage, ctx, deps, overrides, state);
+    if (state.parseFailed && !wasPassed) return state;
     if (state.parseFailed) return state;
+    // The stage passed. Append to state.passed and notify.
+    state.passed = state.passed || [];
+    if (!state.passed.includes(stage.id)) state.passed.push(stage.id);
+    await onStagePassed(stage.id, state);
   }
   return state;
 }
 
 // runSubWorkflow walks a sub-workflow stage list in order. Same
-// shape as runStages. A gate failure inside the sub-workflow
-// sets state.parseFailed; the macro `sniff` stage's run sees
-// the flag on the next iteration and short-circuits.
+// shape as runStages. Honors state.sub[macroId] (a list of
+// sub-stage ids) for the macro stage's sub-workflow; the
+// orchestrator in index.mjs is responsible for setting
+// state.sub[macroId] when reading the workflow state. A
+// sub-stage whose id is in the per-macro list is skipped.
 export async function runSubWorkflow(stages, ctx, deps, overrides, state) {
+  const macroId = state._subWorkflowOf;
+  const subPassed =
+    macroId && state.sub && Array.isArray(state.sub[macroId])
+      ? state.sub[macroId]
+      : null;
   for (const stage of stages) {
+    if (subPassed && subPassed.includes(stage.id)) {
+      deps.log("resume", `sub-stage ${stage.id} already passed; skipping`, {
+        sub: subPassed,
+      });
+      continue;
+    }
+    const wasPassed = state.parseFailed;
     await withRetry(stage, ctx, deps, overrides, state);
+    if (state.parseFailed && !wasPassed) return state;
     if (state.parseFailed) return state;
+    // Sub-stage passed. Append to state.sub[macroId] if we know
+    // the macro id. The orchestrator's onStagePassed callback
+    // (fired by the macro executor after the macro stage
+    // returns) will pick up the updated sub list and persist
+    // the state.
+    if (macroId) {
+      state.sub = state.sub || {};
+      state.sub[macroId] = state.sub[macroId] || [];
+      if (!state.sub[macroId].includes(stage.id)) {
+        state.sub[macroId].push(stage.id);
+      }
+    }
   }
 }
 
@@ -399,7 +451,17 @@ async function fetchStage(ctx, deps, _overrides, _state) {
 }
 
 async function sniffStage(ctx, deps, overrides, state) {
-  await runSubWorkflow(REVIEW_SUB_STAGES, ctx, deps, overrides, state);
+  // Mark the sub-workflow's "owner" so runSubWorkflow can
+  // apply the per-macro skip list. The orchestrator (index.mjs)
+  // populates state.sub.sniff with the already-passed sub-stage
+  // ids when it reads the workflow state from the status
+  // comment.
+  state._subWorkflowOf = "sniff";
+  try {
+    await runSubWorkflow(REVIEW_SUB_STAGES, ctx, deps, overrides, state);
+  } finally {
+    delete state._subWorkflowOf;
+  }
 }
 
 async function summaryStage(ctx, deps, _overrides, state) {

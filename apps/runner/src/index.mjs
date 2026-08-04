@@ -41,6 +41,8 @@ import { createCleanupRegistry, cloneRepo } from "./lib/git.mjs";
 import { runStages } from "./lib/workflow.mjs";
 import {
   postStatus,
+  readWorkflowState,
+  writeWorkflowState,
 } from "./lib/github.mjs";
 import { postStatus as postDashboardStatus, postTelemetry } from "./lib/dashboard.mjs";
 
@@ -144,7 +146,64 @@ export async function run(env = process.env, overrides = {}) {
     bot_login: ctx.botLogin,
   });
 
-  const state = {};
+  // QUB-92 resume: state.passed is the list of macro stages
+  // that have already landed (read from the status comment by
+  // a prior run). The runner reads the state from the comment
+  // after the handshake stage (we need the octokit first) and
+  // writes it back after every macro stage that passes. A pod
+  // kill mid-run preserves the last successful write.
+  const state = { passed: [], sub: {} };
+
+  // onStagePassed: invoked after every macro stage that
+  // passes. The first invocation (handshake) reads the prior
+  // workflow state from the comment and merges it. All
+  // invocations write the updated state back. The two-phase
+  // design means the comment is the source of truth: if a
+  // prior run wrote "passed=[handshake,fetch]" and the pod
+  // died before reaching sniff, this run will see that on
+  // its handshake callback and skip the relevant stages.
+  let stateInitialized = false;
+  const onStagePassed = async (stageId) => {
+    const octokit = deps.getOctokit();
+    if (!octokit || !ctx.statusCommentId) return;
+    if (!stateInitialized) {
+      const prior = await readWorkflowState(octokit, ctx, {
+        log: log.log,
+        errlog: log.errlog,
+      });
+      // Merge the prior passed list with the current run's
+      // passed list. The current run started empty (state.passed
+      // is [] above), so the merge is a union — the prior
+      // run's passed stages are prepended.
+      if (prior.passed && prior.passed.length > 0) {
+        state.passed = [
+          ...prior.passed.filter((id) => !state.passed.includes(id)),
+          ...state.passed,
+        ];
+      }
+      if (prior.sub && Object.keys(prior.sub).length > 0) {
+        for (const [macroId, subs] of Object.entries(prior.sub)) {
+          state.sub[macroId] = [
+            ...(subs || []).filter((id) => !(state.sub[macroId] || []).includes(id)),
+            ...(state.sub[macroId] || []),
+          ];
+        }
+      }
+      if (state.passed.length > 0 || Object.keys(state.sub).length > 0) {
+        log.log("state", "resuming from prior run", {
+          passed: state.passed,
+          sub: state.sub,
+        });
+      }
+      stateInitialized = true;
+    }
+    await writeWorkflowState(
+      octokit,
+      ctx,
+      { log: log.log, errlog: log.errlog },
+      { passed: state.passed, sub: state.sub },
+    );
+  };
 
   try {
     // The six macro stages: handshake → fetch → sniff → summary
@@ -155,7 +214,9 @@ export async function run(env = process.env, overrides = {}) {
     // stage handles its own skip (first review / no botLogin) and
     // best-effort error swallow so the orchestrator stays
     // straightforward.
-    await runStages(ctx, deps, overrides, state);
+    await runStages(ctx, deps, overrides, state, {
+      onStagePassed,
+    });
 
     // Parse-failed sniff: the summary stage set state.parseFailed
     // and posted "failed" already. Skip the rest of the lifecycle

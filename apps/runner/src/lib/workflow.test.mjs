@@ -739,3 +739,136 @@ test("each stage declares retryable: true or false (QUB-91)", () => {
   assert.equal(byId.inlines.retryable, true);
   assert.equal(byId.cleanup.retryable, true);
 });
+
+// --- resume (QUB-92) ---------------------------------------------------
+
+test("runStages skips macro stages listed in state.passed (QUB-92)", async () => {
+  // A failed prior run wrote state.passed = ["handshake",
+  // "fetch"] to the status comment. The new run reads it and
+  // skips those two stages; only sniff + summary + inlines +
+  // cleanup run.
+  //
+  // The test seeds state.openrouterApiKey (the sniff-legacy
+  // sub-stage gate requires it) and state.octokit (the
+  // summary + inlines gates require it) because the
+  // handshake stage — which would normally populate both —
+  // is skipped.
+  const sequence = [];
+  const octokit = fakeOctokit();
+  const deps = recordingDeps({
+    postStatus: async (stage) => sequence.push(`postStatus(${stage})`),
+    setOctokit: () => sequence.push("setOctokit"),
+    cloneRepo: async (_ctx, d) => {
+      sequence.push("cloneRepo");
+      await d.postStatus("clone");
+    },
+  });
+  const overrides = {
+    makeOctokit: () => octokit,
+    runOpenCodeSkill: async (_apiKey, _ctx, d) => {
+      sequence.push("runOpenCodeSkill");
+      await d.postStatus("review");
+      return fakeReview();
+    },
+  };
+  const state = {
+    passed: ["handshake", "fetch"],
+    sub: {},
+    openrouterApiKey: "fake", // seed for the sniff-legacy gate
+    octokit, // seed for the summary + inlines gates (handshake was skipped)
+  };
+  await runStages(fakeCtx, deps, overrides, state);
+  // handshake + fetch were skipped. The "auth" / "clone"
+  // status lines were NOT PATCHed.
+  assert.ok(!sequence.includes("setOctokit"));
+  assert.ok(!sequence.includes("cloneRepo"));
+  assert.ok(!sequence.includes("postStatus(auth)"));
+  // The rest ran normally.
+  assert.ok(sequence.includes("runOpenCodeSkill"));
+  assert.ok(sequence.includes("postStatus(review)"));
+  // The state.passed list grew to include the new stages.
+  assert.deepEqual(state.passed, [
+    "handshake",
+    "fetch",
+    "sniff",
+    "summary",
+    "inlines",
+    "cleanup",
+  ]);
+});
+
+test("runStages calls onStagePassed after every macro stage (QUB-92)", async () => {
+  // The orchestrator (index.mjs) uses the onStagePassed
+  // callback to persist state to the status comment after
+  // each macro stage. The callback is the write-side of the
+  // resume contract.
+  const calls = [];
+  const deps = recordingDeps({
+    setOctokit: () => {},
+    cloneRepo: async () => {},
+  });
+  const overrides = {
+    makeOctokit: () => fakeOctokit(),
+    runOpenCodeSkill: async () => fakeReview(),
+  };
+  await runStages(fakeCtx, deps, overrides, { passed: [], sub: {} }, {
+    onStagePassed: async (stageId, state) => {
+      calls.push({ stageId, passed: [...state.passed] });
+    },
+  });
+  assert.deepEqual(
+    calls.map((c) => c.stageId),
+    ["handshake", "fetch", "sniff", "summary", "inlines", "cleanup"],
+  );
+  // Each callback sees the cumulative state.passed at the
+  // moment the stage passed.
+  assert.deepEqual(calls[0], { stageId: "handshake", passed: ["handshake"] });
+  assert.deepEqual(calls[1], { stageId: "fetch", passed: ["handshake", "fetch"] });
+  assert.deepEqual(
+    calls[5],
+    { stageId: "cleanup", passed: ["handshake", "fetch", "sniff", "summary", "inlines", "cleanup"] },
+  );
+});
+
+test("runSubWorkflow skips sub-stages listed in state.sub[macroId] (QUB-92)", async () => {
+  // The sniff macro stage's sub-workflow honors state.sub.sniff.
+  // A prior run wrote sub = { sniff: ["sniff-legacy"] } and
+  // the new run sees it and skips sniff-legacy.
+  const sequence = [];
+  const deps = recordingDeps();
+  const overrides = {
+    runOpenCodeSkill: async () => {
+      sequence.push("runOpenCodeSkill");
+      return fakeReview();
+    },
+  };
+  const state = {
+    passed: [],
+    sub: { sniff: ["sniff-legacy"] },
+    _subWorkflowOf: "sniff",
+  };
+  await runSubWorkflow(REVIEW_SUB_STAGES, fakeCtx, deps, overrides, state);
+  // sniff-legacy was skipped; runOpenCodeSkill was not called.
+  assert.deepEqual(sequence, []);
+});
+
+test("runSubWorkflow records passed sub-stages in state.sub[macroId] (QUB-92)", async () => {
+  // Each sub-stage that passes is appended to state.sub[macroId].
+  // The orchestrator's onStagePassed callback (at the macro
+  // level) reads state.sub and writes it to the comment.
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake", // seed for the sniff-legacy gate
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    { runOpenCodeSkill: async () => fakeReview() },
+    state,
+  );
+  assert.deepEqual(state.sub, { sniff: ["sniff-legacy"] });
+});
