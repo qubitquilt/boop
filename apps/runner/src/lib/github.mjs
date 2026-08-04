@@ -4,6 +4,8 @@
 //   - mintInstallationToken: exchange an App JWT for an installation token
 //   - postStatus / postReview / postInlineComment: the public comments
 //   - cleanupPriorReview: resolve outdated threads + minimize prior bot comments
+//   - readWorkflowState / writeWorkflowState: the resume handoff
+//     (QUB-92) — the state lives in the status comment
 //   - graphql + paginated fetches used by cleanup
 //
 // Each function takes the loaded `ctx` and a `deps` bundle (fetch,
@@ -14,6 +16,13 @@ import { Octokit } from "@octokit/rest";
 import { SHORT, STATUS } from "./config.mjs";
 import { shortSha } from "./security.mjs";
 import { reviewHeader } from "../review-header.mjs";
+
+// Re-export STATUS and SHORT so the test suite (workflow.test.mjs)
+// can pin the user-visible surface (QUB-93) without reaching
+// into config.mjs. The runner is the canonical consumer of
+// these maps; the receiver mirrors them in
+// apps/receiver/internal/webhook/handler.go.
+export { STATUS, SHORT };
 
 // mintInstallationToken exchanges an App JWT for an installation
 // token (1h TTL). Used by both status updates and the cleanup
@@ -242,6 +251,117 @@ export async function postStatus(stage, detail, ctx, deps) {
   } catch (err) {
     errlog("status", "comment update failed", { stage, err: String(err?.message ?? err) });
   }
+}
+
+// --- workflow state persistence (QUB-92) -------------------------------
+//
+// The runner persists its progress to the GitHub status comment so
+// a failed run can resume from the failed stage. The state lives in
+// a hidden HTML comment the runner reads on startup and PATCHes
+// after each macro stage passes. The format is intentionally tiny
+// (~80 bytes); the existing 60 KB comment trim path handles the
+// rest of the body.
+
+// WORKFLOW_STATE_MARKER is the HTML-comment delimiter the runner
+// uses to find its state line in the status comment. Anything
+// between the open and close tags is JSON. A runner that sees
+// a missing or malformed marker treats the run as fresh.
+export const WORKFLOW_STATE_MARKER = "<!-- boop-state:";
+
+// readWorkflowState reads the status comment and returns the
+// passed-macro-stages list. Best-effort: a missing comment,
+// missing marker, or malformed JSON returns an empty list
+// (treat as fresh run). The caller (run() in index.mjs) uses
+// the list to skip already-passed stages.
+export async function readWorkflowState(octokit, ctx, deps) {
+  if (!octokit || !ctx.statusCommentId) {
+    return { passed: [], sub: {} };
+  }
+  try {
+    const { data: current } = await octokit.rest.issues.getComment({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      comment_id: ctx.statusCommentId,
+    });
+    return parseStateFromBody(current.body || "");
+  } catch (err) {
+    deps.log("state", "read failed; treating as fresh", {
+      err: String(err?.message ?? err),
+    });
+    return { passed: [], sub: {} };
+  }
+}
+
+function parseStateFromBody(body) {
+  const start = body.indexOf(WORKFLOW_STATE_MARKER);
+  if (start < 0) return { passed: [], sub: {} };
+  const openEnd = start + WORKFLOW_STATE_MARKER.length;
+  const closeStart = body.indexOf("-->", openEnd);
+  if (closeStart < 0) return { passed: [], sub: {} };
+  const json = body.slice(openEnd, closeStart).trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return { passed: [], sub: {} };
+  }
+  return {
+    passed: Array.isArray(parsed.passed) ? parsed.passed : [],
+    sub: parsed.sub && typeof parsed.sub === "object" ? parsed.sub : {},
+  };
+}
+
+// writeWorkflowState PATCHes the status comment with the
+// current state. The state is appended after the
+// `<!-- boop-state:` marker (replacing any previous state
+// line). The rest of the comment body is preserved.
+//
+// Best-effort: a write failure is logged but the run continues.
+// The state is best-effort: a PATCH that fails leaves the
+// in-memory state ahead of the comment; the next stage PATCH
+// or a re-trigger's state-read will see the slightly stale
+// state. The status-comment timeline is the fallback: any
+// stage whose side effect (summary post, inlines post) is
+// still in GitHub counts as "passed".
+export async function writeWorkflowState(octokit, ctx, deps, state) {
+  if (!octokit || !ctx.statusCommentId) {
+    return;
+  }
+  const line = `${WORKFLOW_STATE_MARKER} ${JSON.stringify({
+    passed: state.passed || [],
+    sub: state.sub || {},
+  })} -->`;
+  try {
+    const { data: current } = await octokit.rest.issues.getComment({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      comment_id: ctx.statusCommentId,
+    });
+    const body = upsertStateInBody(current.body || "", line);
+    await octokit.rest.issues.updateComment({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      comment_id: ctx.statusCommentId,
+      body,
+    });
+    deps.log("state", "comment updated", { passed: state.passed });
+  } catch (err) {
+    deps.errlog("state", "comment update failed", {
+      err: String(err?.message ?? err),
+    });
+  }
+}
+
+function upsertStateInBody(body, line) {
+  const start = body.indexOf(WORKFLOW_STATE_MARKER);
+  if (start < 0) {
+    return body + "\n" + line;
+  }
+  const closeStart = body.indexOf("-->", start);
+  if (closeStart < 0) {
+    return body + "\n" + line;
+  }
+  return body.slice(0, start) + line + body.slice(closeStart + 3);
 }
 
 // makeOctokit creates an Octokit bound to the installation token.

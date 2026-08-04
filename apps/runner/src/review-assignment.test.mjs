@@ -12,49 +12,75 @@ import path from "node:path";
 // K8s retries per `backoffLimit`, and the PR status timeline shows
 // N copies of `auth -> review -> failed`.
 //
-// This test pins the contract: a `let review;` declaration must
-// precede the opencode-skill call. After the lib-split refactor in
-// PR #71 the call is `await skillFn(...)` where skillFn is either
-// the override or `runOpenCodeSkill`, so we match `await skillFn(`
-// OR `await runOpenCodeSkill(` for the assignment side. The check
-// is source-text rather than runtime because the surrounding
-// `run()` does too much (mints tokens, clones the repo, posts
-// status, drives the opencode TUI) to exercise cheaply in a unit
-// test. If the structure of `run()` changes, this test will need
-// to move with it — the failure is intentional.
+// This test pins the contract: the opencode-skill call must assign
+// to a declared binding (a `let review;` followed by `review = ...`,
+// or a `state.review = ...` where `state` is declared in the same
+// file). Both shapes are valid; the bug the test guards against is
+// the third shape — an undeclared-variable assignment — which
+// strict-mode ES modules reject at runtime.
+//
+// After the lib-split refactor in PR #71 the call became
+// `await skillFn(...)` (with skillFn either the override or
+// `runOpenCodeSkill`). After the QUB-89 refactor the call moved
+// into `lib/workflow.mjs` and the assignment is `state.review = ...`
+// against a `const state = {}` declared in the same function. The
+// test reads both files so a future refactor that splits the call
+// again does not silently re-introduce the bug. The check is
+// source-text rather than runtime because the surrounding `run()`
+// does too much (mints tokens, clones the repo, posts status,
+// drives the opencode TUI) to exercise cheaply in a unit test.
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const indexSrc = readFileSync(path.join(here, "index.mjs"), "utf8");
+const workflowSrc = readFileSync(path.join(here, "lib", "workflow.mjs"), "utf8");
 
-test("review = await runOpenCodeSkill is preceded by a let review; declaration", () => {
-  // The buggy code (commit 96bb92fb) had no `let review;` declaration
-  // anywhere — assigning to an undeclared `review` throws
-  // ReferenceError in strict-mode ES modules. This test asserts the
-  // declaration is present and precedes the opencode-skill call.
-  // The check is intentionally a flat source-text scan: lexical
-  // scope tracking (matching `{` / `}` depth) is brittle and
-  // unnecessary for a regression that only ever involved a missing
-  // declaration.
-  const declRe = /\blet\s+review\s*;/;
-  const declMatch = indexSrc.match(declRe);
-  assert.ok(declMatch, "no `let review;` declaration found in index.mjs");
-
-  // Accept either the original `await runOpenCodeSkill(` call or
-  // the lib-split indirection `await skillFn(` (where skillFn is
-  // assigned above as `overrides.runOpenCodeSkill || runOpenCodeSkill`).
-  // Both must be preceded by the `let review;` declaration.
-  const callIdx = Math.max(
-    indexSrc.indexOf("await runOpenCodeSkill("),
-    indexSrc.indexOf("await skillFn("),
-  );
+test("opencode-skill call assigns to a declared binding", () => {
+  // Find the file that has the opencode-skill call.
+  const callIdxByFile = [
+    ["index.mjs", indexSrc],
+    ["lib/workflow.mjs", workflowSrc],
+  ].map(([label, src]) => [
+    label,
+    src,
+    Math.max(
+      src.indexOf("await runOpenCodeSkill("),
+      src.indexOf("await skillFn("),
+    ),
+  ]);
+  const found = callIdxByFile.find(([, , idx]) => idx >= 0);
   assert.ok(
-    callIdx >= 0,
-    "no `await runOpenCodeSkill(` or `await skillFn(` call found in index.mjs",
+    found,
+    "no `await runOpenCodeSkill(` or `await skillFn(` call found in index.mjs or lib/workflow.mjs",
   );
+  const [label, src] = found;
 
+  // The two safe shapes. The unsafe shape (bare `review = await ...`
+  // with no preceding `let review;` in scope) is what we guard
+  // against. state.review is a property of a const-declared state
+  // object, which strict-mode ES modules accept.
+  const safeDeclMatch = src.match(/\blet\s+review\s*;/);
+  if (safeDeclMatch) {
+    // Old shape: let review; precedes the call.
+    const callIdx = Math.max(
+      src.indexOf("await runOpenCodeSkill("),
+      src.indexOf("await skillFn("),
+    );
+    assert.ok(
+      safeDeclMatch.index < callIdx,
+      `expected 'let review;' (offset ${safeDeclMatch.index}) to appear before ` +
+        `the opencode-skill call (offset ${callIdx}) in ${label}`,
+    );
+    return;
+  }
+  // New shape: state.review = ... with `state` declared in the
+  // same file (either a `const state = ...` at top-level or a
+  // function parameter `state`).
+  const hasStateDecl =
+    /\b(?:const|let)\s+state\s*=/.test(src) ||
+    /\bfunction\s+\w+\s*\([^)]*\bstate\b/.test(src);
   assert.ok(
-    declMatch.index < callIdx,
-    `expected 'let review;' (offset ${declMatch.index}) to appear before ` +
-      `the opencode-skill call (offset ${callIdx})`,
+    hasStateDecl,
+    `opencode-skill call in ${label} is not assigned to a declared binding ` +
+      `(no 'let review;', no 'const state = ...', and no function parameter named 'state')`,
   );
 });

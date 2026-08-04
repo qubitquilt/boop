@@ -8,6 +8,8 @@ import {
   postInlineComments,
   cleanupPriorReview,
   makeOctokit,
+  readWorkflowState,
+  writeWorkflowState,
 } from "./github.mjs";
 
 const ctx = {
@@ -556,4 +558,126 @@ test("cleanupPriorReview skips bot filter when ctx.botLogin is null", async () =
   const result = await cleanupPriorReview("tok", noBotCtx, { fetchImpl, ...log });
   assert.equal(result.resolved, 0);
   assert.equal(result.minimized, 0);
+});
+
+// --- workflow state read / write (QUB-92) -----------------------------
+
+test("readWorkflowState returns the passed list from the comment body", async () => {
+  const octokit = makeFakeOctokit({
+    getComment: async () => ({
+      data: {
+        body:
+          "🐾 header\n\n<!-- boop-timeline -->\n- 👃 sniffing\n<!-- boop-state: {\"passed\":[\"handshake\",\"fetch\"],\"sub\":{\"sniff\":[\"classify\"]}} -->\n",
+      },
+    }),
+  });
+  const deps = { log: () => {}, errlog: () => {} };
+  const result = await readWorkflowState(octokit, ctx, deps);
+  assert.deepEqual(result.passed, ["handshake", "fetch"]);
+  assert.deepEqual(result.sub, { sniff: ["classify"] });
+});
+
+test("readWorkflowState returns empty state when the marker is missing", async () => {
+  const octokit = makeFakeOctokit({
+    getComment: async () => ({
+      data: { body: "🐾 header\n\n<!-- boop-timeline -->\n" },
+    }),
+  });
+  const deps = { log: () => {}, errlog: () => {} };
+  const result = await readWorkflowState(octokit, ctx, deps);
+  assert.deepEqual(result, { passed: [], sub: {} });
+});
+
+test("readWorkflowState treats malformed JSON as a fresh run", async () => {
+  const octokit = makeFakeOctokit({
+    getComment: async () => ({
+      data: { body: "<!-- boop-state: {not-json} -->" },
+    }),
+  });
+  const deps = { log: () => {}, errlog: () => {} };
+  const result = await readWorkflowState(octokit, ctx, deps);
+  assert.deepEqual(result, { passed: [], sub: {} });
+});
+
+test("readWorkflowState returns empty state when octokit is missing", async () => {
+  // A test that drives the runner without a real Octokit
+  // gets an empty state — same as a fresh run.
+  const deps = { log: () => {}, errlog: () => {} };
+  const result = await readWorkflowState(null, { ...ctx, statusCommentId: 100 }, deps);
+  assert.deepEqual(result, { passed: [], sub: {} });
+});
+
+test("writeWorkflowState PATCHes the comment with the state line", async () => {
+  // A fresh body (no prior state) gets the state appended.
+  let captured = null;
+  const octokit = makeFakeOctokit({
+    getComment: async () => ({ data: { body: "header\n" } }),
+    updateComment: async (args) => {
+      captured = args;
+      return { data: { id: 1, body: args.body } };
+    },
+  });
+  const log = recordingLogger();
+  await writeWorkflowState(
+    octokit,
+    ctx,
+    { log: log.log, errlog: log.errlog },
+    { passed: ["handshake"], sub: {} },
+  );
+  assert.ok(captured, "updateComment should have been called");
+  assert.match(captured.body, /boop-state:.*"passed":\["handshake"\]/);
+});
+
+test("writeWorkflowState replaces the prior state line on a re-write", async () => {
+  // The runner writes the state many times during a single
+  // run (once per macro stage). The marker is upserted in
+  // place; the rest of the comment body is preserved.
+  let captured = null;
+  const octokit = makeFakeOctokit({
+    getComment: async () => ({
+      data: {
+        body:
+          "header\n<!-- boop-state: {\"passed\":[\"handshake\"],\"sub\":{}} -->\n",
+      },
+    }),
+    updateComment: async (args) => {
+      captured = args;
+      return { data: { id: 1, body: args.body } };
+    },
+  });
+  await writeWorkflowState(
+    octokit,
+    ctx,
+    { log: () => {}, errlog: () => {} },
+    { passed: ["handshake", "fetch"], sub: {} },
+  );
+  assert.ok(captured, "updateComment should have been called");
+  assert.match(captured.body, /boop-state:.*"passed":\["handshake","fetch"\]/);
+  // The header is preserved.
+  assert.match(captured.body, /^header\n/);
+  // Only one state line (the upsert replaced the old one).
+  const matches = captured.body.match(/<!-- boop-state:/g) || [];
+  assert.equal(matches.length, 1);
+});
+
+test("writeWorkflowState swallows errors (best-effort)", async () => {
+  // A failed PATCH does not throw; the run continues. The
+  // state is best-effort — a re-trigger's state-read will see
+  // the last successful write.
+  const octokit = makeFakeOctokit({
+    getComment: async () => { throw new Error("get failed"); },
+  });
+  const log = recordingLogger();
+  // No throw:
+  await writeWorkflowState(
+    octokit,
+    ctx,
+    { log: log.log, errlog: log.errlog },
+    { passed: ["handshake"], sub: {} },
+  );
+  assert.ok(
+    log.out.some(
+      (e) => e.level === "ERROR" && /get failed/.test(e.err || ""),
+    ),
+  );
 });

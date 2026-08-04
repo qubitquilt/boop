@@ -4,30 +4,19 @@
 //   1. Reads the GitHub App private key and OpenRouter API key from
 //      their mounted Secret files (not env — env is visible to a
 //      prompt-injected LLM via /proc/self/environ).
-//   2. Mints a GitHub App installation token.
-//   3. Posts a status comment on the PR (the receiver pre-creates
-//      one; if BOOP_STATUS_COMMENT_ID is set we PATCH it, otherwise
-//      we post a fresh one as a fallback).
-//   4. Clones the PR at the head SHA into /work/repo using a
-//      short-lived git credential helper (so the token never
-//      appears in argv, .git/config, or process listings).
-//   5. Validates PR_BASE_REF and previousHeadSHA against a strict
-//      regex before passing them to `git fetch` / `git checkout` to
-//      defeat CVE-2017-1000117-class argument injection (a branch
-//      named `--upload-pack=evil` would otherwise execute the
-//      attacker's command on the runner host).
-//   6. Runs `opencode run` against /work/repo with the boop skill
-//      prompt. Hard-kills the subprocess after 25 min so a hung
-//      call cannot pin the Job past its 30-min deadline.
-//   7. PATCHes the status comment at each stage with the latest
+//   2. Walks the staged workflow (handshake → fetch → sniff →
+//      summary → inlines) defined in `./lib/workflow.mjs`.
+//   3. PATCHes the status comment at each stage with the latest
 //      emoji + message.
-//   8. Posts the review body to the PR as a single comment.
+//   4. Posts the review body to the PR as a single comment, plus
+//      the line-specific inline comments.
 //
 // Structure: this file is the orchestrator. The work is in
-// `./lib/*.mjs` (config, log, security, git, opencode, github).
-// Each lib module accepts a `ctx` (loaded config) and a `deps`
-// bundle so the whole pipeline is unit-testable without env vars,
-// real Octokit, real network, or real `git`.
+// `./lib/*.mjs` (config, log, security, git, opencode, github,
+// dashboard, workflow). Each lib module accepts a `ctx` (loaded
+// config) and a `deps` bundle so the whole pipeline is
+// unit-testable without env vars, real Octokit, real network, or
+// real `git`.
 
 import fs from "node:fs/promises";
 import jwt from "jsonwebtoken";
@@ -47,16 +36,13 @@ import {
   GITCONFIG_PATH,
 } from "./lib/config.mjs";
 import { makeLogger } from "./lib/log.mjs";
-import { assertSafeRef, assertSafeSha, readSecretFile } from "./lib/security.mjs";
+import { assertSafeRef, assertSafeSha } from "./lib/security.mjs";
 import { createCleanupRegistry, cloneRepo } from "./lib/git.mjs";
-import { runOpenCodeSkill } from "./lib/opencode.mjs";
+import { runStages } from "./lib/workflow.mjs";
 import {
-  mintInstallationToken,
-  makeOctokit,
-  postReview,
-  postInlineComments,
   postStatus,
-  cleanupPriorReview,
+  readWorkflowState,
+  writeWorkflowState,
 } from "./lib/github.mjs";
 import { postStatus as postDashboardStatus, postTelemetry } from "./lib/dashboard.mjs";
 
@@ -66,7 +52,15 @@ const execFileAsync = promisify(execFile);
 // passes around. Each lib function reads only what it needs from
 // `deps`; tests can swap any field (spawnFn, fetchImpl, OctokitCtor)
 // to drive a deterministic scenario.
+//
+// The octokit slot is shared between the handshake stage (which
+// writes it after minting the installation token) and the
+// `postStatus` closure (which reads it at PATCH time). The slot
+// pattern lets the stage functions stay in workflow.mjs without
+// reaching back into index.mjs to mutate module state.
 function makeDeps(ctx, log, cleanup) {
+  const octokitSlot = { value: null };
+  const getOctokit = () => octokitSlot.value;
   return {
     fs,
     execFile: execFileAsync,
@@ -86,23 +80,27 @@ function makeDeps(ctx, log, cleanup) {
     cleanup,
     log: log.log,
     errlog: log.errlog,
-    postStatus: (stage, detail) => postStatus(stage, detail, ctx, octokitDeps(log)),
+    setOctokit: (octokit) => { octokitSlot.value = octokit; },
+    getOctokit,
+    postStatus: (stage, detail) => postStatus(stage, detail, ctx, {
+      log: log.log,
+      errlog: log.errlog,
+      octokit: getOctokit(),
+    }),
     // cloneRepo is wrapped so its postStatus call goes through the
     // same lazy octokit-resolution path as the direct postStatus.
     // The clone runs AFTER token minting so the GitHub-App
-    // installation token is already populated in currentOctokit.
-    cloneRepo: (c, d) => cloneRepo(c, { ...d, postStatus: (s) => postStatus(s, undefined, c, octokitDeps(log)) }),
+    // installation token is already populated.
+    cloneRepo: (c, d) => cloneRepo(c, {
+      ...d,
+      postStatus: (s) => postStatus(s, undefined, c, {
+        log: log.log,
+        errlog: log.errlog,
+        octokit: getOctokit(),
+      }),
+    }),
   };
 }
-
-// octokitDeps is the subset of deps that postStatus needs. Kept as a
-// helper so the postStatus reference in makeDeps always reflects the
-// current octokit (it's set after the installation token is minted).
-function octokitDeps(log) {
-  return { log: log.log, errlog: log.errlog, octokit: currentOctokit };
-}
-
-let currentOctokit = null;
 
 // run is the pipeline. Exported so tests can drive it with a fixture
 // ctx + injected deps; index.mjs is just the entry invocation.
@@ -110,9 +108,10 @@ let currentOctokit = null;
 // `overrides` lets a test swap any side-effecting dep (spawn, exec,
 // fetch, jwt, fs) without monkey-patching the module — every lib
 // function reads its dependencies off the `deps` bundle, so the
-// override simply replaces the corresponding field. `runOpenCodeSkill`
-// and `cleanupPriorReview` are also overridable so a test can return
-// canned output without actually running opencode or hitting GitHub.
+// override simply replaces the corresponding field. The individual
+// stage functions in `workflow.mjs` also read `overrides.runOpenCodeSkill`
+// and `overrides.makeOctokit` so the same override surface keeps
+// working.
 export async function run(env = process.env, overrides = {}) {
   const ctx = loadConfig(env);
   const log = makeLogger(ctx);
@@ -147,142 +146,104 @@ export async function run(env = process.env, overrides = {}) {
     bot_login: ctx.botLogin,
   });
 
-  // Read secrets from mounted files. Each value is stored in a
-  // local const so it doesn't leak into process.env (it never
-  // leaves this function — see runOpencode in lib/opencode.mjs for
-  // the env stripping).
-  const GITHUB_APP_PRIVATE_KEY = await readSecretFile(
-    "GITHUB_APP_PRIVATE_KEY",
-    ctx.privateKeyPath,
-    deps.fs,
-  );
-  const OPENROUTER_API_KEY = await readSecretFile(
-    "OPENROUTER_API_KEY",
-    ctx.openrouterKeyPath,
-    deps.fs,
-  );
+  // QUB-92 resume: state.passed is the list of macro stages
+  // that have already landed (read from the status comment by
+  // a prior run). The runner reads the state from the comment
+  // after the handshake stage (we need the octokit first) and
+  // writes it back after every macro stage that passes. A pod
+  // kill mid-run preserves the last successful write.
+  const state = { passed: [], sub: {} };
 
-  // Mint installation token first; we need it for the status API too.
-  const installationToken = await mintInstallationToken(
-    ctx.githubAppId,
-    GITHUB_APP_PRIVATE_KEY,
-    ctx.githubAppInstallationId,
-    deps,
-  );
-  currentOctokit = overrides.makeOctokit
-    ? overrides.makeOctokit(installationToken)
-    : makeOctokit(installationToken);
-  log.log("auth", "minted installation token");
-  await deps.postStatus("auth");
-  // Dashboard data layer: announce the run as started. The
-  // receiver wrote the run row in its submitJob; this call
-  // updates it to the "running" stage so the dashboard's
-  // live panel knows the runner is alive.
-  await postDashboardStatus("running", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
-
-  try {
-    // Clone the PR at the head SHA into /work/repo before the LLM
-    // stage. The status timeline should show every stage the runner
-    // actually performs; a missing "clone" line would imply the
-    // clone happened but went unannounced. cloneRepo itself calls
-    // deps.postStatus("clone") so the 🥎 fetched stage lands in
-    // the timeline after a successful clone.
-    await deps.cloneRepo(ctx, deps);
-    log.log("clone", "repo cloned", { dir: deps.paths.repoDir, sha: ctx.prHeadSha });
-
-    let review;
-    try {
-      const skillFn = overrides.runOpenCodeSkill || runOpenCodeSkill;
-      const reviewResult = await skillFn(OPENROUTER_API_KEY, ctx, deps);
-      const telemetry = reviewResult.telemetry ?? null;
-      const review = {
-        summary: reviewResult.summary,
-        inlineComments: reviewResult.inlineComments,
-        confidence: reviewResult.confidence,
-      };
-      log.log("review", "opencode returned", {
-        summaryBytes: review.summary.length,
-        inlineCount: review.inlineComments.length,
-        confidence: review.confidence,
-        ...(telemetry ? {
-          cost_usd: telemetry.costUsd,
-          tokens_in: telemetry.inputTokens,
-          tokens_out: telemetry.outputTokens,
-          step_count: telemetry.stepCount,
-        } : {}),
-      });
-
-      if (!review.summary) {
-        // The LLM ran cleanly but produced output the parser could
-        // not turn into a review (no structured block, or a structured
-        // block whose body failed the structure sanity check — JS
-        // string-concat echo, shell transcript, raw error, etc.). The
-        // `summary_parse_failed` log line carries the reason + a
-        // stdout preview. We do NOT post anything to the PR: posting
-        // a half-rendered review is worse than posting nothing, and
-        // we don't want to retire prior review artifacts on a
-        // re-review when the new one didn't actually run.
-        log.log("done", "summary parse failed, skipping post", {
-          reason: reviewResult.parseError,
-          confidence: review.confidence,
-        });
-        await deps.postStatus(
-          "failed",
-          `summary parse failed: ${reviewResult.parseError || "unknown"}`,
-        );
-        return;
-      }
-
-      await postReview(currentOctokit, review.summary, ctx.reviewNumber, review.confidence, ctx);
-      log.log("done", "summary comment posted", {
-        review_number: ctx.reviewNumber,
-        confidence: review.confidence,
-      });
-
-      await postInlineComments(currentOctokit, review.inlineComments, ctx, {
+  // onStagePassed: invoked after every macro stage that
+  // passes. The first invocation (handshake) reads the prior
+  // workflow state from the comment and merges it. All
+  // invocations write the updated state back. The two-phase
+  // design means the comment is the source of truth: if a
+  // prior run wrote "passed=[handshake,fetch]" and the pod
+  // died before reaching sniff, this run will see that on
+  // its handshake callback and skip the relevant stages.
+  let stateInitialized = false;
+  const onStagePassed = async (stageId) => {
+    const octokit = deps.getOctokit();
+    if (!octokit || !ctx.statusCommentId) return;
+    if (!stateInitialized) {
+      const prior = await readWorkflowState(octokit, ctx, {
         log: log.log,
         errlog: log.errlog,
       });
-
-      // On re-reviews, retire prior Boop artifacts so the PR thread
-      // looks pristine. Best-effort: any error is logged but the
-      // review still completes. Skipped on the first review (nothing
-      // to clean) and when ctx.botLogin is unset (the receiver didn't
-      // know the bot login — most commonly because the App is
-      // configured to omit it).
-      if (ctx.reviewNumber > 1 && ctx.botLogin) {
-        try {
-          const cleanupFn = overrides.cleanupPriorReview || cleanupPriorReview;
-          const cleaned = await cleanupFn(installationToken, ctx, deps);
-          if (cleaned.resolved > 0 || cleaned.minimized > 0) {
-            log.log("cleanup", "retired prior review artifacts", cleaned);
-          } else {
-            log.log("cleanup", "no prior artifacts to retire");
-          }
-        } catch (err) {
-          log.errlog("cleanup", "prior-review cleanup failed", {
-            err: String(err?.message ?? err),
-          });
+      // Merge the prior passed list with the current run's
+      // passed list. The current run started empty (state.passed
+      // is [] above), so the merge is a union — the prior
+      // run's passed stages are prepended.
+      if (prior.passed && prior.passed.length > 0) {
+        state.passed = [
+          ...prior.passed.filter((id) => !state.passed.includes(id)),
+          ...state.passed,
+        ];
+      }
+      if (prior.sub && Object.keys(prior.sub).length > 0) {
+        for (const [macroId, subs] of Object.entries(prior.sub)) {
+          state.sub[macroId] = [
+            ...(subs || []).filter((id) => !(state.sub[macroId] || []).includes(id)),
+            ...(state.sub[macroId] || []),
+          ];
         }
       }
-
-      // Dashboard data layer: POST final telemetry (token usage
-      // + cost) once the review is fully posted. Best-effort —
-      // failures are logged inside postTelemetry.
-      if (telemetry) {
-        await postTelemetry(telemetry, ctx, { log: log.log, fetchImpl: deps.fetchImpl });
+      if (state.passed.length > 0 || Object.keys(state.sub).length > 0) {
+        log.log("state", "resuming from prior run", {
+          passed: state.passed,
+          sub: state.sub,
+        });
       }
-      await postDashboardStatus("done", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
-      await deps.postStatus("done");
-    } catch (err) {
-      log.errlog("review", "opencode failed", { error: String(err?.message ?? err) });
-      // Best-effort dashboard status so the dashboard's live
-      // view shows the run as failed even if the post-pipeline
-      // status PATCH (deps.postStatus) also fails.
-      await postDashboardStatus("failed", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
-      await deps.postStatus("failed", String(err?.message ?? err));
-      throw err;
+      stateInitialized = true;
     }
+    await writeWorkflowState(
+      octokit,
+      ctx,
+      { log: log.log, errlog: log.errlog },
+      { passed: state.passed, sub: state.sub },
+    );
+  };
+
+  try {
+    // The six macro stages: handshake → fetch → sniff → summary
+    // → inlines → cleanup. Each stage reads from `state` (or
+    // ctx) and writes its output to `state`. Throwing aborts the
+    // run; the catch below translates the failure into a
+    // status-comment PATCH + dashboard "failed". The cleanup
+    // stage handles its own skip (first review / no botLogin) and
+    // best-effort error swallow so the orchestrator stays
+    // straightforward.
+    await runStages(ctx, deps, overrides, state, {
+      onStagePassed,
+    });
+
+    // Parse-failed sniff: the summary stage set state.parseFailed
+    // and posted "failed" already. Skip the rest of the lifecycle
+    // (no summary, no inlines, no cleanup of prior artifacts —
+    // we did not post anything, so the prior review is still
+    // current on the PR).
+    if (state.parseFailed) {
+      await postDashboardStatus("failed", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
+      return;
+    }
+
+    // Dashboard data layer: POST final telemetry (token usage
+    // + cost) once the review is fully posted. Best-effort —
+    // failures are logged inside postTelemetry.
+    if (state.review && state.review.telemetry) {
+      await postTelemetry(state.review.telemetry, ctx, { log: log.log, fetchImpl: deps.fetchImpl });
+    }
+    await postDashboardStatus("done", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
+    await deps.postStatus("done");
+  } catch (err) {
+    log.errlog("review", "staged workflow failed", { error: String(err?.message ?? err) });
+    // Best-effort dashboard status so the dashboard's live
+    // view shows the run as failed even if the post-pipeline
+    // status PATCH (deps.postStatus) also fails.
+    await postDashboardStatus("failed", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
+    await deps.postStatus("failed", String(err?.message ?? err));
+    throw err;
   } finally {
     // Always scrub credentials and tmp artefacts, even on failure.
     // Order matters: revoke the netrc / gitconfig before unlinking
@@ -308,11 +269,12 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       prHeadSha: ctx.prHeadSha || "?",
     });
     log.errlog("fatal", "boop runner failed", { error: String(err?.message ?? err) });
-    if (currentOctokit && ctx.statusCommentId) {
+    const fatalOctokit = deps.getOctokit();
+    if (fatalOctokit && ctx.statusCommentId) {
       await postStatus("failed", String(err?.message ?? err), ctx, {
         log: log.log,
         errlog: log.errlog,
-        octokit: currentOctokit,
+        octokit: fatalOctokit,
       });
     }
     process.exit(1);

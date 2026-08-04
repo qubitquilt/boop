@@ -111,6 +111,12 @@ function fakeReview() {
 // before returning the canned review — without that, the postStatus
 // pipeline within the opencode step is never exercised. The
 // cloneRepo stub mirrors that pattern for the "clone" stage.
+//
+// QUB-91 collapsed the retry policy: stageMaxAttempts = 1 means
+// "no retry" so the existing failure tests don't sit on the
+// backoff timer. The QUB-91 unit tests in workflow.test.mjs
+// exercise the retry path explicitly with stageMaxAttempts = 3
+// + a no-op sleep.
 function standardOverrides(extra = {}) {
   return {
     fs: fakeFs(),
@@ -124,6 +130,8 @@ function standardOverrides(extra = {}) {
       kill: () => {},
     }),
     makeOctokit: () => fakeOctokit(),
+    stageMaxAttempts: 1,
+    sleep: async () => {}, // no-op so any retry test doesn't actually wait
     cloneRepo: async (ctx, deps) => {
       await deps.postStatus("clone");
     },
