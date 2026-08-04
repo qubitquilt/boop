@@ -6,5 +6,5 @@ metadata:
 data:
   LOG_LEVEL: "info"
   PORT: "8080"
-  JOB_IMAGE: "ghcr.io/qubitquilt/boop-runner@sha256:0c9db600c9ea5464e2c9b62eb11452f360526b29df310df52857d769c9cc6f75"
+  JOB_IMAGE: "ghcr.io/qubitquilt/boop-runner@sha256:d5431fdc0d747fc37e309a8b43c7d54a87fc928ef73d1b5dcfa0685e4658d35f"
   TARGET_NAMESPACE: "dev-tools"
