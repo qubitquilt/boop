@@ -246,12 +246,25 @@ export function statusStageFor(id) {
 // thrown run (after retries) is "hard" — it propagates to the
 // orchestrator catch.
 //
-// QUB-92: the executor honors state.passed (an array of macro
-// stage ids). A macro stage whose id is in state.passed is
-// skipped (its run is not called, its gate is not called). The
-// orchestrator in index.mjs populates state.passed from the
-// status comment on startup; on each stage pass, it appends
-// the new id to state.passed and writes the state back.
+// QUB-92 + QUB-102: the executor honors state.passed (an array
+// of macro stage ids) read from the status comment by the
+// orchestrator in index.mjs. A macro stage whose id is in
+// state.passed means a prior pod of the same Job already ran
+// it (the comment write fires from onStagePassed after every
+// passing stage). QUB-92 used this as a resume signal (skip
+// and continue); QUB-102 flips it to an abort signal so the
+// current pod cannot post a duplicate summary + inline
+// comments when a sibling pod of the same Job has already
+// done so. With BackoffLimit=0 in the Job spec the K8s
+// controller will not auto-restart pods, so this path is the
+// belt-and-suspenders defense for manual re-triggers / K8s
+// bugs / etc.
+//
+// The abort is "soft" — same shape as a failed gate. We post
+// the failed status with the reason verbatim and set
+// state.parseFailed; the orchestrator in index.mjs short-
+// circuits the lifecycle so no summary, no inlines, and no
+// cleanup stage run on the second pod.
 //
 // options.onStagePassed is an optional callback the executor
 // fires after every stage that passes. The orchestrator uses
@@ -261,10 +274,31 @@ export async function runStages(ctx, deps, overrides, state, options = {}) {
   const onStagePassed = options.onStagePassed || (() => {});
   for (const stage of STAGES) {
     if (state.passed && state.passed.includes(stage.id)) {
-      deps.log("resume", `${stage.id} already passed; skipping`, {
+      // QUB-102: another pod of this Job already passed this
+      // stage. Abort the current run to prevent duplicate
+      // GitHub side effects (summary comment, inline review
+      // threads) — see jobbuilder.go:59 (jobBackoffLimit=0)
+      // for the primary defense.
+      //
+      // The reason lists the full passed set so the operator
+      // sees the prior pod's progress at a glance from the
+      // status timeline. The merge in index.mjs runs after
+      // the per-iteration push, so the array order can shift
+      // (e.g. ["fetch","handshake"] instead of
+      // ["handshake","fetch"]); the items are the same, the
+      // order is cosmetic. The orchestrator reads
+      // state.failureReason and forwards it to the dashboard
+      // so the operator's primary view is not just "failed"
+      // with no context.
+      const reason = `another pod already passed [${state.passed.join(", ")}]; refusing to duplicate the review`;
+      deps.errlog("abort", reason, {
+        stage: stage.id,
         passed: state.passed,
       });
-      continue;
+      state.failureReason = reason;
+      await deps.postStatus("failed", reason);
+      state.parseFailed = true;
+      return state;
     }
     const wasPassed = state.parseFailed;
     await withRetry(stage, ctx, deps, overrides, state);
@@ -426,6 +460,13 @@ async function onGateFailure(stageId, reason, state, deps) {
   deps.log("gate", `${stageId} gate failed`, { reason });
   await deps.postStatus("failed", reason);
   state.parseFailed = true;
+  // Mirror the QUB-102 abort path: stash the reason on
+  // state.failureReason so the orchestrator's parseFailed
+  // branch forwards it to the dashboard. Without this, a
+  // sniff / summary parse failure reaches the dashboard
+  // row as just stage="failed" with no error field, even
+  // though the GitHub comment timeline carries the reason.
+  state.failureReason = reason;
 }
 
 // --- macro-stage gates --------------------------------------------------

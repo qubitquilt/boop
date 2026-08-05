@@ -279,8 +279,14 @@ func TestBuildJob(t *testing.T) {
 	if got := job.Spec.ActiveDeadlineSeconds; got == nil || *got != 1800 {
 		t.Errorf("ActiveDeadlineSeconds = %v, want 1800", got)
 	}
-	if got := job.Spec.BackoffLimit; got == nil || *got != 1 {
-		t.Errorf("BackoffLimit = %v, want 1", got)
+	// QUB-102: BackoffLimit is 0. A pod failure surfaces as a
+	// failed Job instead of auto-restarting with a fresh pod
+	// that would mint a duplicate installation token, PATCH the
+	// status comment, and POST duplicate summary + inline
+	// comments (the receiver's claimJobSlot dedup is keyed on
+	// the first webhook for the head SHA, not the pod index).
+	if got := job.Spec.BackoffLimit; got == nil || *got != 0 {
+		t.Errorf("BackoffLimit = %v, want 0", got)
 	}
 	if got := job.Spec.Template.Spec.RestartPolicy; got != "Never" {
 		t.Errorf("restartPolicy = %q, want Never", got)

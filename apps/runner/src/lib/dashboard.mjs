@@ -26,11 +26,20 @@ const POST_RETRIES = 1;
  * stage (auth/clone/review/done/failed). Best-effort: a 4xx
  * response is logged at warn; a 5xx or network error is retried
  * once after a short backoff, then logged and dropped.
+ *
+ * `reason` is an optional free-form string attached to the
+ * status payload as `error`. QUB-102: the runner's abort path
+ * stashes the abort reason on `state.failureReason` and forwards
+ * it here so the operator's dashboard row distinguishes a
+ * duplicate-pod abort from a sniff-parse failure (both reach
+ * the receiver as stage="failed"; the reason disambiguates).
  */
-export async function postStatus(stage, ctx, deps) {
+export async function postStatus(stage, ctx, deps, reason) {
   if (!ctx.dashboardUrl || !ctx.dashboardToken) return;
   const url = `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(ctx.jobName || jobNameFromCtx(ctx))}/status`;
-  const body = JSON.stringify({ stage });
+  const payload = { stage };
+  if (reason) payload.error = reason;
+  const body = JSON.stringify(payload);
   await postWithRetry(url, body, ctx.dashboardToken, deps);
 }
 
