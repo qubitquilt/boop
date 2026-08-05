@@ -56,7 +56,14 @@ function fakeFs() {
 }
 
 function fakeOctokit(handlers = {}) {
-  const calls = { createComment: [], updateComment: [], getComment: [], createReviewComment: [] };
+  const calls = {
+    createComment: [],
+    updateComment: [],
+    getComment: [],
+    listComments: [],
+    createReviewComment: [],
+    listReviewComments: [],
+  };
   return {
     calls,
     rest: {
@@ -76,12 +83,32 @@ function fakeOctokit(handlers = {}) {
           if (handlers.getComment) return handlers.getComment(args);
           return { data: { body: "header\n<!-- boop-timeline -->\n" } };
         },
+        // QUB-103: postReview's dedup lists existing issue
+        // comments to look for a matching summary. The default
+        // returns an empty page (no prior summary), so postReview
+        // always takes the create path. Tests that want the
+        // PATCH path override via `handlers.listComments`.
+        listComments: async (args) => {
+          calls.listComments.push(args);
+          if (handlers.listComments) return handlers.listComments(args);
+          return { data: [] };
+        },
       },
       pulls: {
         createReviewComment: async (args) => {
           calls.createReviewComment.push(args);
           if (handlers.createReviewComment) return handlers.createReviewComment(args);
           return { data: { id: 1 } };
+        },
+        // QUB-103: postInlineComments's dedup lists existing PR
+        // review comments to look for inline-key markers. The
+        // default returns an empty page (no prior inlines), so
+        // every candidate posts. Tests that want the skip path
+        // override via `handlers.listReviewComments`.
+        listReviewComments: async (args) => {
+          calls.listReviewComments.push(args);
+          if (handlers.listReviewComments) return handlers.listReviewComments(args);
+          return { data: [] };
         },
       },
     },
@@ -514,13 +541,28 @@ test("run: parse failure on first review also skips the post (no cleanup either 
 // workflow-state marker ("<!-- boop-state: ... -->"), so
 // the runner's readWorkflowState sees the prior pod's
 // progress and the abort path fires.
-function statefulOctokit({ seedPassed } = {}) {
+//
+// QUB-103 additions: the fixture tracks a separate collection
+// of issue comments and PR review comments (in addition to the
+// status comment) so postReview's listComments dedup path and
+// postInlineComments's listReviewComments dedup path can be
+// exercised against pre-seeded artifacts. `seedIssueComments`
+// and `seedReviewComments` simulate pod 1's successful posts
+// before pod 1 died (so pod 2 dedups against them).
+function statefulOctokit({
+  seedPassed,
+  seedIssueComments = [],
+  seedReviewComments = [],
+} = {}) {
   const calls = {
     createComment: [],
     updateComment: [],
     getComment: [],
+    listComments: [],
     createReviewComment: [],
+    listReviewComments: [],
   };
+  const STATUS_COMMENT_ID = 111;
   let body =
     "🐾 **Boop's on the case!**\n\n<!-- boop-timeline -->\n";
   // Seed the comment body with a QUB-92 state line so the
@@ -534,28 +576,58 @@ function statefulOctokit({ seedPassed } = {}) {
     })} -->`;
     body = body + stateLine + "\n";
   }
+  // Issue comments and review comments are mutable lists.
+  // The QUB-103 integration tests pre-seed these to
+  // simulate pod 1's already-posted artifacts.
+  const issueComments = seedIssueComments.map((c) => ({ ...c }));
+  const reviewComments = seedReviewComments.map((c) => ({ ...c }));
   const octokit = {
     calls,
     rest: {
       issues: {
         createComment: async (args) => {
           calls.createComment.push(args);
-          return { data: { id: 1001, body: args.body } };
+          const newId = 1000 + issueComments.length;
+          issueComments.push({ id: newId, body: args.body });
+          return { data: { id: newId, body: args.body } };
         },
         updateComment: async (args) => {
           calls.updateComment.push(args);
-          body = args.body;
-          return { data: { id: 111, body: args.body } };
+          if (args.comment_id === STATUS_COMMENT_ID) {
+            body = args.body;
+          } else {
+            const idx = issueComments.findIndex(
+              (c) => c.id === args.comment_id,
+            );
+            if (idx >= 0) {
+              issueComments[idx] = { ...issueComments[idx], body: args.body };
+            }
+          }
+          return { data: { id: args.comment_id, body: args.body } };
         },
-        getComment: async () => {
-          calls.getComment.push({});
-          return { data: { body } };
+        getComment: async (args) => {
+          calls.getComment.push(args || {});
+          if (args && args.comment_id === STATUS_COMMENT_ID) {
+            return { data: { body } };
+          }
+          const c = issueComments.find((c) => c.id === args?.comment_id);
+          return { data: { body: c?.body || "" } };
+        },
+        listComments: async (args) => {
+          calls.listComments.push(args);
+          return { data: issueComments };
         },
       },
       pulls: {
         createReviewComment: async (args) => {
           calls.createReviewComment.push(args);
-          return { data: { id: 1 } };
+          const newId = 2000 + reviewComments.length;
+          reviewComments.push({ id: newId, body: args.body });
+          return { data: { id: newId } };
+        },
+        listReviewComments: async (args) => {
+          calls.listReviewComments.push(args);
+          return { data: reviewComments };
         },
       },
     },
@@ -737,6 +809,223 @@ test("run: pod-1-posted-summary + pod-2-starts -> no duplicate posts (QUB-102)",
     .find((c) => /chased tail/.test(c.body));
   assert.ok(lastFailed, "expected a 'chased tail' status post on pod 2");
   assert.ok(lastFailed.body.includes("summary"));
+});
+
+// --- QUB-103 integration tests ----------------------------------------
+//
+// The QUB-92 workflow-state write is fire-and-forget. A 502 on
+// the PATCH leaves the in-memory `state.passed` ahead of the
+// comment's `boop-state` marker. Pod 1 can still post the
+// summary + inline threads (those side effects are independent
+// of the state PATCH) before dying. Pod 2 then reads stale (or
+// empty) state and would re-run summary + inlines without the
+// QUB-103 dedup machinery. These tests cover both halves:
+//
+//   - The headline scenario: every writeWorkflowState PATCH
+//     failed (state.passed stays empty), pod 1 still posted
+//     summary + inlines, pod 2 dedups via the comment markers.
+//   - The partial-inlines scenario: pod 1's Promise.allSettled
+//     posted N-1 of N inlines, pod 2 dedups and posts only the
+//     missing one.
+//
+// QUB-102's abort guard is a separate defense (it fires when
+// state.passed is non-empty); these tests cover the OTHER
+// failure mode where the abort cannot fire because state.passed
+// is empty.
+
+test("run: state-PATCH-502 + pod-2-starts -> no duplicate posts (QUB-103)", async () => {
+  // The headline QUB-103 scenario from the issue. Pod 1's
+  // every writeWorkflowState PATCH returned 502 — the
+  // comment's boop-state marker stays at the seed
+  // (passed=[]). Pod 1 still ran summary + inlines
+  // successfully (the side effects are independent of the
+  // state PATCH). Pod 1 died (OOM, node kill, deadline)
+  // before the orchestrator's catch could run.
+  //
+  // Pod 2: reads state.passed = [] → runStages runs every
+  // stage (no QUB-102 abort — the abort only fires on
+  // state.passed non-empty). QUB-103's side-effect dedup is
+  // the ONLY defense. postReview finds pod 1's summary via
+  // the head-SHA marker fallback (different reviewIds across
+  // pods because each run generates its own UUID) and
+  // PATCHes it. postInlineComments finds pod 1's inline
+  // thread via the inline-key marker and skips it.
+  //
+  // Headline assertion: zero new comments on the PR after
+  // pod 2 ran.
+  const { createHash } = await import("node:crypto");
+  const inlineKeyFoo = createHash("sha256")
+    .update("nit on naming")
+    .digest("hex")
+    .slice(0, 16);
+  const octokit = statefulOctokit({
+    // All pod 1 state writes failed → marker stays empty.
+    seedPassed: [],
+    // Pod 1 successfully posted the summary before dying.
+    seedIssueComments: [
+      {
+        id: 42,
+        body:
+          "## 🐾 Boop's review\n\n✅ **Confidence: high** — ready to merge.\n\n" +
+          "## TL;DR\nLooks good.\n\n" +
+          "<sub>Posted by [BoopPr](https://github.com/qubitquilt/boop) · PR `0123456` · good boy powered</sub>\n" +
+          "<!-- boop-head-sha: 0123456789abcdef0123456789abcdef01234567 -->\n",
+      },
+    ],
+    // Pod 1 successfully posted the inline before dying.
+    seedReviewComments: [
+      {
+        id: 100,
+        body: `nit on naming\n\n<!-- boop-inline: src/foo.ts:10:${inlineKeyFoo} -->\n`,
+        path: "src/foo.ts",
+        line: 10,
+      },
+    ],
+  });
+  const overrides = standardOverrides({
+    makeOctokit: () => octokit,
+    runOpenCodeSkill: async () => fakeReview(),
+  });
+  await run(env, overrides);
+  // Headline: zero new summary comments (pod 1's was PATCHed).
+  assert.equal(
+    octokit.calls.createComment.length,
+    0,
+    "expected zero new summary comments (pod 1's summary was PATCHed via head-SHA dedup)",
+  );
+  // Zero new inline threads (pod 1's was deduped via inline-key).
+  assert.equal(
+    octokit.calls.createReviewComment.length,
+    0,
+    "expected zero new inline threads (pod 1's thread was deduped via inline-key marker)",
+  );
+  // Pod 1's summary (id=42) was PATCHed. The existing issue
+  // comment is the dedup target; pod 2 must NOT have created
+  // a fresh comment.
+  const patchedSummary = octokit.calls.updateComment.find(
+    (c) => c.comment_id === 42,
+  );
+  assert.ok(
+    patchedSummary,
+    "expected pod 2 to PATCH the existing summary comment (id=42)",
+  );
+  // The PATCH carries both markers (head-SHA + pod 2's
+  // fresh review-id). The dedup matched via head-SHA (the
+  // reviewIds differ across pods), but the body the runner
+  // writes carries both. The receiver's priorReviewHeadSHARegex
+  // still parses the head-SHA marker.
+  assert.match(
+    patchedSummary.body,
+    /<!-- boop-head-sha: 0123456789abcdef0123456789abcdef01234567 -->/,
+    "patched summary must carry the head-SHA marker (receiver-side regex still parses it)",
+  );
+  assert.match(
+    patchedSummary.body,
+    /<!-- boop-review-id: [0-9a-f-]{36} -->/,
+    "patched summary must carry pod 2's per-run review-id marker",
+  );
+  // The state.passed in the boop-state marker grew to the
+  // full set (pod 2 ran every stage — no abort because
+  // state.passed was empty). The state-pinned tests in
+  // workflow.test.mjs cover the full passed shape; here
+  // we just assert the state line is present and now
+  // non-empty.
+  const lastStateUpdate = [...octokit.calls.updateComment]
+    .reverse()
+    .find((c) => /boop-state:/.test(c.body));
+  assert.ok(
+    lastStateUpdate,
+    "expected pod 2 to PATCH the state at least once",
+  );
+  assert.match(
+    lastStateUpdate.body,
+    /"passed":\["handshake","fetch","sniff","summary","inlines","cleanup"\]/,
+    "expected pod 2's final state.passed to contain every stage (no abort)",
+  );
+});
+
+test("run: partial-inlines-mid-pod-1-kill + pod-2-starts -> only missing inlines land (QUB-103)", async () => {
+  // Issue scenario 3: pod 1's postInlineComments Promise.allSettled
+  // posted N-1 of N inline threads before the pod died. Pod 2
+  // must post only the missing one. The dedup is per-inline via
+  // the inline-key marker; the runner's own promise-scheduling
+  // cannot accidentally re-post a successful inline.
+  //
+  // To exercise this with the canned fakeReview (one inline
+  // comment), we swap the override for a runOpenCodeSkill that
+  // returns multiple inlines. Two of three match seeded
+  // review comments; the third is fresh.
+  const { createHash } = await import("node:crypto");
+  const hashA = createHash("sha256").update("finding A").digest("hex").slice(0, 16);
+  const hashB = createHash("sha256").update("finding B").digest("hex").slice(0, 16);
+  const inlineKeys = new Set([hashA, hashB]);
+  const octokit = statefulOctokit({
+    seedPassed: [],  // simulate "all state writes failed"
+    // Pod 1 posted the first two inlines before dying.
+    seedReviewComments: [
+      {
+        id: 200,
+        body: `finding A\n\n<!-- boop-inline: src/a.ts:1:${hashA} -->\n`,
+        path: "src/a.ts",
+        line: 1,
+      },
+      {
+        id: 201,
+        body: `finding B\n\n<!-- boop-inline: src/b.ts:2:${hashB} -->\n`,
+        path: "src/b.ts",
+        line: 2,
+      },
+    ],
+  });
+  const overrides = standardOverrides({
+    makeOctokit: () => octokit,
+    runOpenCodeSkill: async () => ({
+      summary: "## TL;DR\nMulti-inline review.",
+      // Three inlines: two duplicate pod 1's, one fresh.
+      inlineComments: [
+        { path: "src/a.ts", line: 1, body: "finding A" },
+        { path: "src/b.ts", line: 2, body: "finding B" },
+        { path: "src/c.ts", line: 3, body: "finding C (fresh)" },
+      ],
+      confidence: "high",
+    }),
+  });
+  await run(env, overrides);
+  // Headline: only the missing inline lands. The two
+  // duplicates were skipped (pod 1's seeded comments stay
+  // alone on the PR — pod 2 didn't post on top).
+  assert.equal(
+    octokit.calls.createReviewComment.length,
+    1,
+    "expected exactly one new inline thread (the missing one)",
+  );
+  assert.equal(
+    octokit.calls.createReviewComment[0].path,
+    "src/c.ts",
+    "expected the new inline to be the one not in pod 1's seed",
+  );
+  // Sanity: every newly-posted inline has the inline-key
+  // marker (so the dedup is forward-compatible with a third
+  // pod).
+  assert.match(
+    octokit.calls.createReviewComment[0].body,
+    /<!-- boop-inline: src\/c\.ts:3:[0-9a-f]{16} -->/,
+    "the fresh inline must carry its inline-key marker",
+  );
+  // Sanity: the two seeded inlines were still skipped (i.e.,
+  // pod 2 didn't double-post them). Without the dedup, pod 2
+  // would have posted all three.
+  const allPostedKeys = octokit.calls.createReviewComment
+    .map((c) => c.body.match(/<!-- boop-inline: ([^ ]+) -->/)?.[1])
+    .filter(Boolean);
+  for (const key of inlineKeys) {
+    const keyPrefix = key.slice(0, 6);
+    const matched = allPostedKeys.some((k) => k && k.includes(keyPrefix));
+    assert.ok(
+      !matched,
+      `expected no newly-posted inline to match the skipped seed key ${key}`,
+    );
+  }
 });
 
 // --- module surface -----------------------------------------------------

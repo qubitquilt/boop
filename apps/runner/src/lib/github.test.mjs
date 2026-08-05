@@ -12,6 +12,10 @@ import {
   renderInitialStatusBody,
   readWorkflowState,
   writeWorkflowState,
+  inlineKeyForComment,
+  appendInlineKeyMarker,
+  parseInlineKey,
+  listExistingInlineKeys,
 } from "./github.mjs";
 
 const ctx = {
@@ -25,6 +29,7 @@ const ctx = {
   reactionCommentId: 200,
   reviewNumber: 1,
   botLogin: "booppr[bot]",
+  reviewId: "test-review-uuid",
 };
 
 // --- helpers ------------------------------------------------------------
@@ -45,11 +50,19 @@ function makeFakeOctokit(handlers = {}) {
         calls.push({ createComment: args });
         return (handlers.createComment || (async () => ({ data: { id: 555 } })))(args);
       },
+      listComments: async (args) => {
+        calls.push({ listComments: args });
+        return (handlers.listComments || (async () => ({ data: [] })))(args);
+      },
     },
     pulls: {
       createReviewComment: async (args) => {
         calls.push({ createReviewComment: args });
         return (handlers.createReviewComment || (async () => ({ data: {} })))(args);
+      },
+      listReviewComments: async (args) => {
+        calls.push({ listReviewComments: args });
+        return (handlers.listReviewComments || (async () => ({ data: [] })))(args);
       },
     },
   };
@@ -259,6 +272,186 @@ test("postReview head marker contract (matches receiver regex)", () => {
   assert.equal(marker.replace(/<!--\s*boop-head-sha:\s*([0-9a-f]{7,40})\s*-->/, "$1"), sha);
 });
 
+// --- postReview QUB-103 idempotency ------------------------------------
+
+test("postReview carries the per-run review-id marker (QUB-103)", async () => {
+  // QUB-103: every summary comment embeds a per-run UUID the
+  // runner generated at run() start. The marker lets postReview
+  // find the existing summary on retry and PATCH it instead of
+  // double-posting. The marker is hidden HTML (renders as nothing
+  // in the markdown view) and survives the GitHub API verbatim.
+  let captured;
+  const octokit = makeFakeOctokit({
+    createComment: async (args) => { captured = args; return { data: {} }; },
+  });
+  await postReview(octokit, "body", 1, "high", ctx);
+  assert.match(
+    captured.body,
+    /<!-- boop-review-id: test-review-uuid -->/,
+    "summary body must carry the per-run review-id marker",
+  );
+});
+
+test("postReview PATCHes existing summary when matching review-id is found (QUB-103)", async () => {
+  // Headline QUB-103 dedup path: a prior run (or a sibling pod)
+  // posted a summary with this run's review-id marker. The next
+  // call must PATCH it in place, not create a second comment.
+  // Without this, a pod kill mid-run would produce duplicate
+  // summary comments on the PR.
+  let updatedCommentId;
+  let createCalls = 0;
+  const octokit = makeFakeOctokit({
+    listComments: async () => ({
+      data: [
+        // Older, unrelated summary (different review id) — not a
+        // match.
+        { id: 900, body: "old summary\n<!-- boop-review-id: other-run -->\n<!-- boop-head-sha: aaaa -->\n" },
+        // The current run's prior summary — match by review-id.
+        { id: 123, body: "prior summary\n<!-- boop-review-id: test-review-uuid -->\n<!-- boop-head-sha: 0123456789abcdef0123456789abcdef01234567 -->\n" },
+      ],
+    }),
+    updateComment: async (args) => {
+      updatedCommentId = args.comment_id;
+      return { data: {} };
+    },
+    createComment: async () => { createCalls++; return { data: { id: 999 } }; },
+  });
+  const log = recordingLogger();
+  await postReview(octokit, "new summary body", 1, "high", ctx, log);
+  assert.equal(updatedCommentId, 123, "must PATCH the matching comment, not create a new one");
+  assert.equal(createCalls, 0, "no createComment call when a match exists");
+  assert.ok(
+    log.out.some((l) => /patched existing summary comment/.test(l.msg)),
+    "expected a 'patched' log entry",
+  );
+});
+
+test("postReview falls back to head-SHA match when no review-id match (QUB-103 / pre-QUB-103 summaries)", async () => {
+  // Pre-QUB-103 summaries don't carry the review-id marker. The
+  // dedup must still work via the head-SHA marker so an upgrade
+  // from an older runner doesn't suddenly start posting
+  // duplicates. The match is the most recent (last in the
+  // chronological list) comment whose body contains the head
+  // SHA — not just any matching comment.
+  let updatedCommentId;
+  const octokit = makeFakeOctokit({
+    listComments: async () => ({
+      data: [
+        { id: 800, body: "old\n<!-- boop-head-sha: aaaa1111 -->\n" },
+        // Match by head-SHA only (older form, no review-id).
+        { id: 456, body: "older summary\n<!-- boop-head-sha: 0123456789abcdef0123456789abcdef01234567 -->\n" },
+      ],
+    }),
+    updateComment: async (args) => {
+      updatedCommentId = args.comment_id;
+      return { data: {} };
+    },
+    createComment: async () => { throw new Error("must not create when head-SHA match exists"); },
+  });
+  await postReview(octokit, "body", 1, "high", ctx);
+  assert.equal(updatedCommentId, 456, "must PATCH the head-SHA-matched comment");
+});
+
+test("postReview picks the most recent match across pagination (QUB-103)", async () => {
+  // GitHub returns comments oldest-first. A duplicated
+  // (head-SHA-matching) summary on an earlier page should NOT
+  // win over a newer one on a later page. The dedup walks the
+  // whole pagination and returns the highest index. Without
+  // this, a partially-completed retry could PATCH the older
+  // duplicate and leave the newer one stale.
+  let updatedCommentId;
+  const octokit = makeFakeOctokit({
+    listComments: async (args) => {
+      if (args.page === 1) {
+        // First page is full (100 items, signals more pages).
+        // The match on this page is older (id 111).
+        const filler = Array.from({ length: 99 }, (_, i) => ({
+          id: 1000 + i,
+          body: "filler\n",
+        }));
+        return {
+          data: [
+            { id: 111, body: "older\n<!-- boop-head-sha: 0123456789abcdef0123456789abcdef01234567 -->\n" },
+            ...filler,
+          ],
+        };
+      }
+      // Page 2 — fewer items (last page). The match here is
+      // newer (id 222); the dedup must pick it.
+      return {
+        data: [
+          { id: 222, body: "newer\n<!-- boop-head-sha: 0123456789abcdef0123456789abcdef01234567 -->\n" },
+        ],
+      };
+    },
+    updateComment: async (args) => {
+      updatedCommentId = args.comment_id;
+      return { data: {} };
+    },
+    createComment: async () => { throw new Error("must not create when match exists"); },
+  });
+  await postReview(octokit, "body", 1, "high", ctx);
+  assert.equal(updatedCommentId, 222, "must PATCH the most recent match");
+});
+
+test("postReview creates a fresh summary when no existing marker matches (QUB-103)", async () => {
+  // No prior comment carries the review-id or head-SHA marker.
+  // The runner posts a fresh comment. This is the first-run
+  // happy path; the test pins that the dedup machinery doesn't
+  // accidentally skip the create.
+  let createCalls = 0;
+  let updateCalls = 0;
+  const octokit = makeFakeOctokit({
+    listComments: async () => ({
+      data: [
+        // Different head SHA — not a match.
+        { id: 999, body: "prior run on a different commit\n<!-- boop-head-sha: deadbeef00000000 -->\n" },
+      ],
+    }),
+    createComment: async () => { createCalls++; return { data: { id: 555 } }; },
+    updateComment: async () => { updateCalls++; return { data: {} }; },
+  });
+  const log = recordingLogger();
+  await postReview(octokit, "body", 1, "high", ctx, log);
+  assert.equal(createCalls, 1, "must createComment when no match exists");
+  assert.equal(updateCalls, 0, "must not updateComment when no match exists");
+  assert.ok(log.out.some((l) => /created summary comment/.test(l.msg)));
+});
+
+test("postReview falls back to a fresh POST when the listing throws 502 (QUB-103)", async () => {
+  // The dedup is best-effort. A 502 on listComments cannot cost
+  // the run — postReview swallows the listing error and posts
+  // fresh. Worst case is a duplicate summary (caught by the
+  // workflow-state abort path on the next pod).
+  let createCalls = 0;
+  const octokit = makeFakeOctokit({
+    listComments: async () => { throw new Error("502 Bad Gateway"); },
+    createComment: async () => { createCalls++; return { data: { id: 555 } }; },
+  });
+  const log = recordingLogger();
+  await postReview(octokit, "body", 1, "high", ctx, log);
+  assert.equal(createCalls, 1, "must fall back to createComment when list fails");
+  assert.ok(
+    log.out.some((l) => /list existing summary comments failed/.test(l.msg)),
+    "expected a 'list failed' log entry",
+  );
+});
+
+test("postReview head marker is preserved alongside the review-id marker (QUB-103)", async () => {
+  // Both markers must land in the comment body. The receiver's
+  // priorReviewHeadSHARegex still parses the head SHA; the
+  // review-id marker is additive, not a replacement. Removing
+  // the head-SHA marker would silently break the receiver's
+  // re-review diffing (priorReviewHeadSHARegex depends on it).
+  let captured;
+  const octokit = makeFakeOctokit({
+    createComment: async (args) => { captured = args; return { data: {} }; },
+  });
+  await postReview(octokit, "body", 1, "high", ctx);
+  assert.match(captured.body, /<!-- boop-head-sha: 0123456789abcdef0123456789abcdef01234567 -->/);
+  assert.match(captured.body, /<!-- boop-review-id: test-review-uuid -->/);
+});
+
 // --- postInlineComments ------------------------------------------------
 
 test("postInlineComments posts each comment in parallel", async () => {
@@ -319,6 +512,465 @@ test("postInlineComments does nothing on empty list", async () => {
   await postInlineComments(octokit, [], ctx, log);
   assert.equal(log.out.filter((l) => /inline/.test(l.msg)).length, 0);
 });
+
+// --- postInlineComments QUB-103 idempotency -----------------------------
+
+test("postInlineComments appends the inline-key marker to every body (QUB-103)", async () => {
+  // Each posted body must carry the deterministic
+  // `<!-- boop-inline: <path>:<line>:<hash> -->` marker. The
+  // marker survives the GitHub API verbatim; on a retry the
+  // runner reads the existing review comments' markers to
+  // detect duplicates. Without the marker on every body, a
+  // re-run cannot tell a posted comment from a candidate.
+  const postedBodies = [];
+  const octokit = makeFakeOctokit({
+    createReviewComment: async (args) => {
+      postedBodies.push({ path: args.path, line: args.line, body: args.body });
+      return { data: {} };
+    },
+  });
+  await postInlineComments(
+    octokit,
+    [
+      { path: "a.ts", line: 1, body: "alpha" },
+      { path: "b.ts", line: 2, body: "beta" },
+    ],
+    ctx,
+    recordingLogger(),
+  );
+  for (const p of postedBodies) {
+    assert.match(
+      p.body,
+      new RegExp(`<!-- boop-inline: ${p.path}:${p.line}:[0-9a-f]{16} -->`),
+      `body for ${p.path}:${p.line} must carry the inline-key marker`,
+    );
+  }
+});
+
+test("postInlineComments skips posting when a candidate key already exists (QUB-103)", async () => {
+  // Headline QUB-103 dedup path: a prior run (or sibling pod)
+  // already posted a comment whose body carries the
+  // `<!-- boop-inline: ... -->` marker for one of the
+  // candidates. The next call must NOT post a duplicate. The
+  // dedup is by (path, line, body-hash) — a comment at a
+  // different body content posts normally.
+  const posted = [];
+  const octokit = makeFakeOctokit({
+    listReviewComments: async () => {
+      // Compute the same key the runner would compute for the
+      // candidate `a.ts:1:"alpha"` body, and seed it into the
+      // existing set. The other two candidates (`b.ts:2:"beta"`
+      // and `c.ts:3:"gamma"`) are not in the existing set.
+      const hashAlpha = await shaShort("alpha");
+      return {
+        data: [
+          { id: 100, body: `old\n<!-- boop-inline: a.ts:1:${hashAlpha} -->\n` },
+        ],
+      };
+    },
+    createReviewComment: async (args) => {
+      posted.push({ path: args.path, line: args.line });
+      return { data: {} };
+    },
+  });
+  const log = recordingLogger();
+  await postInlineComments(
+    octokit,
+    [
+      { path: "a.ts", line: 1, body: "alpha" },
+      { path: "b.ts", line: 2, body: "beta" },
+      { path: "c.ts", line: 3, body: "gamma" },
+    ],
+    ctx,
+    log,
+  );
+  // Only the two non-duplicate candidates were posted.
+  assert.deepEqual(posted.map((p) => p.path).sort(), ["b.ts", "c.ts"]);
+  // The log mentions the skip count.
+  assert.ok(
+    log.out.some((l) => /skipped 1\/3 inline comments \(already posted\)/.test(l.msg)),
+    "expected a skip-count log entry",
+  );
+  assert.ok(
+    log.out.some((l) => /posted 2\/3 inline comments \(1 skipped as duplicates\)/.test(l.msg)),
+    "expected the summary log to include the duplicate count",
+  );
+});
+
+test("postInlineComments posts all when no existing keys match (QUB-103)", async () => {
+  // No existing review comments on the PR. Every candidate
+  // posts. Pins the happy path: the dedup machinery doesn't
+  // accidentally skip everything.
+  const posted = [];
+  const octokit = makeFakeOctokit({
+    listReviewComments: async () => ({ data: [] }),
+    createReviewComment: async (args) => {
+      posted.push({ path: args.path });
+      return { data: {} };
+    },
+  });
+  const log = recordingLogger();
+  await postInlineComments(
+    octokit,
+    [
+      { path: "a.ts", line: 1, body: "x" },
+      { path: "b.ts", line: 2, body: "y" },
+    ],
+    ctx,
+    log,
+  );
+  assert.equal(posted.length, 2);
+  assert.ok(log.out.some((l) => /posted 2\/2 inline comments/.test(l.msg)));
+  // No skip line on the all-fresh path.
+  assert.ok(
+    !log.out.some((l) => /skipped/.test(l.msg)),
+    "no 'skipped' log on the all-fresh path",
+  );
+});
+
+test("postInlineComments falls back to posting all when the listing throws 502 (QUB-103)", async () => {
+  // The dedup is best-effort. A 502 on listReviewComments
+  // cannot cost the run — the runner logs and posts every
+  // candidate. Worst case is duplicate inline threads (the
+  // receiver's CountPriorReviews / operator cleanup catches
+  // them).
+  const posted = [];
+  const octokit = makeFakeOctokit({
+    listReviewComments: async () => { throw new Error("502 Bad Gateway"); },
+    createReviewComment: async (args) => {
+      posted.push({ path: args.path });
+      return { data: {} };
+    },
+  });
+  const log = recordingLogger();
+  await postInlineComments(
+    octokit,
+    [
+      { path: "a.ts", line: 1, body: "x" },
+      { path: "b.ts", line: 2, body: "y" },
+    ],
+    ctx,
+    log,
+  );
+  assert.equal(posted.length, 2, "must post all candidates when list fails");
+  assert.ok(
+    log.out.some((l) => /list existing inline comments failed; proceeding without dedup/.test(l.msg)),
+    "expected a 'list failed' log entry",
+  );
+});
+
+test("postInlineComments treats distinct body content at the same line as distinct keys (QUB-103)", async () => {
+  // The key includes a hash of the body, so two distinct
+  // findings at the same (path, line) — e.g. security + style
+  // — dedupe separately. Without the body hash, the runner
+  // would treat them as the same comment and silently drop
+  // the second.
+  const posted = [];
+  const octokit = makeFakeOctokit({
+    listReviewComments: async () => {
+      const hashA = await shaShort("finding A");
+      return {
+        data: [{ id: 100, body: `old\n<!-- boop-inline: a.ts:1:${hashA} -->\n` }],
+      };
+    },
+    createReviewComment: async (args) => {
+      posted.push(args.body);
+      return { data: {} };
+    },
+  });
+  await postInlineComments(
+    octokit,
+    [
+      // Same path:line, different body — should NOT be skipped.
+      { path: "a.ts", line: 1, body: "finding B (distinct content)" },
+    ],
+    ctx,
+    recordingLogger(),
+  );
+  assert.equal(posted.length, 1, "distinct body content at the same line still posts");
+  // The body hash is different from the existing one.
+  assert.ok(/finding B/.test(posted[0]));
+});
+
+// --- direct unit tests for the QUB-103 helpers ------------------------
+//
+// These pin the inline-key shape and the marker format. They
+// ride on the now-exported helpers in github.mjs so a future
+// change to the hash algorithm, separator, or marker prefix
+// surfaces here rather than only as a downstream dedup miss
+// (which is invisible until a retry actually fires).
+
+test("inlineKeyForComment produces a deterministic <path>:<line>:<hash> key", () => {
+  // The shape is part of the dedup contract — a future
+  // change to the separator or hash length would silently
+  // change which inline comments dedupe together. The regex
+  // pins the visible structure.
+  const k = inlineKeyForComment({ path: "src/a.ts", line: 10, body: "alpha" });
+  assert.match(k, /^src\/a\.ts:10:[0-9a-f]{16}$/);
+  // Determinism: same input -> same key. The runner relies
+  // on this for the dedup to work across pod retries.
+  const k2 = inlineKeyForComment({ path: "src/a.ts", line: 10, body: "alpha" });
+  assert.equal(k, k2);
+});
+
+test("inlineKeyForComment distinguishes body content at the same (path, line)", () => {
+  // Two findings at the same (path, line) with different
+  // bodies (e.g. security + style) must yield distinct
+  // keys. The body hash captures the content; the (path,
+  // line) prefix alone is not enough.
+  const a = inlineKeyForComment({ path: "src/a.ts", line: 1, body: "finding A" });
+  const b = inlineKeyForComment({ path: "src/a.ts", line: 1, body: "finding B" });
+  assert.notEqual(a, b, "distinct body content must yield distinct keys");
+});
+
+test("inlineKeyForComment distinguishes (path, line) at the same body content", () => {
+  // Same body content at different (path, line) tuples
+  // must yield distinct keys. The dedup is per-tuple, not
+  // per-body alone.
+  const a = inlineKeyForComment({ path: "src/a.ts", line: 1, body: "finding" });
+  const b = inlineKeyForComment({ path: "src/b.ts", line: 1, body: "finding" });
+  assert.notEqual(a, b, "distinct (path, line) must yield distinct keys");
+});
+
+test("inlineKeyForComment handles missing/empty body content safely", () => {
+  // Defensive: a malformed `c.body` (undefined, null, "")
+  // must not crash the helper. The runner receives
+  // `{ path, line, body }` shapes from the narrator; a
+  // future change there shouldn't be able to break the
+  // dedup helper. The expected output collapses to
+  // `<path>:<line>:<hash-of-empty>` so a synthetic
+  // candidate with no body still gets a deterministic key.
+  const k1 = inlineKeyForComment({ path: "x.ts", line: 1 });
+  const k2 = inlineKeyForComment({ path: "x.ts", line: 1, body: "" });
+  const k3 = inlineKeyForComment({ path: "x.ts", line: 1, body: null });
+  assert.equal(k1, k2);
+  assert.equal(k2, k3);
+  assert.match(k1, /^x\.ts:1:[0-9a-f]{16}$/);
+});
+
+test("appendInlineKeyMarker appends the marker with a single newline separator (no trailing-newline body)", () => {
+  // Body without trailing newline: separator is two newlines
+  // so the marker reads as its own paragraph in the rendered
+  // markdown. The marker survives the API as HTML comments.
+  const out = appendInlineKeyMarker("review body", "src/a.ts:1:abc123");
+  assert.equal(out, "review body\n\n<!-- boop-inline: src/a.ts:1:abc123 -->");
+});
+
+test("appendInlineKeyMarker collapses the separator to one newline when the body already ends with a newline", () => {
+  // Body with trailing newline: the separator picks \n (not
+  // \n\n) so the result is two newlines between content and
+  // marker (one from the body, one from the separator). The
+  // marker reads as its own paragraph in the rendered
+  // markdown without piling up blank lines.
+  const out = appendInlineKeyMarker("review body\n", "src/a.ts:1:abc123");
+  assert.equal(out, "review body\n\n<!-- boop-inline: src/a.ts:1:abc123 -->");
+});
+
+test("appendInlineKeyMarker handles empty and null bodies", () => {
+  // Empty body: same shape as the no-trailing-newline path
+  // (an empty string doesn't end with a newline, so the
+  // separator is \n\n). The marker still parses back via
+  // parseInlineKey.
+  const out1 = appendInlineKeyMarker("", "src/a.ts:1:abc123");
+  assert.equal(out1, "\n\n<!-- boop-inline: src/a.ts:1:abc123 -->");
+  // null body: same path (coerced to "" via ??).
+  const out2 = appendInlineKeyMarker(null, "src/a.ts:1:abc123");
+  assert.equal(out2, "\n\n<!-- boop-inline: src/a.ts:1:abc123 -->");
+});
+
+test("parseInlineKey extracts the inline key from a marked body", () => {
+  // The happy path. The runner calls this on every review
+  // comment when computing the existing-keys set for dedup;
+  // a parse failure here would silently let duplicates slip
+  // through.
+  const body = "review body\n\n<!-- boop-inline: src/a.ts:10:abc123def4567890 -->\n";
+  assert.equal(parseInlineKey(body), "src/a.ts:10:abc123def4567890");
+});
+
+test("parseInlineKey uses lastIndexOf to handle bodies that contain the literal marker text", () => {
+  // A review body can legitimately contain the literal
+  // `<!-- boop-inline:` text (e.g. quoting docs, JSON
+  // samples). The runner takes the *trailing* marker — the
+  // one this run appended — so the parse key matches the
+  // key the runner just generated. Without lastIndexOf, an
+  // earlier literal would win and the dedup would be wrong.
+  const body =
+    "review body\n\n" +
+    "Note: see `<!-- boop-inline: doc-example -->` in docs.\n\n" +
+    "<!-- boop-inline: src/a.ts:10:abc123def4567890 -->\n";
+  assert.equal(
+    parseInlineKey(body),
+    "src/a.ts:10:abc123def4567890",
+    "expected the trailing marker, not the literal-quoted earlier one",
+  );
+});
+
+test("parseInlineKey returns null on missing / empty / malformed bodies", () => {
+  // No marker at all -> null (the dedup treats absent as
+  // not-present, not as a parse error). Empty / null bodies
+  // are short-circuit null returns. A body with the open
+  // marker but no close -> null (a half-written marker
+  // should not be mistaken for a real one).
+  assert.equal(parseInlineKey(null), null);
+  assert.equal(parseInlineKey(""), null);
+  assert.equal(parseInlineKey("plain body, no marker"), null);
+  assert.equal(parseInlineKey("<!-- boop-inline: still-open"), null);
+});
+
+test("inlineKeyForComment + appendInlineKeyMarker + parseInlineKey round-trip", () => {
+  // The end-to-end round-trip the dedup machinery depends
+  // on: a key computed from (path, line, body) is appended
+  // to the body, and parseInlineKey recovers the same key.
+  // Any divergence between the three helpers breaks the
+  // dedup silently.
+  const cases = [
+    { path: "src/a.ts", line: 10, body: "finding" },
+    { path: "src/b.ts", line: 999, body: "x".repeat(1000) },
+    { path: "weird/path with spaces.ts", line: 1, body: "" },
+  ];
+  for (const c of cases) {
+    const key = inlineKeyForComment(c);
+    const body = appendInlineKeyMarker(c.body, key);
+    assert.equal(
+      parseInlineKey(body),
+      key,
+      `round-trip mismatch for ${JSON.stringify(c)}`,
+    );
+  }
+});
+
+// --- listExistingInlineKeys (direct test) -----------------------------
+
+test("listExistingInlineKeys walks pagination and aggregates the key set (QUB-103)", async () => {
+  // Headline reviewer concern: the cross-page
+  // `listReviewComments` pagination shape was tested
+  // indirectly via postInlineComments. This test pins the
+  // pagination contract on the underlying helper: page 1
+  // returns a full page (signals "more pages"), page 2
+  // returns fewer items (signals "end of list"), and the
+  // helper aggregates keys across both pages.
+  //
+  // The seed keys span two pages so a bug that breaks
+  // after page 1 (e.g. a missing `page++`) would surface
+  // as a missing key.
+  const { createHash } = await import("node:crypto");
+  const hashA = createHash("sha256").update("alpha").digest("hex").slice(0, 16);
+  const hashB = createHash("sha256").update("beta").digest("hex").slice(0, 16);
+  const hashC = createHash("sha256").update("gamma").digest("hex").slice(0, 16);
+  const octokit = makeFakeOctokit({
+    listReviewComments: async (args) => {
+      if (args.page === 1) {
+        // First page is full (100 items) — signals more
+        // pages. The key for "alpha" lives here. The 99
+        // fillers have no marker; the helper skips them.
+        return {
+          data: [
+            { id: 1, body: `alpha\n<!-- boop-inline: src/a.ts:1:${hashA} -->\n` },
+            ...Array.from({ length: 99 }, (_, i) => ({
+              id: 100 + i,
+              body: `filler-${i}\n`,
+            })),
+          ],
+        };
+      }
+      // Page 2: last page (fewer items, signals end).
+      // Two more keys live here.
+      return {
+        data: [
+          { id: 200, body: `beta\n<!-- boop-inline: src/b.ts:2:${hashB} -->\n` },
+          { id: 201, body: `gamma\n<!-- boop-inline: src/c.ts:3:${hashC} -->\n` },
+        ],
+      };
+    },
+  });
+  const keys = await listExistingInlineKeys(octokit, ctx);
+  // All three keys are present despite the pagination.
+  assert.equal(keys.size, 3);
+  assert.ok(keys.has(`src/a.ts:1:${hashA}`));
+  assert.ok(keys.has(`src/b.ts:2:${hashB}`));
+  assert.ok(keys.has(`src/c.ts:3:${hashC}`));
+  // The helper actually paginated (otherwise the keys
+  // beyond page 1 would be missing). The makeFakeOctokit
+  // helper records each call as a { listReviewComments: args }
+  // element in octokit.calls, so filter for them.
+  const listCalls = octokit.calls
+    .map((c) => c.listReviewComments)
+    .filter(Boolean);
+  assert.ok(
+    listCalls.length >= 2,
+    `expected at least 2 pagination calls, got ${listCalls.length}`,
+  );
+  assert.equal(listCalls[0].page, 1);
+  assert.equal(listCalls[1].page, 2);
+  // The page-2 call carried per_page=100 (consistent with
+  // the per_page=100 used elsewhere in the dedup code
+  // path). A future change to the page size would surface
+  // here.
+  assert.equal(listCalls[0].per_page, 100);
+});
+
+test("listExistingInlineKeys returns an empty set when the page returns no items", async () => {
+  // Counter-test: an empty first page terminates the
+  // pagination immediately. Without an early break the
+  // helper would loop on a `page++` that never sees a
+  // result.
+  const octokit = makeFakeOctokit({
+    listReviewComments: async () => ({ data: [] }),
+  });
+  const keys = await listExistingInlineKeys(octokit, ctx);
+  assert.equal(keys.size, 0);
+  const listCalls = octokit.calls
+    .map((c) => c.listReviewComments)
+    .filter(Boolean);
+  assert.equal(listCalls.length, 1);
+});
+
+test("listExistingInlineKeys dedupes duplicate keys across pages", async () => {
+  // The same inline key can appear on multiple pages
+  // (e.g. a prior run re-posted the same comment). The
+  // Set must collapse duplicates — a future change that
+  // returned an array (or a non-Set collection) would
+  // surface as flakiness in the dedup math
+  // (Set.has vs. array.includes).
+  const { createHash } = await import("node:crypto");
+  const hashA = createHash("sha256").update("alpha").digest("hex").slice(0, 16);
+  const key = `src/a.ts:1:${hashA}`;
+  const octokit = makeFakeOctokit({
+    listReviewComments: async (args) => {
+      if (args.page === 1) {
+        // Full page so the loop continues. The same key
+        // appears in two of the 100 items.
+        const filler = Array.from({ length: 98 }, (_, i) => ({
+          id: 100 + i,
+          body: `filler\n`,
+        }));
+        return {
+          data: [
+            { id: 1, body: `alpha\n<!-- boop-inline: ${key} -->\n` },
+            { id: 2, body: `alpha again\n<!-- boop-inline: ${key} -->\n` },
+            ...filler,
+          ],
+        };
+      }
+      return { data: [] };
+    },
+  });
+  const keys = await listExistingInlineKeys(octokit, ctx);
+  assert.equal(keys.size, 1, "duplicate keys must collapse to a single set entry");
+  assert.ok(keys.has(key));
+});
+
+// --- helpers for the inline-key tests ----------------------------------
+
+// shaShort mirrors the inline-key helper in github.mjs
+// (sha-256 truncated to 16 hex chars). Kept local to the test
+// file so a future change to the helper forces both sides to
+// update together — and so the test computes the same key the
+// production code does, no hard-coded literal.
+async function shaShort(text) {
+  const { createHash } = await import("node:crypto");
+  return createHash("sha256").update(String(text)).digest("hex").slice(0, 16);
+}
 
 // --- cleanupPriorReview -----------------------------------------------
 

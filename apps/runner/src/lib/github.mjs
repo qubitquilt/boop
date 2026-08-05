@@ -12,6 +12,7 @@
 // Octokit factory, logger, status constants) so a test can pass a
 // stub Octokit and a recording fetch without touching the network.
 
+import { createHash } from "node:crypto";
 import { Octokit } from "@octokit/rest";
 import { SHORT, STATUS } from "./config.mjs";
 import { shortSha } from "./security.mjs";
@@ -449,6 +450,162 @@ function upsertStateInBody(body, line) {
   return body.slice(0, start) + line + body.slice(closeStart + 3);
 }
 
+// --- review-id + inline-key idempotency (QUB-103) ----------------------
+//
+// The runner's externally-visible writes (summary comment, inline
+// threads, prior-thread cleanup) must be idempotent under pod kill.
+// The workflow-state write (QUB-92) is best-effort; the real
+// correctness mechanism lives in the side-effect dedup. Each
+// summary comment carries a per-run `boop-review-id: <uuid>`
+// marker generated at run() start. Each inline thread carries a
+// per-inline `boop-inline: <path>:<line>:<body-hash>` marker. On
+// retry, postReview / postInlineComments list existing artifacts
+// and skip / re-PATCH instead of double-posting.
+//
+// The head-SHA marker (`boop-head-sha`) is the pre-QUB-103 dedup
+// key. We still write it on every summary, and postReview accepts
+// it as a fallback match when no review-id marker is present (so
+// older summaries — written before this PR — still dedupe).
+
+// REVIEW_ID_MARKER_PREFIX / INLINE_KEY_MARKER_PREFIX are the HTML
+// comment delimiters the runner uses to find review + inline
+// markers. Hidden in the rendered markdown; preserved by the
+// GitHub API verbatim.
+export const REVIEW_ID_MARKER_PREFIX = "<!-- boop-review-id:";
+export const INLINE_KEY_MARKER_PREFIX = "<!-- boop-inline:";
+export const HEAD_SHA_MARKER_PREFIX = "<!-- boop-head-sha:";
+const HTML_COMMENT_CLOSE = "-->";
+
+// inlineKeyForComment computes the deterministic per-inline key
+// from (path, line, body). The body hash is sha-256 truncated to
+// 16 hex chars (64 bits) — more than enough to avoid collisions
+// and short enough to keep the inline marker terse. The key
+// shape is `<path>:<line>:<hash>`; the body hash captures the
+// actual content so two distinct findings at the same line
+// (e.g. security + style) still get distinct keys.
+//
+// Exported so direct unit tests (github.test.mjs) can pin the
+// key shape without going through the integration path. A
+// future change to the hash algorithm or separator that's
+// detected by these tests will surface as a clear contract
+// violation rather than as a downstream dedup-miss.
+export function inlineKeyForComment(c) {
+  const hash = createHash("sha256")
+    .update(String(c?.body ?? ""))
+    .digest("hex")
+    .slice(0, 16);
+  return `${c?.path}:${c?.line}:${hash}`;
+}
+
+// appendInlineKeyMarker appends the deterministic key marker to
+// a comment body. Hidden in the rendered markdown. Always called
+// before posting (the marker survives the GitHub API as-is), so
+// a re-run's listExistingInlineKeys can detect duplicates even
+// when the workflow-state marker (QUB-92) is stale or missing.
+//
+// Exported for direct unit tests — see parseInlineKey below.
+export function appendInlineKeyMarker(body, key) {
+  const sep = String(body ?? "").endsWith("\n") ? "\n" : "\n\n";
+  return `${body ?? ""}${sep}${INLINE_KEY_MARKER_PREFIX} ${key} ${HTML_COMMENT_CLOSE}`;
+}
+
+// parseInlineKey extracts the inline key from a comment body,
+// or returns null if no marker is present. The runner calls this
+// on every review comment when computing the existing-keys set
+// for dedup. Uses `lastIndexOf` so a body that legitimately
+// contains the literal `<!-- boop-inline:` text (e.g., quoting
+// docs, JSON keys, etc.) is parsed correctly — only the trailing
+// marker counts.
+//
+// Exported for direct unit tests.
+export function parseInlineKey(body) {
+  if (!body) return null;
+  const start = body.lastIndexOf(INLINE_KEY_MARKER_PREFIX);
+  if (start < 0) return null;
+  const openEnd = start + INLINE_KEY_MARKER_PREFIX.length + 1;
+  const closeStart = body.indexOf("-->", openEnd);
+  if (closeStart < 0) return null;
+  return body.slice(openEnd, closeStart).trim();
+}
+
+// findExistingSummaryCommentID walks every issue comment on the
+// PR (paginated) and returns the integer id of the most recent
+// one whose body matches the review-id or head-SHA marker. Used
+// by postReview to PATCH instead of POST on retry. The dedup is
+// best-effort: if the listing throws (502 / timeout), the
+// caller's try/catch logs and falls back to a fresh POST so a
+// transient listing error doesn't cost the run.
+async function findExistingSummaryCommentID(octokit, ctx) {
+  const expectedReviewIdMarker = ctx.reviewId
+    ? `${REVIEW_ID_MARKER_PREFIX} ${ctx.reviewId} ${HTML_COMMENT_CLOSE}`
+    : null;
+  const expectedHeadShaMarker = ctx.prHeadSha
+    ? `${HEAD_SHA_MARKER_PREFIX} ${ctx.prHeadSha} ${HTML_COMMENT_CLOSE}`
+    : null;
+  if (!expectedReviewIdMarker && !expectedHeadShaMarker) return null;
+  let page = 1;
+  let latest = null;
+  let absoluteIndex = 0;
+  while (true) {
+    const { data: arr } = await octokit.rest.issues.listComments({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      issue_number: Number(ctx.prNumber),
+      per_page: 100,
+      page,
+    });
+    if (!Array.isArray(arr) || arr.length === 0) break;
+    for (const c of arr) {
+      const body = c.body || "";
+      const matches =
+        (expectedReviewIdMarker && body.includes(expectedReviewIdMarker)) ||
+        (expectedHeadShaMarker && body.includes(expectedHeadShaMarker));
+      if (matches) {
+        const candidate = { id: c.id, _index: absoluteIndex };
+        if (!latest || candidate._index > latest._index) {
+          latest = candidate;
+        }
+      }
+      absoluteIndex++;
+    }
+    if (arr.length < 100) break;
+    page++;
+  }
+  return latest ? latest.id : null;
+}
+
+// listExistingInlineKeys walks every PR review comment
+// (paginated) and returns the set of inline-key markers found
+// across their bodies. Used by postInlineComments to filter out
+// duplicates on retry. A failed list is treated as an empty set
+// (the caller logs and proceeds) — best-effort dedup, not a
+// correctness gate.
+//
+// Exported so direct unit tests can pin the pagination shape
+// (per_page, last-page break) without going through
+// postInlineComments.
+export async function listExistingInlineKeys(octokit, ctx) {
+  const keys = new Set();
+  let page = 1;
+  while (true) {
+    const { data: arr } = await octokit.rest.pulls.listReviewComments({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      pull_number: Number(ctx.prNumber),
+      per_page: 100,
+      page,
+    });
+    if (!Array.isArray(arr) || arr.length === 0) break;
+    for (const c of arr) {
+      const k = parseInlineKey(c.body || "");
+      if (k) keys.add(k);
+    }
+    if (arr.length < 100) break;
+    page++;
+  }
+  return keys;
+}
+
 // makeOctokit creates an Octokit bound to the installation token.
 // Exported so callers can reuse the same instance for both REST and
 // the postStatus / postReview / postInlineComment calls.
@@ -458,8 +615,18 @@ export function makeOctokit(installationToken, deps = {}) {
 }
 
 // postReview creates the summary comment with the confidence badge,
-// review header, and the hidden head-SHA marker for re-review diffing.
-export async function postReview(octokit, body, reviewNumber, confidence, ctx) {
+// review header, and the hidden head-SHA + per-run review-id markers
+// for re-review diffing and QUB-103 idempotency.
+//
+// QUB-103: the runner PATCHes an existing summary when one already
+// carries the matching review-id or head-SHA marker. The fallback
+// to head-SHA dedup keeps older summaries (pre-QUB-103) covered.
+// `deps` is optional; passing `{ log }` lets the caller observe
+// which side-effect path fired (created vs patched). Throwing on a
+// list failure would surface to the orchestrator catch in index.mjs
+// and force the run to abort — we instead swallow and fall back to
+// a fresh POST so a transient listing error doesn't cost the run.
+export async function postReview(octokit, body, reviewNumber, confidence, ctx, deps = {}) {
   const max = 65000;
   const cleaned = body.replace(/\n{3,}/g, "\n\n").trim();
   const trimmed = cleaned.length > max ? cleaned.slice(0, max - 50) + "\n\n…(truncated)" : cleaned;
@@ -470,17 +637,51 @@ export async function postReview(octokit, body, reviewNumber, confidence, ctx) {
   // (see priorReviewHeadSHARegex in client.go). GitHub renders HTML
   // comments as nothing in the markdown view, so it's invisible to
   // human readers.
-  const headMarker = `<!-- boop-head-sha: ${ctx.prHeadSha} -->`;
+  const headMarker = `${HEAD_SHA_MARKER_PREFIX} ${ctx.prHeadSha} ${HTML_COMMENT_CLOSE}`;
+  // QUB-103: per-run review id lets the runner find the existing
+  // summary on retry and PATCH it instead of double-posting. The
+  // UUID is generated at run() start in index.mjs and threaded
+  // through ctx; tests inject it via fixture ctx.
+  const reviewIdMarker = ctx.reviewId
+    ? `\n${REVIEW_ID_MARKER_PREFIX} ${ctx.reviewId} ${HTML_COMMENT_CLOSE}`
+    : "";
+  const fullBody =
+    `${reviewHeader(reviewNumber)}\n\n` +
+    `${badge}\n\n` +
+    trimmed +
+    `\n\n<sub>Posted by [BoopPr](https://github.com/qubitquilt/boop) · PR \`${shortSha(ctx.prHeadSha)}\`${reviewTag} · good boy powered</sub>` +
+    `\n${headMarker}` +
+    reviewIdMarker;
+
+  let existingId = null;
+  try {
+    existingId = await findExistingSummaryCommentID(octokit, ctx);
+  } catch (err) {
+    deps.log?.("review", "list existing summary comments failed; falling back to create", {
+      err: String(err?.message ?? err),
+    });
+  }
+  if (existingId) {
+    await octokit.rest.issues.updateComment({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      comment_id: existingId,
+      body: fullBody,
+    });
+    deps.log?.("review", "patched existing summary comment", {
+      comment_id: existingId,
+      review_id: ctx.reviewId || null,
+    });
+    return;
+  }
   await octokit.rest.issues.createComment({
     owner: ctx.prOwner,
     repo: ctx.prRepo,
     issue_number: Number(ctx.prNumber),
-    body:
-      `${reviewHeader(reviewNumber)}\n\n` +
-      `${badge}\n\n` +
-      trimmed +
-      `\n\n<sub>Posted by [BoopPr](https://github.com/qubitquilt/boop) · PR \`${shortSha(ctx.prHeadSha)}\`${reviewTag} · good boy powered</sub>` +
-      `\n${headMarker}`,
+    body: fullBody,
+  });
+  deps.log?.("review", "created summary comment", {
+    review_id: ctx.reviewId || null,
   });
 }
 
@@ -504,25 +705,60 @@ async function postInlineComment(octokit, c, ctx) {
 // Each comment is independent, so a single failure does not block the
 // rest. We use Promise.allSettled so failures are surfaced via the
 // logger rather than thrown.
+//
+// QUB-103: every candidate inline is enriched with a deterministic
+// `<!-- boop-inline: <path>:<line>:<body-hash> -->` marker before
+// posting. On entry, the runner lists the PR's existing review
+// comments, parses their markers, and skips any candidate whose key
+// is already present. This decouples inline dedup from the
+// fire-and-forget workflow-state write (QUB-92) — a pod kill that
+// posted half the inlines before dying cannot cause the next pod to
+// re-post them.
 export async function postInlineComments(octokit, comments, ctx, deps) {
   const { log, errlog } = deps;
+  let existingKeys = new Set();
+  if (comments.length > 0) {
+    try {
+      existingKeys = await listExistingInlineKeys(octokit, ctx);
+    } catch (err) {
+      errlog("inline", "list existing inline comments failed; proceeding without dedup", {
+        err: String(err?.message ?? err),
+      });
+    }
+  }
+
+  const enriched = comments.map((c) => {
+    const key = inlineKeyForComment(c);
+    return { c, key, body: appendInlineKeyMarker(c.body, key) };
+  });
+
+  const toPost = enriched.filter(({ key }) => !existingKeys.has(key));
+  const skipped = comments.length - toPost.length;
+  if (skipped > 0) {
+    log("inline", `skipped ${skipped}/${comments.length} inline comments (already posted)`, {
+      skipped,
+    });
+  }
+
   const results = await Promise.allSettled(
-    comments.map((c) => postInlineComment(octokit, c, ctx)),
+    toPost.map(({ body, c }) => postInlineComment(octokit, { ...c, body }, ctx)),
   );
   let ok = 0;
   results.forEach((r, i) => {
     if (r.status === "fulfilled") {
       ok++;
     } else {
+      const c = toPost[i].c;
       errlog("inline", "failed to post inline comment", {
-        path: comments[i].path,
-        line: comments[i].line,
+        path: c.path,
+        line: c.line,
         err: String(r.reason?.message ?? r.reason),
       });
     }
   });
   if (comments.length > 0) {
-    log("done", `posted ${ok}/${comments.length} inline comments`);
+    const tail = skipped > 0 ? ` (${skipped} skipped as duplicates)` : "";
+    log("done", `posted ${ok}/${comments.length} inline comments${tail}`);
   }
 }
 
