@@ -295,8 +295,15 @@ func (h *Handler) deepHealth(w http.ResponseWriter, r *http.Request) {
 	ok, result, err := h.store.DeepCheck()
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
+		// Log the raw error server-side so an operator can
+		// correlate the 503 with the actual SQLite failure, but
+		// do not echo it to the client. The /health?deep=1
+		// endpoint is unauthenticated and any error string
+		// could leak file paths, table names, or driver-level
+		// internals to a probe client.
+		h.logger.Warn("deepHealth: store check failed", "err", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = fmt.Fprintf(w, `{"status":"error","err":%q}`, err.Error())
+		_, _ = io.WriteString(w, `{"status":"error"}`)
 		return
 	}
 	stats, _ := h.store.Stats(r.Context())
