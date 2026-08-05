@@ -66,7 +66,13 @@ func NewManager(cfg AppConfig) *Manager {
 // `*_test.go` convention would scope this to the github package's
 // own tests, but the webhook package's tests also need it, so it
 // is exported. Do not call from production code.
+//
+// QUB-99: swapping baseHTTP once redirects every API call the
+// Manager makes (AppBotLogin, ListInstallations, and every
+// per-installation Client call) to the test server.
 func (m *Manager) SetBaseHTTPForTest(c *http.Client) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.baseHTTP = c
 }
 
@@ -150,6 +156,7 @@ func (m *Manager) AppBotLogin(ctx context.Context, installationID int64) (string
 	}
 
 	url := appInfoURL
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("build request: %w", err)
@@ -346,6 +353,7 @@ func AppInfoURLForTest() string { return appInfoURL }
 // SetAppInfoURLForTest replaces the appInfoURL value. Tests use it
 // to point AppBotLogin at a httptest.Server. Test-only.
 func SetAppInfoURLForTest(s string) { appInfoURL = s }
+
 
 // installationsListURL is the App endpoint that returns every
 // installation of the App. Paged by GitHub; we walk pages until

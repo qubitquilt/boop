@@ -41,6 +41,7 @@ import { createCleanupRegistry, cloneRepo } from "./lib/git.mjs";
 import { runStages } from "./lib/workflow.mjs";
 import {
   postStatus,
+  ensureStatusComment,
   readWorkflowState,
   writeWorkflowState,
 } from "./lib/github.mjs";
@@ -58,9 +59,42 @@ const execFileAsync = promisify(execFile);
 // `postStatus` closure (which reads it at PATCH time). The slot
 // pattern lets the stage functions stay in workflow.mjs without
 // reaching back into index.mjs to mutate module state.
+//
+// QUB-99: the status-comment slot mirrors the octokit slot.
+// BOOP_STATUS_COMMENT_ID may arrive unset (the receiver no longer
+// pre-creates the comment). On the first postStatus call the
+// wrapper lazy-creates the initial status comment, caches the new
+// id on the slot, and reuses it for every subsequent PATCH (so a
+// pipeline retry hits the same comment instead of posting another
+// one). The slot is mutable; pass-by-reference is the point.
 function makeDeps(ctx, log, cleanup) {
   const octokitSlot = { value: null };
+  const statusCommentSlot = { value: ctx.statusCommentId || null };
   const getOctokit = () => octokitSlot.value;
+  const patchStatusWithCtx = (stage, detail) => {
+    const effectiveCtx = statusCommentSlot.value
+      ? { ...ctx, statusCommentId: statusCommentSlot.value }
+      : ctx;
+    return postStatus(stage, detail, effectiveCtx, {
+      log: log.log,
+      errlog: log.errlog,
+      octokit: getOctokit(),
+    });
+  };
+  const postStatusWrapper = async (stage, detail) => {
+    if (!getOctokit()) {
+      log.log("status", "skip (no octokit yet)", { stage });
+      return;
+    }
+    await ensureStatusComment(
+      getOctokit(),
+      ctx,
+      { log: log.log, errlog: log.errlog },
+      statusCommentSlot,
+      ctx.triggeredBy || null,
+    );
+    await patchStatusWithCtx(stage, detail);
+  };
   return {
     fs,
     execFile: execFileAsync,
@@ -82,22 +116,14 @@ function makeDeps(ctx, log, cleanup) {
     errlog: log.errlog,
     setOctokit: (octokit) => { octokitSlot.value = octokit; },
     getOctokit,
-    postStatus: (stage, detail) => postStatus(stage, detail, ctx, {
-      log: log.log,
-      errlog: log.errlog,
-      octokit: getOctokit(),
-    }),
+    postStatus: postStatusWrapper,
     // cloneRepo is wrapped so its postStatus call goes through the
-    // same lazy octokit-resolution path as the direct postStatus.
-    // The clone runs AFTER token minting so the GitHub-App
-    // installation token is already populated.
+    // same lazy octokit-resolution + status-comment-creation path
+    // as the direct postStatus. The clone runs AFTER token minting
+    // so the GitHub-App installation token is already populated.
     cloneRepo: (c, d) => cloneRepo(c, {
       ...d,
-      postStatus: (s) => postStatus(s, undefined, c, {
-        log: log.log,
-        errlog: log.errlog,
-        octokit: getOctokit(),
-      }),
+      postStatus: (s) => postStatusWrapper(s, undefined),
     }),
   };
 }

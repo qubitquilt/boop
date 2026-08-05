@@ -109,6 +109,14 @@ export function loadConfig(env = process.env) {
     reactionCommentId: parsePositiveInt(env.BOOP_REACTION_COMMENT_ID),
     reviewNumber: parsePositiveInt(env.BOOP_REVIEW_NUMBER) || 1,
     botLogin: env.BOOP_BOT_LOGIN || null,
+    // QUB-99: GitHub login of the user who triggered an
+    // issue_comment-based review. Forwarded by the receiver
+    // from the issue_comment payload via BOOP_SENDER_LOGIN so
+    // the runner can render the "Triggered by @user"
+    // attribution on the initial status comment it creates on
+    // its first postStatus call. Empty for pull_request-driven
+    // runs.
+    triggeredBy: env.BOOP_SENDER_LOGIN || null,
     skipSkill: env.BOOP_SKIP_SKILL === "1",
     debug: !!env.BOOP_DEBUG,
     home: env.HOME || "/home/opencode",

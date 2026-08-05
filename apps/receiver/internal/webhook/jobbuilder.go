@@ -306,6 +306,13 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 								{Name: "BOOP_STATUS_COMMENT_ID", Value: v.StatusCommentID},
 								{Name: "BOOP_REACTION_COMMENT_ID", Value: v.ReactionCommentID},
 								{Name: "BOOP_REVIEW_NUMBER", Value: v.ReviewNumber},
+								// QUB-99: the issue_comment sender login
+								// (empty for pull_request-driven runs).
+								// The runner uses this to render the
+								// "Triggered by @user" line on the
+								// initial status comment it creates
+								// on its first postStatus call.
+								{Name: "BOOP_SENDER_LOGIN", Value: v.TriggeredBy},
 								{Name: "BOOP_BOT_LOGIN", Value: v.BotLogin},
 							{Name: "BOOP_SKIP_SKILL", Value: "0"},
 							// QUB-94: feature flag for the

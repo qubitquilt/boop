@@ -91,11 +91,34 @@ type Config struct {
 	OpenRouterSDKDefault string
 }
 
+// ghClientAPI captures the GitHub client surface the webhook
+// handler uses. Defined as an interface (rather than the concrete
+// *boopgithub.Manager) so the integration tests in
+// crash_safety_test.go can swap a recording fake in without
+// standing up a full GitHub mock server. The production *Manager
+// satisfies it for free.
+type ghClientAPI interface {
+	AppBotLogin(ctx context.Context, installationID int64) (string, error)
+	ClientFor(installationID int64) *boopgithub.Client
+	ListInstallations(ctx context.Context) ([]boopgithub.Installation, error)
+}
+
+// ghIssueClientAPI captures the per-installation client surface
+// the webhook handler uses. The production *boopgithub.Client
+// satisfies it; tests can supply a recording fake to assert call
+// ordering and the "no orphan status comment" invariant.
+type ghIssueClientAPI interface {
+	FetchPullRequest(ctx context.Context, owner, repo string, number int) (*boopgithub.PullRequest, error)
+	CountPriorReviews(ctx context.Context, owner, repo string, issueNumber int) (int, string, error)
+	AddCommentReaction(ctx context.Context, owner, repo string, commentID int64, content string) error
+	PostIssueComment(ctx context.Context, owner, repo string, issueNumber int, body string) (int64, error)
+}
+
 type Handler struct {
 	cfg      Config
 	logger   *slog.Logger
 	kube     kubernetes.Interface
-	ghClient *boopgithub.Manager
+	ghClient ghClientAPI
 	store    *store.Store // may be nil; nil disables the data layer (legacy mode)
 
 	// consecutiveConfigMapFallbacks tracks how many submitJob calls
@@ -196,7 +219,7 @@ func (d *deliveryDedup) seen(id string) bool {
 	return false
 }
 
-func NewHandler(cfg Config, ghClient *boopgithub.Manager, logger *slog.Logger) (*Handler, error) {
+func NewHandler(cfg Config, ghClient ghClientAPI, logger *slog.Logger) (*Handler, error) {
 	kube, err := newInClusterClient()
 	if err != nil {
 		return nil, fmt.Errorf("kube client: %w", err)
@@ -317,9 +340,8 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 	client := h.ghClient.ClientFor(installationID)
-	// Check for duplicate before posting a status comment — otherwise a
-	// re-delivery of the same head SHA leaves a stranded "🐾" status
-	// comment that no runner will update.
+	// Check for duplicate before submitting a Job — otherwise a
+	// re-delivery of the same head SHA can schedule a second K8s Job.
 	if claimed, _ := h.claimJobSlot(ctx, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, w); !claimed {
 		return
 	}
@@ -330,14 +352,12 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 		reviewNumber = 1
 		previousHeadSHA = ""
 	}
-	// No trigger comment to react to for plain PR events. Post a fresh
-	// status comment and pass its id to the Job.
-	statusID, err := h.postStatus(ctx, client, pr.Owner, pr.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, "", reviewNumber))
-	if err != nil {
-		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
-		// Non-fatal — the Job still runs.
-	}
-	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("pull_request.%s", pr.Action), 0, statusID, installationID, reviewNumber, pr.Labels)
+	// QUB-99: createJob is the only durable side effect for this
+	// path. There is no status comment to react to for plain PR
+	// events, so the call returns without further side effects.
+	// The runner creates the initial status comment on its first
+	// PATCH (BOOP_STATUS_COMMENT_ID is passed as 0).
+	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("pull_request.%s", pr.Action), 0, 0, "", installationID, reviewNumber, pr.Labels)
 }
 
 func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter, delivery string, installationID int64, body []byte) {
@@ -397,22 +417,15 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		return
 	}
 
-	// Check for duplicate (active or succeeded) before reacting or
-	// posting a status comment — otherwise a same-SHA `@BoopPr review`
-	// leaves a stranded 👀 reaction / "Boop's on the case!" status
-	// comment with no runner to update it.
+	// Check for duplicate (active or succeeded) before submitting
+	// the Job — otherwise a same-SHA `@BoopPr review` schedules a
+	// second K8s Job that races with the first.
 	claimed, dupeStatus := h.claimJobSlot(ctx, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, w)
 	if !claimed {
 		if dupeStatus == "active" || dupeStatus == "succeeded" {
 			h.replyDuplicateReview(ctx, client, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, dupeStatus)
 		}
 		return
-	}
-
-	// React only after we know a run will start, so no-ops do not look
-	// like work is underway.
-	if err := client.AddCommentReaction(ctx, ic.Owner, ic.Repo, ic.CommentID, "eyes"); err != nil {
-		h.logger.Warn("add reaction", "delivery", delivery, "err", err)
 	}
 
 	reviewNumber, previousHeadSHA, err := h.computeReviewNumber(ctx, client, ic.Owner, ic.Repo, pr.Number)
@@ -422,13 +435,28 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 		previousHeadSHA = ""
 	}
 
-	// Post a status comment the runner will PATCH as it progresses.
-	statusID, err := h.postStatus(ctx, client, ic.Owner, ic.Repo, pr.Number, renderStatusBody(StatusInitial, pr.HeadSHA, ic.SenderLogin, reviewNumber))
-	if err != nil {
-		h.logger.Warn("post status comment", "delivery", delivery, "err", err)
+	// QUB-99: createJob first (the durable side effect). The
+	// 👀 reaction happens AFTER createJob returns successfully —
+	// otherwise a process death between AddCommentReaction and
+	// createJob would leave an orphan reaction with no runner
+	// to follow up. The initial status comment is not posted
+	// here; the runner creates it on its first postStatus call
+	// (it receives an empty BOOP_STATUS_COMMENT_ID). The sender
+	// login is forwarded via BOOP_SENDER_LOGIN so the runner can
+	// render the "Triggered by @user" line.
+	jobCreated, submitErr := h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, 0, ic.SenderLogin, installationID, reviewNumber, nil)
+	if submitErr != nil || !jobCreated {
+		return
 	}
-
-	h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, statusID, installationID, reviewNumber, nil)
+	// Best-effort. GitHub's reaction API rejects a duplicate add
+	// on the same (user, comment, content) triple with a 422, but
+	// the ID-error on the 422 (already reacted) is the same surface
+	// we already get on a redelivery — so the orderly path doesn't
+	// need extra handling. A failure here doesn't block the run
+	// (the runner is already in flight).
+	if err := client.AddCommentReaction(ctx, ic.Owner, ic.Repo, ic.CommentID, "eyes"); err != nil {
+		h.logger.Warn("add reaction", "delivery", delivery, "err", err)
+	}
 }
 
 // computeReviewNumber returns the 1-based index of the review this
@@ -438,7 +466,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 // from that commit instead of the full main..head range. Falls
 // back to (1, "", nil) on error so a transient GitHub hiccup never
 // blocks a review.
-func (h *Handler) computeReviewNumber(ctx context.Context, client *boopgithub.Client, owner, repo string, number int) (int, string, error) {
+func (h *Handler) computeReviewNumber(ctx context.Context, client ghIssueClientAPI, owner, repo string, number int) (int, string, error) {
 	n, lastSHA, err := client.CountPriorReviews(ctx, owner, repo, number)
 	if err != nil {
 		return 0, "", err
@@ -495,7 +523,7 @@ func renderStatusBody(stage, sha, by string, reviewNumber int) string {
 	return fmt.Sprintf("boop status: %s", stage)
 }
 
-func (h *Handler) postStatus(ctx context.Context, client *boopgithub.Client, owner, repo string, number int, body string) (int64, error) {
+func (h *Handler) postStatus(ctx context.Context, client ghIssueClientAPI, owner, repo string, number int, body string) (int64, error) {
 	return client.PostIssueComment(ctx, owner, repo, number, body)
 }
 
@@ -535,7 +563,7 @@ func (h *Handler) claimJobSlot(ctx context.Context, delivery, owner, repo string
 
 // replyDuplicateReview posts a short PR comment explaining why a same-SHA
 // `@BoopPr review` request was a no-op. Non-fatal on API errors.
-func (h *Handler) replyDuplicateReview(ctx context.Context, client *boopgithub.Client, delivery, owner, repo string, number int, headSHA, status string) {
+func (h *Handler) replyDuplicateReview(ctx context.Context, client ghIssueClientAPI, delivery, owner, repo string, number int, headSHA, status string) {
 	body := duplicateReviewReply(status, headSHA)
 	if body == "" {
 		return
@@ -565,7 +593,29 @@ func duplicateReviewReply(status, headSHA string) string {
 	}
 }
 
-func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID, installationID int64, reviewNumber int, labels []string) {
+// submitJob renders and creates the K8s review Job, persists the
+// dashboard row, and writes the webhook ack. The return value tells
+// the caller whether the Job is durable:
+//
+//   - (true, nil) — Job created. The caller may now run user-visible
+//     side effects (the 👀 reaction on issue_comment triggers). A
+//     pod kill between this return and the caller-side side effect
+//     leaves a partial surface (no Job created, so GitHub's
+//     5xx-driven redelivery starts fresh on a new pod; the reaction
+//     would be the only orphan). GitHub's reaction API is idempotent
+//     on the same content, so a redelivery would just no-op.
+//   - (false, nil) — duplicate Job (race with another delivery) or
+//     upstream validation failure. The HTTP response is already
+//     written. The caller must NOT post additional side effects.
+//   - (false, err) — recover-from-Here server error. The HTTP
+//     response is already written (500). The caller must NOT post
+//     additional side effects.
+//
+// triggeredBy is the issue_comment sender login (forwarded via
+// BOOP_SENDER_LOGIN so the runner can render its "Triggered by @user"
+// attribution on the initial status comment). Empty for
+// pull_request triggers.
+func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID int64, triggeredBy string, installationID int64, reviewNumber int, labels []string) (bool, error) {
 	jobName := buildJobName(owner, repo, number, headSHA)
 
 	// QUB-94: resolve the BOOP_USE_OPENROUTER_SDK value for this
@@ -601,8 +651,13 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		ReactionCommentID: fmt.Sprintf("%d", reactionCommentID),
 		ReviewNumber:      fmt.Sprintf("%d", reviewNumber),
 		InstallationID:    fmt.Sprintf("%d", installationID),
-		BotLogin:          h.cfg.BotLogin,
-		JobName:           jobName,
+		// QUB-99: BOOP_SENDER_LOGIN so the runner can render
+		// the "Triggered by @user" attribution on its
+		// runner-created initial status comment. Empty for the
+		// pull_request path.
+		TriggeredBy:        triggeredBy,
+		BotLogin:           h.cfg.BotLogin,
+		JobName:            jobName,
 		// Dashboard URL is the receiver Service's in-cluster DNS.
 		// Hard-coded to the canonical Service name + namespace so
 		// a misconfigured operator can't accidentally point the
@@ -622,7 +677,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		// any future proxy the request is malformed.
 		h.logger.Warn("build job", "delivery", delivery, "err", err)
 		http.Error(w, "invalid job spec", http.StatusBadRequest)
-		return
+		return false, nil
 	}
 
 	if err := h.createJob(ctx, job); err != nil {
@@ -633,11 +688,11 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 			// whether to react / reply.
 			h.logger.Info("duplicate job race", "delivery", delivery, "job", jobName, "err", err)
 			writeAck(w, "duplicate", jobName, delivery)
-			return
+			return false, nil
 		}
 		h.logger.Error("create job", "delivery", delivery, "job", jobName, "err", err)
 		http.Error(w, "create job", http.StatusInternalServerError)
-		return
+		return false, fmt.Errorf("create job: %w", err)
 	}
 
 	// Persist the run row so the dashboard has it. This is
@@ -676,8 +731,13 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		"status_comment_id", statusCommentID,
 		"reaction_comment_id", reactionCommentID,
 		"review_number", reviewNumber,
+		"triggered_by", triggeredBy,
 	)
 	writeAck(w, "accepted", jobName, delivery)
+	// QUB-99: success means the durable side effect (K8s Job)
+	// is in flight. The caller may now run user-visible side
+	// effects (👀 reaction on issue_comment).
+	return true, nil
 }
 
 // boopConfigMapName is the ConfigMap the receiver reads for
@@ -779,15 +839,17 @@ type templateVars struct {
 	ReactionCommentID string // GitHub comment id that received the trigger reaction (empty if none)
 	ReviewNumber      string // 1-based review number for this run; runner uses it for headers
 	InstallationID    string // GitHub App installation ID, sourced from the webhook header
-	BotLogin          string // GitHub login of the bot App (e.g. "booppr[bot]"); used to identify prior review artifacts for cleanup
-	DashboardURL      string // receiver Service URL the runner POSTs telemetry to; empty disables telemetry capture
-	DashboardToken    string // shared secret for the runner's POSTs; empty disables telemetry capture
-	JobName           string // the K8s Job name, which the runner reports back as the run id
-	// QUB-94: BOOP_USE_OPENROUTER_SDK value forwarded to the
-	// runner. "1" → in-process OpenRouter SDK path; "0" →
-	// opencode subprocess. Resolved at submitJob time from the
-	// cluster default + the boop:openrouter-sdk per-PR label.
-	OpenRouterSDKEnabled string
+	// QUB-99: GitHub login of the user who triggered an
+	// issue_comment-based review (empty for pull_request-driven
+	// runs). Forwarded as BOOP_SENDER_LOGIN so the runner can
+	// render the "Triggered by @user" line on the initial
+	// status comment it creates on its first postStatus call.
+	TriggeredBy          string
+	BotLogin             string // GitHub login of the bot App (e.g. "booppr[bot]"); used to identify prior review artifacts for cleanup
+	DashboardURL         string // receiver Service URL the runner POSTs telemetry to; empty disables telemetry capture
+	DashboardToken       string // shared secret for the runner's POSTs; empty disables telemetry capture
+	JobName              string // the K8s Job name, which the runner reports back as the run id
+	OpenRouterSDKEnabled string // QUB-94: BOOP_USE_OPENROUTER_SDK value
 }
 
 type prMeta struct {

@@ -845,7 +845,8 @@ func TestSubmitJob_FallsBackOnConfigMapReadFailure(t *testing.T) {
 	// submitJob's signature is wide; most args are required for
 	// buildJob but not for the image-resolution path we're
 	// pinning. reactionCommentID=0 because the pull_request branch
-	// doesn't react on the trigger comment.
+	// doesn't react on the trigger comment. triggeredBy="" because
+	// pull_request-driven runs have no @user attribution.
 	w := httptest.NewRecorder()
 	h.submitJob(
 		context.Background(),
@@ -860,6 +861,7 @@ func TestSubmitJob_FallsBackOnConfigMapReadFailure(t *testing.T) {
 		"pull_request.opened",
 		0,          // reactionCommentID
 		5153677875, // statusCommentID (validates the Job runs the status thread)
+		"",         // triggeredBy (empty for pull_request)
 		12345,      // installationID
 		1,          // reviewNumber
 		nil,        // labels (no per-PR SDK opt-in)
@@ -928,8 +930,9 @@ func TestSubmitJob_UsesLiveConfigMapWhenAvailable(t *testing.T) {
 		"main",
 		"",
 		"pull_request.opened",
-		0,
-		5153677875,
+		0,        // reactionCommentID
+		5153677875, // statusCommentID
+		"",       // triggeredBy (empty for pull_request)
 		12345,
 		1,
 		nil,

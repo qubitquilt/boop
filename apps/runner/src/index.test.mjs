@@ -317,16 +317,28 @@ test("run: re-review labels the summary as re-review #N", async () => {
   assert.match(octokit.calls.createComment[0].body, /re-review #3/);
 });
 
-test("run: no status comment id → skip status updates", async () => {
+test("run: no status comment id → runner creates initial status comment", async () => {
+  // QUB-99: the receiver no longer pre-creates the status comment
+  // (the prior ordering left orphans when the receiver died between
+  // postStatus and createJob). The runner now takes over the
+  // creation on its first postStatus call. With
+  // BOOP_STATUS_COMMENT_ID unset, the runner must POST a new
+  // initial comment, then PATCH it for every subsequent stage
+  // (auth/clone/review/done).
   const noStatusEnv = { ...env };
   delete noStatusEnv.BOOP_STATUS_COMMENT_ID;
   const octokit = fakeOctokit();
   const overrides = standardOverrides({ makeOctokit: () => octokit });
   await run(noStatusEnv, overrides);
-  // getComment never called (status updates skipped).
-  assert.equal(octokit.calls.getComment.length, 0);
-  // Summary still posts.
-  assert.equal(octokit.calls.createComment.length, 1);
+  // First create: the runner's initial status comment.
+  assert.equal(octokit.calls.createComment.length, 2); // 1 = initial status, 2 = summary
+  const initial = octokit.calls.createComment[0];
+  assert.match(initial.body, /Boop's on the case/);
+  // Every subsequent postStatus is a PATCH (no extra create).
+  assert.ok(octokit.calls.updateComment.length > 0, "expected at least one PATCH");
+  // The new comment id is reused for every PATCH (one per stage).
+  const patchedIds = new Set(octokit.calls.updateComment.map((c) => c.comment_id));
+  assert.equal(patchedIds.size, 1, "all PATCHes should target the same id");
 });
 
 test("run: botLogin unset → skip cleanupPriorReview on re-review", async () => {

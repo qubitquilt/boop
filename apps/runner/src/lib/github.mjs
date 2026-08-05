@@ -203,9 +203,21 @@ async function minimizeComment(token, commentNodeId, deps) {
   return data?.minimizeComment?.minimizedComment?.isMinimized === true;
 }
 
-// postStatus PATCHes the receiver-pre-created status comment with the
-// latest stage. Best-effort: any error is logged but the run continues
-// (status is informational, not load-bearing for the review itself).
+// postStatus PATCHes the status comment with the latest stage.
+// See the long comment below for the QUB-99 ordering.
+//
+// QUB-99: postStatus was previously bound to a receiver-pre-created
+// comment. The receiver now (a) creates the durable K8s Job before
+// any user-visible side effect and (b) does NOT pre-create the
+// status comment. The runner is therefore responsible for creating
+// the initial status comment on its first PATCH when
+// ctx.statusCommentId is missing.
+//
+// The caller (makeDeps in index.mjs) wraps deps.postStatus with a
+// `ensureStatusComment` step that lazy-creates the initial comment
+// on first call and patches the slot for subsequent calls. This
+// function trusts that the id is present and skips when it is not
+// (same best-effort behaviour as before — no comment, no crash).
 export async function postStatus(stage, detail, ctx, deps) {
   const { octokit, log, errlog } = deps;
   if (!octokit || !ctx.statusCommentId) {
@@ -250,6 +262,79 @@ export async function postStatus(stage, detail, ctx, deps) {
     log("status", "comment updated", { stage, comment_id: ctx.statusCommentId });
   } catch (err) {
     errlog("status", "comment update failed", { stage, err: String(err?.message ?? err) });
+  }
+}
+
+// renderInitialStatusBody produces the body of the runner-created
+// initial status comment. The receiver's pre-QUB-99 postStatus call
+// did this; the runner now owns the role. The shape matches what the
+// receiver used to render via renderStatusBody(StatusInitial, ...):
+//
+//	🐾 **Boop's on the case!** (review)
+//	[Triggered by @user]
+//	Last commit: `xxx`. Digging in now — updates will appear here.
+//
+//	<!-- boop-timeline -->
+//
+// The trailing HTML comment is the timeline separator the runner's
+// PATCH path appends after (see postStatus). Without it the first
+// PATCH would rewrite the receiver-supplied header instead of
+// appending to the timeline. Today (2026-08-05) the only caller
+// changing the header is the runner's own lazy-create — the body
+// here is the only header ever written — but the separator stays
+// so the format stays a strict superset of the old receiver template.
+//
+// `by` is the issue_comment sender login (forwarded by the receiver
+// as BOOP_SENDER_LOGIN). Empty for pull_request-driven runs — those
+// have no trigger attribution.
+export function renderInitialStatusBody(ctx, opts = {}) {
+  const short = shortSha(ctx.prHeadSha);
+  const label = ctx.reviewNumber > 1 ? `re-review #${ctx.reviewNumber}` : "review";
+  const byLine = opts.by ? `Triggered by @${opts.by}\n\n` : "";
+  return `🐾 **Boop's on the case!** (${label})\n\n${byLine}Last commit: \`${short}\`. Digging in now — updates will appear here.\n\n<!-- boop-timeline -->`;
+}
+
+// ensureStatusComment creates the initial status comment when
+// ctx.statusCommentId is unset, and caches the new id on a shared
+// `slot` object so the rest of the run PATCHes the same comment.
+//
+// QUB-99: the receiver no longer pre-creates the status comment
+// (the prior ordering left orphans when the receiver died between
+// postStatus and createJob). The runner now takes over the
+// creation. The first postStatus call from any stage lazily
+// creates the comment and continues in PATCH mode for the rest of
+// the run.
+//
+// Returns the comment id (existing or just-created). Returns null
+// when the lazy-create could not run (no octokit) — postStatus
+// then skips as before.
+//
+// `slot` is a mutable { value } object the caller passes so the
+// caller can observe the new id (and so subsequent calls don't
+// repeat the create on PATCH retries). The `by` parameter is
+// forwarded from BOOP_SENDER_LOGIN into the initial body.
+export async function ensureStatusComment(octokit, ctx, deps, slot, by) {
+  if (slot && slot.value) return slot.value;
+  if (!octokit) return null;
+  const { log, errlog } = deps;
+  const body = renderInitialStatusBody(ctx, { by });
+  try {
+    const { data: created } = await octokit.rest.issues.createComment({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      issue_number: Number(ctx.prNumber),
+      body,
+    });
+    if (slot) slot.value = created.id;
+    log("status", "created initial status comment", {
+      comment_id: created.id,
+    });
+    return created.id;
+  } catch (err) {
+    errlog("status", "create initial status comment failed", {
+      err: String(err?.message ?? err),
+    });
+    return null;
   }
 }
 

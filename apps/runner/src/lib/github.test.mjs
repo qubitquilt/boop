@@ -8,6 +8,8 @@ import {
   postInlineComments,
   cleanupPriorReview,
   makeOctokit,
+  ensureStatusComment,
+  renderInitialStatusBody,
   readWorkflowState,
   writeWorkflowState,
 } from "./github.mjs";
@@ -31,12 +33,24 @@ function makeFakeOctokit(handlers = {}) {
   const calls = [];
   const rest = {
     issues: {
-      getComment: handlers.getComment || (async () => ({ data: { body: "" } })),
-      updateComment: handlers.updateComment || (async () => ({ data: {} })),
-      createComment: handlers.createComment || (async () => ({ data: {} })),
+      getComment: async (args) => {
+        calls.push({ getComment: args });
+        return (handlers.getComment || (async () => ({ data: { body: "" } })))(args);
+      },
+      updateComment: async (args) => {
+        calls.push({ updateComment: args });
+        return (handlers.updateComment || (async () => ({ data: {} })))(args);
+      },
+      createComment: async (args) => {
+        calls.push({ createComment: args });
+        return (handlers.createComment || (async () => ({ data: { id: 555 } })))(args);
+      },
     },
     pulls: {
-      createReviewComment: handlers.createReviewComment || (async () => ({ data: {} })),
+      createReviewComment: async (args) => {
+        calls.push({ createReviewComment: args });
+        return (handlers.createReviewComment || (async () => ({ data: {} })))(args);
+      },
     },
   };
   return {
@@ -678,6 +692,116 @@ test("writeWorkflowState swallows errors (best-effort)", async () => {
   assert.ok(
     log.out.some(
       (e) => e.level === "ERROR" && /get failed/.test(e.err || ""),
+    ),
+  );
+});
+
+// --- renderInitialStatusBody (QUB-99) ---------------------------------
+
+test("renderInitialStatusBody matches the receiver template", () => {
+  // The receiver's pre-QUB-99 postStatus used this exact
+  // body shape. The runner takes over creation on its first
+  // PATCH and must produce the same surface so the user
+  // experience is unchanged. The header is pinned so a
+  // future rename of the "Boop's on the case" template
+  // surfaces here (QUB-93 user-visible surface).
+  const PAW = String.fromCodePoint(0x1f43e);
+  const body = renderInitialStatusBody(ctx, {});
+  assert.ok(body.startsWith(PAW + " **Boop's on the case!** (review)"),
+    "initial body must start with the receiver template, got: " + body.slice(0, 60));
+  assert.match(body, /Last commit: `0123456`/);
+  assert.match(body, /<!-- boop-timeline -->/);
+  assert.ok(!body.includes("Triggered by"));
+});
+
+test("renderInitialStatusBody renders re-review label", () => {
+  const PAW = String.fromCodePoint(0x1f43e);
+  const body = renderInitialStatusBody({ ...ctx, reviewNumber: 3 }, {});
+  assert.ok(body.startsWith(PAW + " **Boop's on the case!** (re-review #3)"),
+    "re-review body must carry the (re-review #N) label");
+});
+
+test("renderInitialStatusBody appends Triggered by when sender is set", () => {
+  const body = renderInitialStatusBody(ctx, { by: "alice" });
+  assert.match(body, /Triggered by @alice/);
+  assert.match(body, /Last commit: `0123456`/);
+});
+
+// --- ensureStatusComment (QUB-99) ------------------------------------
+
+test("ensureStatusComment is a no-op when ctx.statusCommentId is set", async () => {
+  // The receiver-pre-create path: the runner should NOT
+  // create a second comment when the id is already known.
+  // The first-call lazy-create path is the only legitimate
+  // way to populate the slot.
+  const octokit = makeFakeOctokit();
+  const slot = { value: 555 };
+  const id = await ensureStatusComment(octokit, ctx, recordingLogger(), slot, null);
+  assert.equal(id, 555);
+  // No createComment call.
+  assert.equal(octokit.calls.length, 0);
+  // Slot unchanged.
+  assert.equal(slot.value, 555);
+});
+
+test("ensureStatusComment creates a new comment when id is null", async () => {
+  // makeFakeOctokit's default createComment returns id 555
+  // so the test can assert against a known stable id.
+  const octokit = makeFakeOctokit();
+  const slot = { value: null };
+  const id = await ensureStatusComment(octokit, ctx, recordingLogger(), slot, "alice");
+  assert.ok(typeof id === "number" && id > 0, "should return a numeric id");
+  assert.equal(slot.value, id, "slot should be populated with the new id");
+  // The create call carries the initial body + the triggered-by line.
+  const create = octokit.calls.find((c) => c.createComment);
+  assert.ok(create, "createComment was called");
+  const PAW = String.fromCodePoint(0x1f43e);
+  assert.ok(
+    create.createComment.body.startsWith(PAW + " **Boop's on the case!** (review)"),
+    "createComment body must match the receiver template",
+  );
+  assert.match(create.createComment.body, /Triggered by @alice/);
+});
+
+test("ensureStatusComment reuses the slot on a second call", async () => {
+  // The slot is a stable handle: the second lazy-create
+  // (after the first PATCHed the comment) must NOT post a
+  // second initial comment. Without this, a pipeline retry
+  // would double-post the header.
+  const octokit = makeFakeOctokit();
+  const slot = { value: null };
+  const id1 = await ensureStatusComment(octokit, ctx, recordingLogger(), slot, null);
+  const id2 = await ensureStatusComment(octokit, ctx, recordingLogger(), slot, null);
+  assert.equal(id1, id2);
+  // Only one createComment call.
+  const creates = octokit.calls.filter((c) => c.createComment);
+  assert.equal(creates.length, 1, "ensureStatusComment should create at most one comment per slot");
+});
+
+test("ensureStatusComment returns null when no octokit is supplied", async () => {
+  // The first postStatus can land before the handshake
+  // mints the installation token (the octokit slot is null).
+  // In that case the lazy-create is a no-op and postStatus
+  // itself logs "skip" — no crash.
+  const slot = { value: null };
+  const id = await ensureStatusComment(null, ctx, recordingLogger(), slot, null);
+  assert.equal(id, null);
+  assert.equal(slot.value, null);
+});
+
+test("ensureStatusComment swallows create errors (best-effort)", async () => {
+  const octokit = makeFakeOctokit({
+    createComment: async () => { throw new Error("rate-limited"); },
+  });
+  const log = recordingLogger();
+  const slot = { value: null };
+  const id = await ensureStatusComment(octokit, ctx, log, slot, null);
+  assert.equal(id, null);
+  // Slot stays null so the runner can retry on the next PATCH.
+  assert.equal(slot.value, null);
+  assert.ok(
+    log.out.some(
+      (e) => e.level === "ERROR" && /rate-limited/.test(e.err || ""),
     ),
   );
 });
