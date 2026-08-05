@@ -162,6 +162,19 @@ export async function run(env = process.env, overrides = {}) {
   // prior run wrote "passed=[handshake,fetch]" and the pod
   // died before reaching sniff, this run will see that on
   // its handshake callback and skip the relevant stages.
+  // QUB-92: stateInitialized is racy under concurrent
+  // onStagePassed invocations. The macro stages in
+  // runStages are strictly sequential today, so the flag
+  // is set exactly once on the first stage's callback and
+  // no later callback re-enters the read-merge-write block.
+  // If a future change parallelises stages (QUB-91 already
+  // added per-stage retries; a future PR could promote
+  // some macro stages to a worker pool), this flag must
+  // be guarded or replaced with a one-shot helper. The
+  // read-merge-write block is NOT idempotent — running it
+  // twice would re-read the same prior state and double-
+  // filter, possibly dropping stages the current run
+  // already passed.
   let stateInitialized = false;
   const onStagePassed = async (stageId) => {
     const octokit = deps.getOctokit();
@@ -223,8 +236,19 @@ export async function run(env = process.env, overrides = {}) {
     // (no summary, no inlines, no cleanup of prior artifacts —
     // we did not post anything, so the prior review is still
     // current on the PR).
+    //
+    // QUB-102: state.failureReason was set by the abort path
+    // (or by a soft gate failure in workflow.mjs). Forward it
+    // to the dashboard so a "failed" row carries the reason;
+    // otherwise the dashboard cannot distinguish a QUB-102
+    // abort from a sniff-parse failure (both reach the
+    // receiver as stage="failed").
     if (state.parseFailed) {
-      await postDashboardStatus("failed", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
+      await postDashboardStatus("failed", ctx, {
+        log: log.log,
+        fetchImpl: deps.fetchImpl,
+        reason: state.failureReason,
+      });
       return;
     }
 
@@ -240,9 +264,16 @@ export async function run(env = process.env, overrides = {}) {
     log.errlog("review", "staged workflow failed", { error: String(err?.message ?? err) });
     // Best-effort dashboard status so the dashboard's live
     // view shows the run as failed even if the post-pipeline
-    // status PATCH (deps.postStatus) also fails.
-    await postDashboardStatus("failed", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
-    await deps.postStatus("failed", String(err?.message ?? err));
+    // status PATCH (deps.postStatus) also fails. The reason
+    // mirrors the GitHub-commented reason so the operator's
+    // primary view matches the source of truth.
+    const reason = state.failureReason || String(err?.message ?? err);
+    await postDashboardStatus("failed", ctx, {
+      log: log.log,
+      fetchImpl: deps.fetchImpl,
+      reason,
+    });
+    await deps.postStatus("failed", reason);
     throw err;
   } finally {
     // Always scrub credentials and tmp artefacts, even on failure.

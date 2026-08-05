@@ -116,14 +116,14 @@ test("sub-stages are silent on the status thread (QUB-93)", () => {
 // the surface (auth → clone → review → done, in the order the
 // orchestrator in index.mjs drives).
 function recordingDeps(overrides = {}) {
-  const calls = { postStatus: [], log: [] };
+  const calls = { postStatus: [], log: [], errlog: [] };
   return {
     calls,
     fs: { readFile: async () => "fake" },
     jwt: { sign: () => "fake-jwt" },
     fetchImpl: async () => ({ ok: true, json: async () => ({ token: "ghs_token" }), text: async () => "" }),
     log: (stage, msg, extra) => calls.log.push({ stage, msg, extra }),
-    errlog: (stage, msg, extra) => calls.log.push({ stage, msg, extra }),
+    errlog: (stage, msg, extra) => calls.errlog.push({ stage, msg, extra }),
     postStatus: async (stage, detail) => {
       calls.postStatus.push({ stage, detail });
     },
@@ -490,6 +490,11 @@ test("a failed gate sets state.parseFailed and short-circuits the run (QUB-90)",
   const result = await runStages(fakeCtx, deps, overrides, state);
   assert.equal(result, state);
   assert.equal(state.parseFailed, true);
+  // QUB-102: state.failureReason mirrors the gate's reason
+  // so the orchestrator forwards it to the dashboard. The
+  // dashboard row's `error` field then reads "summary parse
+  // failed: no structured block", not just "failed".
+  assert.equal(state.failureReason, "summary parse failed: no structured block");
   // The summary stage was never reached (the gate caught the
   // empty review before the run). The inlines + cleanup
   // stages were also skipped.
@@ -1203,17 +1208,157 @@ test("B2: re-pass with new findings replaces the rejected expert's old findings"
 
 // --- resume (QUB-92) ---------------------------------------------------
 
-test("runStages skips macro stages listed in state.passed (QUB-92)", async () => {
-  // A failed prior run wrote state.passed = ["handshake",
-  // "fetch"] to the status comment. The new run reads it and
-  // skips those two stages; only sniff + summary + inlines +
-  // cleanup run.
+test("runStages aborts when state.passed already has a macro stage (QUB-102)", async () => {
+  // QUB-102: a prior pod of the same Job wrote state.passed =
+  // ["handshake", "fetch"] to the status comment. The K8s
+  // controller's BackoffLimit=0 (jobbuilder.go) is the primary
+  // defense against a second pod starting, but a manual re-
+  // trigger (operator deletes the failed Job, re-issues the
+  // webhook) or a K8s bug can still produce a second pod of
+  // the same Job. The runner's startup guard catches this:
+  // when state.passed is non-empty, it aborts the run before
+  // any side-effecting stage (summary, inlines) runs, so the
+  // PR sees no duplicate summary comment + no duplicate
+  // inline review threads.
   //
-  // The test seeds state.openrouterApiKey (the sniff-legacy
-  // sub-stage gate requires it) and state.octokit (the
-  // summary + inlines gates require it) because the
-  // handshake stage — which would normally populate both —
-  // is skipped.
+  // QUB-92's resume semantics (skip-and-continue) have been
+  // retired by QUB-102. The new contract is "any prior
+  // progress -> abort", which is the literal reading of the
+  // issue's startup guard. The status-comment timeline is
+  // the operator's source of truth for what the prior pod
+  // did; to re-run a review cleanly the operator clears the
+  // status comment or uses a new head SHA.
+  const sequence = [];
+  const octokit = fakeOctokit();
+  const deps = recordingDeps({
+    postStatus: async (stage, detail) => {
+      sequence.push(
+        `postStatus(${stage}${detail ? `: ${detail}` : ""})`,
+      );
+      deps.calls.postStatus.push({ stage, detail });
+    },
+    setOctokit: () => sequence.push("setOctokit"),
+    cloneRepo: async (_ctx, d) => {
+      sequence.push("cloneRepo");
+      await d.postStatus("clone");
+    },
+  });
+  const overrides = {
+    makeOctokit: () => octokit,
+    runOpenCodeSkill: async () => {
+      sequence.push("runOpenCodeSkill");
+      return fakeReview();
+    },
+  };
+  const state = {
+    passed: ["handshake", "fetch"],
+    sub: {},
+    openrouterApiKey: "fake",
+    octokit,
+  };
+  await runStages(fakeCtx, deps, overrides, state);
+  // The second pod refused to run. No handshake, no clone,
+  // no review, no summary, no inlines, no cleanup.
+  assert.ok(!sequence.includes("setOctokit"));
+  assert.ok(!sequence.includes("cloneRepo"));
+  assert.ok(!sequence.includes("postStatus(auth)"));
+  assert.ok(!sequence.includes("runOpenCodeSkill"));
+  assert.equal(octokit.calls.createComment.length, 0);
+  assert.equal(octokit.calls.createReviewComment.length, 0);
+  // The orchestrator in index.mjs reads state.parseFailed and
+  // short-circuits the lifecycle (no dashboard telemetry, no
+  // "done" status). state.failureReason is the message the
+  // orchestrator forwards to the dashboard so a "failed" row
+  // carries the abort reason (not just the stage).
+  assert.equal(state.parseFailed, true);
+  assert.equal(typeof state.failureReason, "string");
+  assert.match(state.failureReason, /another pod already passed/);
+  // The abort was logged at ERROR severity (errlog, not log)
+  // so an operator filtering kubectl logs by level=ERROR sees
+  // the most actionable diagnostic for a QUB-102 hit.
+  const abortErr = deps.calls.errlog.find((c) => c.stage === "abort");
+  assert.ok(abortErr, "expected an errlog entry for the abort");
+  assert.match(abortErr.msg, /another pod already passed/);
+  // The failed status was posted with the same reason. The
+  // reason lists the full passed set so the operator's
+  // status-thread timeline shows the prior pod's progress.
+  const failed = deps.calls.postStatus.find((c) => c.stage === "failed");
+  assert.ok(failed, "expected a failed status post");
+  assert.match(failed.detail, /another pod already passed \[handshake/);
+  assert.match(failed.detail, /refusing to duplicate the review/);
+});
+
+test("runStages aborts even when state.passed only has the summary stage (QUB-102)", async () => {
+  // The headline scenario: pod 1 wrote passed = [..., "summary"]
+  // before dying (e.g. transient network error mid-sniff
+  // recovered, summary posted, then inlines stage crashed).
+  // Pod 2 starts. With BackoffLimit=0 the controller will not
+  // restart, but for the abort path we still want pod 2 to
+  // refuse to re-post the summary comment. The current test
+  // seeds state.passed with the full prefix so the loop hits
+  // the prefix stages first; the abort fires on the first
+  // stage it finds in passed (handshake).
+  //
+  // The reason lists the full prior-pod passed set so the
+  // operator's status timeline shows what pod 1 actually
+  // finished. The important assertion here is that neither
+  // postReview nor postInlineComments was called — the abort
+  // fires before any postable side effect.
+  const sequence = [];
+  const octokit = fakeOctokit();
+  const deps = recordingDeps({
+    postStatus: async (stage, detail) => {
+      sequence.push(
+        `postStatus(${stage}${detail ? `: ${detail}` : ""})`,
+      );
+      deps.calls.postStatus.push({ stage, detail });
+    },
+    setOctokit: () => sequence.push("setOctokit"),
+    cloneRepo: async (_ctx, d) => {
+      sequence.push("cloneRepo");
+      await d.postStatus("clone");
+    },
+  });
+  const overrides = {
+    makeOctokit: () => octokit,
+    runOpenCodeSkill: async () => {
+      sequence.push("runOpenCodeSkill");
+      return fakeReview();
+    },
+  };
+  const state = {
+    passed: ["handshake", "fetch", "sniff", "summary"],
+    sub: {},
+    openrouterApiKey: "fake",
+    octokit,
+  };
+  await runStages(fakeCtx, deps, overrides, state);
+  // The postable side effects must NOT have run.
+  assert.equal(octokit.calls.createComment.length, 0);
+  assert.equal(octokit.calls.createReviewComment.length, 0);
+  // The orchestrator short-circuits on parseFailed and
+  // forwards the reason to the dashboard via
+  // state.failureReason.
+  assert.equal(state.parseFailed, true);
+  assert.equal(typeof state.failureReason, "string");
+  // The reason includes the full prior-pod passed set; the
+  // merge in index.mjs may shuffle the order (the loop hits
+  // handshake first, the merge produces a different shape),
+  // so the assertion checks the items, not the order.
+  const abortErr = deps.calls.errlog.find((c) => c.stage === "abort");
+  assert.ok(abortErr, "expected an errlog entry for the abort");
+  for (const stage of ["handshake", "fetch", "sniff", "summary"]) {
+    assert.ok(
+      abortErr.msg.includes(stage),
+      `expected reason to list ${stage}; got: ${abortErr.msg}`,
+    );
+  }
+});
+
+test("runStages does not abort when state.passed is empty (QUB-102)", async () => {
+  // Counter-test: a fresh run (no prior progress) must not
+  // hit the abort path. The state.passed array is empty; the
+  // loop runs every stage normally.
   const sequence = [];
   const octokit = fakeOctokit();
   const deps = recordingDeps({
@@ -1226,28 +1371,15 @@ test("runStages skips macro stages listed in state.passed (QUB-92)", async () =>
   });
   const overrides = {
     makeOctokit: () => octokit,
-    runOpenCodeSkill: async (_apiKey, _ctx, d) => {
-      sequence.push("runOpenCodeSkill");
-      await d.postStatus("review");
-      return fakeReview();
-    },
+    runOpenCodeSkill: async () => fakeReview(),
   };
-  const state = {
-    passed: ["handshake", "fetch"],
-    sub: {},
-    openrouterApiKey: "fake", // seed for the sniff-legacy gate
-    octokit, // seed for the summary + inlines gates (handshake was skipped)
-  };
+  const state = { passed: [], sub: {} };
   await runStages(fakeCtx, deps, overrides, state);
-  // handshake + fetch were skipped. The "auth" / "clone"
-  // status lines were NOT PATCHed.
-  assert.ok(!sequence.includes("setOctokit"));
-  assert.ok(!sequence.includes("cloneRepo"));
-  assert.ok(!sequence.includes("postStatus(auth)"));
-  // The rest ran normally.
-  assert.ok(sequence.includes("runOpenCodeSkill"));
-  assert.ok(sequence.includes("postStatus(review)"));
-  // The state.passed list grew to include the new stages.
+  assert.equal(state.parseFailed, undefined);
+  // The normal postable side effects still ran.
+  assert.equal(octokit.calls.createComment.length, 1);
+  assert.equal(octokit.calls.createReviewComment.length, 1);
+  // The passed list grew to the full set.
   assert.deepEqual(state.passed, [
     "handshake",
     "fetch",

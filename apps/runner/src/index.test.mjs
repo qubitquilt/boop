@@ -412,6 +412,265 @@ test("run: parse failure on first review also skips the post (no cleanup either 
   assert.ok(statuses.some((s) => /summary parse failed: no structured block/.test(s)));
 });
 
+// --- duplicate-pod guard (QUB-102) -------------------------------------
+//
+// QUB-102 headline scenario: a flaky runner pod (e.g. transient
+// `git fetch` failure) must not cause a second pod to run the same
+// review and post duplicate summary + inline comments.
+//
+// In production, BackoffLimit=0 in the Job spec is the primary
+// defense (a pod failure surfaces as a failed Job; the K8s
+// controller never restarts). This integration test is the
+// defense-in-depth: even if a second pod of the same Job does
+// start (operator re-trigger, K8s bug, etc.), the runner's
+// startup guard (runStages aborts on state.passed hit) prevents
+// the second pod from posting a duplicate summary + inline
+// review threads.
+//
+// The test wires two `run()` calls against a stateful Octokit
+// whose comment body persists across calls. Pod 1's
+// onStagePassed callbacks write passed=[handshake,fetch] to
+// the comment before the sniff stage throws. Pod 2 reads the
+// state from the comment on its first onStagePassed (handshake)
+// and aborts on the loop's first iteration.
+//
+// Assertion: exactly zero summary comments + exactly zero
+// inline comments land across both pods (the "only one"
+// wording in the issue covers zero as well — no duplicates
+// is the success criterion).
+
+// statefulOctokit keeps the comment body in a single mutable
+// buffer. updateComment writes through; getComment reads the
+// current body. The body holds both the receiver's status
+// timeline ("<!-- boop-timeline -->") and the QUB-92
+// workflow-state marker ("<!-- boop-state: ... -->"), so
+// the runner's readWorkflowState sees the prior pod's
+// progress and the abort path fires.
+function statefulOctokit({ seedPassed } = {}) {
+  const calls = {
+    createComment: [],
+    updateComment: [],
+    getComment: [],
+    createReviewComment: [],
+  };
+  let body =
+    "🐾 **Boop's on the case!**\n\n<!-- boop-timeline -->\n";
+  // Seed the comment body with a QUB-92 state line so the
+  // runner reads a prior pod's progress on its first
+  // onStagePassed callback. Used by the post-summary-pod-1
+  // integration test below.
+  if (seedPassed && seedPassed.length > 0) {
+    const stateLine = `<!-- boop-state: ${JSON.stringify({
+      passed: seedPassed,
+      sub: {},
+    })} -->`;
+    body = body + stateLine + "\n";
+  }
+  const octokit = {
+    calls,
+    rest: {
+      issues: {
+        createComment: async (args) => {
+          calls.createComment.push(args);
+          return { data: { id: 1001, body: args.body } };
+        },
+        updateComment: async (args) => {
+          calls.updateComment.push(args);
+          body = args.body;
+          return { data: { id: 111, body: args.body } };
+        },
+        getComment: async () => {
+          calls.getComment.push({});
+          return { data: { body } };
+        },
+      },
+      pulls: {
+        createReviewComment: async (args) => {
+          calls.createReviewComment.push(args);
+          return { data: { id: 1 } };
+        },
+      },
+    },
+  };
+  return octokit;
+}
+
+test("run: pod-1-fails-mid-sniff + pod-2-starts -> no duplicate posts (QUB-102)", async () => {
+  // A stateful Octokit so pod 2's readWorkflowState sees pod
+  // 1's writeWorkflowState output. The first pod is wired to
+  // fail mid-sniff (runOpenCodeSkill throws); the second pod
+  // is wired to succeed (same shape as the happy-path
+  // stub). If the abort path is missing, pod 2 would post a
+  // summary comment + inline review threads — exactly the
+  // duplicate PR comments the issue describes.
+  const octokit = statefulOctokit();
+  let sniffCalls = 0;
+  const makeOctokit = () => octokit;
+  const overrides = standardOverrides({
+    makeOctokit,
+    runOpenCodeSkill: async () => {
+      sniffCalls++;
+      if (sniffCalls === 1) {
+        // Pod 1: transient git-fetch failure mid-sniff.
+        throw new Error("git fetch failed: connection reset by peer");
+      }
+      // Pod 2: would normally produce a real review.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return fakeReview();
+    },
+  });
+
+  // Pod 1: throws from sniff. The outer catch in run() posts
+  // a "failed" status and rethrows. We assert on the reject
+  // to prove pod 1 actually failed.
+  await assert.rejects(
+    () => run(env, overrides),
+    /git fetch failed/,
+  );
+
+  // Pod 2: a fresh run with the same overrides. The stateful
+  // Octokit now contains pod 1's passed=[handshake,fetch] in
+  // the comment body. The onStagePassed callback for handshake
+  // reads that state and merges it into pod 2's state.passed.
+  // runStages then loops and finds handshake already in
+  // passed -> abort path -> parseFailed = true -> orchestrator
+  // short-circuits. The summary + inline stages never run.
+  await run(env, overrides);
+
+  // Headline assertion: zero summary comments across both pods.
+  // The summary stage never ran (pod 1 died before it; pod 2
+  // aborted). With the abort path in place, this is exactly
+  // what we expect.
+  assert.equal(
+    octokit.calls.createComment.length,
+    0,
+    "expected zero summary comments across both pods (no duplicate posts)",
+  );
+  assert.equal(
+    octokit.calls.createReviewComment.length,
+    0,
+    "expected zero inline review threads across both pods",
+  );
+
+  // Pod 2's status thread carries the abort reason. The
+  // status timeline is the operator's source of truth; they
+  // can see "another pod already passed [...]" in the
+  // comment. The reason lists the full prior-pod passed
+  // set so the operator does not have to cross-reference
+  // the timeline. The order can be ["handshake","fetch"] or
+  // ["fetch","handshake"] depending on the merge's push-
+  // then-merge ordering — the assertion checks both stages
+  // are present, not the order.
+  const lastFailed = [...octokit.calls.updateComment]
+    .reverse()
+    .find((c) => /chased tail/.test(c.body));
+  assert.ok(lastFailed, "expected a 'chased tail' status post on pod 2");
+  assert.match(
+    lastFailed.body,
+    /another pod already passed \[[^\]]+\]/,
+    "expected the QUB-102 abort reason in bracket form",
+  );
+  assert.ok(
+    lastFailed.body.includes("handshake"),
+    "expected abort reason to list handshake",
+  );
+  assert.ok(
+    lastFailed.body.includes("fetch"),
+    "expected abort reason to list fetch",
+  );
+  assert.match(
+    lastFailed.body,
+    /refusing to duplicate the review/,
+    "expected the QUB-102 abort reason to call out the duplicate-post prevention",
+  );
+
+  // The state.passed in the final boop-state line contains
+  // both handshake and fetch (the stages pod 1 finished
+  // before failing). The order is determined by the merge
+  // logic; the assertion is on the SET, not the order.
+  const lastState = [...octokit.calls.updateComment]
+    .reverse()
+    .find((c) => /boop-state:/.test(c.body));
+  assert.ok(lastState, "expected a boop-state line in the final comment");
+  assert.match(
+    lastState.body,
+    /"passed":\[(?:"handshake","fetch"|"fetch","handshake")\]/,
+    "expected state.passed to contain both handshake and fetch",
+  );
+});
+
+// The strongest version of the QUB-102 integration test: pod
+// 1 succeeded all the way through summary + inlines, then a
+// sibling pod 2 starts. The runner guard must prevent pod 2
+// from posting duplicate summary + inline comments even
+// though pod 1 already did so. Without the guard, this test
+// fails (pod 2 would happily re-post via its runOpenCodeSkill
+// override). The pre-summary-pod-1 case is weaker: deleting
+// the guard there would still pass because pod 1 died before
+// posting anything.
+test("run: pod-1-posted-summary-and-inlines + pod-2-starts -> no duplicate posts (QUB-102)", async () => {
+  // Seed the comment body with a state line that says pod 1
+  // finished through inlines (and thus posted both summary
+  // + inline review threads). runOpenCodeSkill returns a
+  // real review, so a guard-less pod 2 would happily
+  // re-post both.
+  const octokit = statefulOctokit({
+    seedPassed: ["handshake", "fetch", "sniff", "summary", "inlines"],
+  });
+  const overrides = standardOverrides({
+    makeOctokit: () => octokit,
+    runOpenCodeSkill: async () => fakeReview(),
+  });
+  await run(env, overrides);
+  // Headline assertion: even with runOpenCodeSkill ready to
+  // post a real review, pod 2 posted zero summary comments
+  // and zero inline review threads.
+  assert.equal(
+    octokit.calls.createComment.length,
+    0,
+    "expected zero summary comments from pod 2 (guard must fire)",
+  );
+  assert.equal(
+    octokit.calls.createReviewComment.length,
+    0,
+    "expected zero inline review threads from pod 2 (guard must fire)",
+  );
+  // The status thread carries the abort reason. The reason
+  // lists the full prior-pod passed set so the operator
+  // sees pod 1 finished through inlines.
+  const lastFailed = [...octokit.calls.updateComment]
+    .reverse()
+    .find((c) => /chased tail/.test(c.body));
+  assert.ok(lastFailed, "expected a 'chased tail' status post on pod 2");
+  for (const stage of ["handshake", "fetch", "sniff", "summary", "inlines"]) {
+    assert.ok(
+      lastFailed.body.includes(stage),
+      `expected abort reason to list ${stage}; got: ${lastFailed.body}`,
+    );
+  }
+});
+
+// Same shape but pod 1 only reached summary (not inlines).
+// Pod 2 must still abort before re-posting summary. Without
+// the guard, pod 2 would post a duplicate summary comment.
+test("run: pod-1-posted-summary + pod-2-starts -> no duplicate posts (QUB-102)", async () => {
+  const octokit = statefulOctokit({
+    seedPassed: ["handshake", "fetch", "sniff", "summary"],
+  });
+  const overrides = standardOverrides({
+    makeOctokit: () => octokit,
+    runOpenCodeSkill: async () => fakeReview(),
+  });
+  await run(env, overrides);
+  assert.equal(octokit.calls.createComment.length, 0);
+  assert.equal(octokit.calls.createReviewComment.length, 0);
+  const lastFailed = [...octokit.calls.updateComment]
+    .reverse()
+    .find((c) => /chased tail/.test(c.body));
+  assert.ok(lastFailed, "expected a 'chased tail' status post on pod 2");
+  assert.ok(lastFailed.body.includes("summary"));
+});
+
 // --- module surface -----------------------------------------------------
 
 test("run is exported as a named function from index.mjs", async () => {

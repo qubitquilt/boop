@@ -107,6 +107,33 @@ test("postStatus does NOT retry on 202 (run not yet persisted)", async () => {
   assert.equal(fr.calls(), 1, "202 is not retryable — the runner will retry on the next stage");
 });
 
+test("postStatus attaches the reason to the payload as `error` (QUB-102)", async () => {
+  // The QUB-102 dashboard plumbing forwards the abort or
+  // gate-failure reason as the `error` field in the
+  // statusRequest body. The receiver's RecordStatus stores
+  // it via UpdateRunStatus and surfaces it on the dashboard
+  // row so the operator can distinguish a QUB-102 abort
+  // from a sniff-parse failure (both reach the receiver as
+  // stage="failed"). Lockdown test: a future refactor that
+  // drops the error field will fail here, not at the
+  // orchestrator level.
+  sent.length = 0;
+  await postStatus(
+    "failed",
+    makeCtx(),
+    { log: () => {}, fetchImpl: makeFetchOK() },
+    "another pod already passed [fetch, handshake]; refusing to duplicate the review",
+  );
+  assert.equal(sent.length, 1);
+  assert.equal(
+    sent[0].init.body,
+    JSON.stringify({
+      stage: "failed",
+      error: "another pod already passed [fetch, handshake]; refusing to duplicate the review",
+    }),
+  );
+});
+
 test("postTelemetry is a no-op when telemetry is null", async () => {
   sent.length = 0;
   await postTelemetry(null, makeCtx(), { log: () => {}, fetchImpl: makeFetchOK() });

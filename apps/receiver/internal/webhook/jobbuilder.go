@@ -55,8 +55,20 @@ const (
 	// Job timing knobs. The runner has a 25-min hard kill on
 	// opencode (see OPENCODE_TIMEOUT_MS in apps/runner/src/index.mjs),
 	// leaving 5 min of headroom against the 30-min active deadline.
-	jobTTLSeconds         = 3600
-	jobBackoffLimit       = 1
+	jobTTLSeconds = 3600
+	// jobBackoffLimit is 0 (QUB-102). Combined with RestartPolicy
+	// Never, a single pod failure ends the Job in `Failed` state
+	// immediately. Any pod restart would mint a fresh installation
+	// token + PATCH the status comment + POST the summary + POST the
+	// inline comments — all with the same BOOP_JOB_NAME, so the
+	// receiver's claimJobSlot dedup (handler.go:497) cannot tell two
+	// pods of the same Job apart, and every GitHub side-effect would
+	// land twice. The runner's startup guard (runStages in
+	// workflow.mjs) is a belt-and-suspenders defense for the case
+	// where a second pod does start (operator re-trigger, K8s bug,
+	// etc.) and detects prior progress via the QUB-92 status-comment
+	// state.
+	jobBackoffLimit       = 0
 	jobActiveDeadlineSecs = 1800
 
 	// Resource requests and limits. Mirrored from the old
