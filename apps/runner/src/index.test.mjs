@@ -71,9 +71,9 @@ function fakeOctokit(handlers = {}) {
           if (handlers.updateComment) return handlers.updateComment(args);
           return { data: { id: 1, body: args.body } };
         },
-        getComment: async () => {
-          calls.getComment.push({});
-          if (handlers.getComment) return handlers.getComment();
+        getComment: async (args) => {
+          calls.getComment.push(args || {});
+          if (handlers.getComment) return handlers.getComment(args);
           return { data: { body: "header\n<!-- boop-timeline -->\n" } };
         },
       },
@@ -317,16 +317,84 @@ test("run: re-review labels the summary as re-review #N", async () => {
   assert.match(octokit.calls.createComment[0].body, /re-review #3/);
 });
 
-test("run: no status comment id → skip status updates", async () => {
+test("run: no status comment id → runner creates initial status comment", async () => {
+  // QUB-99: the receiver no longer pre-creates the status comment
+  // (the prior ordering left orphans when the receiver died between
+  // postStatus and createJob). The runner now takes over the
+  // creation on its first postStatus call. With
+  // BOOP_STATUS_COMMENT_ID unset, the runner must POST a new
+  // initial comment, then PATCH it for every subsequent stage
+  // (auth/clone/review/done).
   const noStatusEnv = { ...env };
   delete noStatusEnv.BOOP_STATUS_COMMENT_ID;
   const octokit = fakeOctokit();
   const overrides = standardOverrides({ makeOctokit: () => octokit });
   await run(noStatusEnv, overrides);
-  // getComment never called (status updates skipped).
-  assert.equal(octokit.calls.getComment.length, 0);
-  // Summary still posts.
-  assert.equal(octokit.calls.createComment.length, 1);
+  // First create: the runner's initial status comment.
+  assert.equal(octokit.calls.createComment.length, 2); // 1 = initial status, 2 = summary
+  const initial = octokit.calls.createComment[0];
+  assert.match(initial.body, /Boop's on the case/);
+  // Every subsequent postStatus is a PATCH (no extra create).
+  assert.ok(octokit.calls.updateComment.length > 0, "expected at least one PATCH");
+  // The new comment id is reused for every PATCH (one per stage).
+  const patchedIds = new Set(octokit.calls.updateComment.map((c) => c.comment_id));
+  assert.equal(patchedIds.size, 1, "all PATCHes should target the same id");
+});
+
+test("run: QUB-92 resume read uses the live statusCommentSlot, not the env-var snapshot", async () => {
+  // PR-review finding: prior to this fix, the resume read in
+  // onStagePassed keyed off ctx.statusCommentId (the env-var
+  // snapshot), which is null because the receiver no longer
+  // pre-creates the status comment. The slot populated by
+  // ensureStatusComment is the new source of truth; if the
+  // resume read kept using ctx.statusCommentId, a future
+  // pod-restart path would silently no-op. This test pins the
+  // contract: after the runner lazy-creates the comment, a
+  // getComment call to read prior state must use the
+  // slot-populated id, not the env var.
+  const noStatusEnv = { ...env };
+  delete noStatusEnv.BOOP_STATUS_COMMENT_ID;
+  // Pre-populate the comment body so the resume read returns a
+  // non-empty prior state — the runner would otherwise treat
+  // it as a fresh run.
+  let getCommentId = null;
+  const octokit = fakeOctokit({
+    // Capture the comment id the runner asked for via the
+    // args the runner passes; the runner calls
+    // octokit.rest.issues.getComment({ owner, repo,
+    // comment_id, ... }) so the id lands in args.comment_id.
+    getComment: async (args) => {
+      if (args && typeof args.comment_id === "number") {
+        getCommentId = args.comment_id;
+      }
+      return {
+        data: {
+          body:
+            "header\n<!-- boop-state: " +
+            JSON.stringify({ passed: ["handshake"], sub: {} }) +
+            " -->\n<!-- boop-timeline -->\n",
+        },
+      };
+    },
+  });
+  const overrides = standardOverrides({ makeOctokit: () => octokit });
+  await run(noStatusEnv, overrides);
+  // The first getComment call sees the new comment id that
+  // ensureStatusComment minted (id 1 by default in this
+  // file's fakeOctokit). Before the F1 fix, the resume read
+  // key was ctx.statusCommentId (null) and the early-return
+  // short-circuited onStagePassed without ever calling
+  // getComment. Asserting the id is non-null AND matches
+  // the lazy-created id pins the new contract.
+  assert.ok(
+    getCommentId !== null,
+    "getComment should have been called with the live id, not null",
+  );
+  assert.equal(
+    getCommentId,
+    1,
+    "getComment id should match the lazy-created comment id",
+  );
 });
 
 test("run: botLogin unset → skip cleanupPriorReview on re-review", async () => {
