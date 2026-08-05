@@ -24,6 +24,8 @@ type Client struct {
 	expires time.Time
 }
 
+const githubCallTimeout = 5 * time.Second
+
 // installationClient returns a GitHub client authenticated as this
 // installation, reusing a cached one if its token is still valid.
 func (c *Client) installationClient(ctx context.Context) (*github.Client, error) {
@@ -64,6 +66,8 @@ type PullRequest struct {
 
 // FetchPullRequest retrieves the PR's current head SHA and base ref.
 func (c *Client) FetchPullRequest(ctx context.Context, owner, repo string, number int) (*PullRequest, error) {
+	ctx, cancel := context.WithTimeout(ctx, githubCallTimeout)
+	defer cancel()
 	client, err := c.installationClient(ctx)
 	if err != nil {
 		return nil, err
@@ -168,6 +172,8 @@ func extractPriorReviewSHA(body string) string {
 // Paginates with a large page size; PRs rarely carry more than a
 // handful of reviews, so the cost is negligible.
 func (c *Client) CountPriorReviews(ctx context.Context, owner, repo string, issueNumber int) (int, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, githubCallTimeout)
+	defer cancel()
 	client, err := c.installationClient(ctx)
 	if err != nil {
 		return 0, "", err
