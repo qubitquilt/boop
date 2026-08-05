@@ -43,10 +43,11 @@ Each has bounded retry. Each is individually resumable.
 | `inlines`   | _(silent)_ | Post the inline comments. |
 | `cleanup`   | _(silent)_ | Resolve / minimize prior Boop artifacts on re-reviews. |
 
-`_run_opencode_` in the macro `sniff` stage is no longer a single
-LLM call; it is the sub-workflow executor. The "review" status
-line is posted once at the start of the macro `sniff` stage and
-covers the whole sub-workflow (so the user-visible surface stays
+`runOpenCodeSkill` in the macro `sniff` stage is no longer a single
+LLM call; it is the sub-workflow executor (the `narrate` sub-stage
+that calls `runOpenCodeSkill` for the boop prompt). The "review"
+status line is posted once at the start of the macro `sniff` stage
+and covers the whole sub-workflow (so the user-visible surface stays
 the same; see QUB-93).
 
 ## Sub-stages inside `sniff` (review sub-workflow)
@@ -54,7 +55,7 @@ the same; see QUB-93).
 | id | what it does |
 |---|---|
 | `classify`    | Identify the type of PR (bug fix, feature, refactor, docs, test-only, infra, etc.). The classification drives the expert selection in the next sub-stage. |
-| `dispatch`    | Choose the experts (1..N) and craft the context for each. Run them in parallel as independent `opencode run` invocations with a tool surface scoped to the PR (bash, file reads, test runner). Each expert is autonomous — it can run tests, inspect files, etc. |
+| `dispatch`    | Choose the experts (1..N) and craft the context for each. Run them in parallel as independent OpenRouter SDK chat completions with a tool surface scoped to the PR (bash, file reads, test runner). Each expert is autonomous — it can run tests, inspect files, etc. |
 | `gather`      | Collect the findings from every expert into a single `state.findings` array. |
 | `meta-review` | A meta-reviewer LLM call that scans the findings for things that "stick out as potentially wrong" (false positives, contradictions, missing context). If anything sticks out, dispatch a re-pass of the specific experts that produced those findings. The re-pass is **bounded to one re-pass per run**; meta-review cannot re-loop. |
 | `narrate`     | Once meta-review is satisfied, a narrative-writer LLM call produces a single cohesive summary + the inline-comment set from the (possibly re-reviewed) findings. |
@@ -115,7 +116,7 @@ already passed, and resumes from the first not-passed (sub-)stage.
 - **No new container images.** The runner image is unchanged; the
   receiver image is unchanged; the ConfigMap is unchanged.
 - **Parallel experts are native.** Each expert is a separate
-  `opencode run` invocation within the same runner pod. Node's
+  OpenRouter SDK chat completion within the same runner pod. Node's
   `Promise.all` fans them out; the pod's CPU/memory budget covers
   them. The 30-min `activeDeadlineSeconds` is the wall-clock ceiling.
 
@@ -218,10 +219,10 @@ and the existing test suite passes end-to-end at every step.
    in `dispatch`.
 8. **QUB-95 — dispatch + parallel experts.** Add the `dispatch`,
    `gather`, and `narrate` sub-stages. The orchestrator picks
-   experts; the runner fans them out as parallel `opencode run`
-   invocations; `gather` collects the findings; `narrate` produces
-   the summary + inlines. This is the most expensive PR (token
-   cost and wall time both grow).
+   experts; the runner fans them out as parallel OpenRouter SDK
+   chat completions; `gather` collects the findings; `narrate`
+   produces the summary + inlines. This is the most expensive PR
+   (token cost and wall time both grow).
 9. **QUB-96 — meta-review with bounded re-pass.** Add the
    `meta-review` sub-stage. The meta-reviewer scans the gathered
    findings; if anything sticks out, it dispatches a re-pass of

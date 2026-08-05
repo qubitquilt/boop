@@ -8,10 +8,11 @@
 //
 // Today the classifier is a stub that returns a placeholder
 // type + low confidence. A follow-up PR wires the real
-// LLM call: a small `opencode run` with a classification
-// prompt (PR title + body + diff stats → PR type). The
-// stub is enough for QUB-94's test surface; the override
-// hook lets a test inject a deterministic classification.
+// LLM call: a small OpenRouter SDK chat completion with a
+// classification prompt (PR title + body + diff stats → PR
+// type). The stub is enough for QUB-94's test surface; the
+// override hook lets a test inject a deterministic
+// classification.
 //
 // The classifier is a pure function over (ctx, deps). It
 // does not depend on workflow.mjs or any runner state —

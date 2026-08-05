@@ -5,7 +5,6 @@ description: >
   changed code. Focuses on issues that will make the changed code harder
   to maintain or extend. Use alongside the other six lenses; this one
   covers code-quality specifically.
-compatibility: opencode-ai
 version: "1.0"
 ---
 

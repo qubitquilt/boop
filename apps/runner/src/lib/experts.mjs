@@ -9,9 +9,10 @@
 // runOpenCodeSkill).
 //
 // Today every expert is a stub: each returns a placeholder
-// finding. The real LLM call (an `opencode run` per expert
-// with a tailored prompt + tool surface) is a follow-up. The
-// override hook lets a test inject specific experts.
+// finding. The real LLM call (an OpenRouter SDK chat
+// completion per expert with a tailored prompt + tool
+// surface) is a follow-up. The override hook lets a test
+// inject specific experts.
 //
 // The expert model:
 //   - Each expert is an async function (ctx, deps, shared)
@@ -67,9 +68,9 @@ export const EXPERT_POOL = {
 
 // defaultExpert is the stub. Returns a single finding with
 // the expert's name + a placeholder body. The real expert
-// will run an `opencode run` invocation with a tailored
-// prompt + the PR diff + tool access (bash, file reads,
-// test runner) scoped to the cloned repo.
+// will run an OpenRouter SDK chat completion with a
+// tailored prompt + the PR diff + tool access (bash, file
+// reads, test runner) scoped to the cloned repo.
 async function defaultExpert(name, _ctx, _deps) {
   return {
     findings: [
@@ -118,11 +119,11 @@ export async function runExperts(names, ctx, deps, shared = {}) {
 
 // defaultMetaReview is the stub. It accepts every finding
 // and requests no re-pass. A follow-up PR wires the real
-// meta-reviewer LLM call: an `opencode run` that scans the
-// gathered findings for things that "stick out as
-// potentially wrong" (false positives, contradictions,
-// missing context) and returns the list of experts to
-// re-dispatch.
+// meta-reviewer LLM call: an OpenRouter SDK chat completion
+// that scans the gathered findings for things that "stick
+// out as potentially wrong" (false positives,
+// contradictions, missing context) and returns the list of
+// experts to re-dispatch.
 //
 // The return shape is { reDispatch: string[] } — the names
 // of the experts whose findings need a re-pass. An empty

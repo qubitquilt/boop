@@ -7,18 +7,21 @@ The whole tree is packed into a single `boop-runner-config` ConfigMap by the
 recursively and uses each file's relative path as its key. Mounted as a volume,
 the directory structure is preserved verbatim.
 
+QUB-98 dropped `opencode.json` from the ConfigMap (and the opencode CLI
+itself). The runner now reads the model name from `OPENROUTER_MODEL` and
+calls the OpenRouter SDK in-process. Only the skill files mount here.
+
 ## Layout
 
 | Path | Purpose |
 |------|---------|
-| `opencode.json` | OpenCode config (model, provider, mcp servers, etc.) |
 | `skills/boop/SKILL.md` | Boop orchestrator: persona, voice contract, output spec |
 | `skills/boop/agents/review-*.md` | Seven review lenses the orchestrator walks |
 
 The runner reads `skills/boop/SKILL.md` and inlines the lens files into the
-prompt. Boop walks all seven lenses in a single OpenCode call, then emits a
-`=== SUMMARY === ... === INLINE COMMENTS === ... === END ===` block that the
-runner parses and posts to the PR.
+prompt. Boop walks all seven lenses in a single OpenRouter SDK call, then
+emits a `=== SUMMARY === ... === INLINE COMMENTS === ... === END ===` block
+that the runner parses and posts to the PR.
 
 ## The seven lenses
 
@@ -45,7 +48,6 @@ sub-agent invocations.
    structure is preserved on mount:
    ```yaml
    files:
-     - opencode.json=runner-config/opencode.json
      - skills/<skill>/SKILL.md=runner-config/skills/<skill>/SKILL.md
      - skills/<skill>/agents/<agent>.md=runner-config/skills/<skill>/agents/<agent>.md
    ```

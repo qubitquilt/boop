@@ -7,7 +7,6 @@ description: >
   suggests a concrete alternative. Audits factory / closure
   consistency so forwarded kwargs are not silently shadowed by
   captured values.
-compatibility: opencode-ai
 version: "1.0"
 ---
 

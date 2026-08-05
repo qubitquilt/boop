@@ -15,15 +15,12 @@
 
 export const REPO_DIR = "/work/repo";
 
-// Source of the read-only opencode config ConfigMap (boop-runner-config).
-// The runner reads from this mount directly (not the materialized copy)
-// to avoid pulling every prior ConfigMap version into the writable
-// destination and OOMing the pod.
+// Source of the read-only runner-config ConfigMap (boop-runner-config).
+// The runner reads skill files (SKILL.md + the seven lens files) from
+// this mount directly. QUB-98 dropped the opencode.json key from the
+// ConfigMap and the opencode CLI entirely; only the skill files mount
+// here now.
 export const CONFIG_SRC = "/home/opencode/.config/opencode";
-
-export const WRITABLE_HOME = "/tmp/opencode-home";
-export const WRITABLE_CONFIG = "/tmp/opencode-config";
-export const CONFIG_DIR = `${WRITABLE_CONFIG}/opencode`;
 
 export const NETRC_PATH = "/tmp/boop-netrc";
 export const GITCONFIG_PATH = "/tmp/boop-gitconfig";
@@ -34,8 +31,11 @@ export const GITCONFIG_PATH = "/tmp/boop-gitconfig";
 export const DEFAULT_PRIVATE_KEY_PATH = "/secrets/github-app-private-key";
 export const DEFAULT_OPENROUTER_KEY_PATH = "/secrets/openrouter-api-key";
 
-// Hard ceiling on the opencode subprocess. The Job has a 30-min
+// Hard ceiling on the OpenRouter SDK call. The Job has a 30-min
 // activeDeadlineSeconds; keep some headroom for the post-review work.
+// The constant name is preserved (it predates the SDK cutover) so
+// dashboards, dashboards-side tests, and receivers that key off the
+// 25-min budget don't have to update.
 export const OPENCODE_TIMEOUT_MS = 25 * 60 * 1000;
 
 // Status stages. The receiver uses the same vocabulary so the user
@@ -61,7 +61,7 @@ export const SHORT = {
 
 // Lens files inlined into the prompt. Order matches the order the
 // orchestrator tells the model to walk them. Read from the source
-// mount (not the materialized copy) — see `CONFIG_SRC` comment.
+// mount at ${CONFIG_SRC}/skills/boop/.
 export const LENS_FILES = [
   "agents/review-code-quality.md",
   "agents/review-design-pattern.md",
@@ -123,23 +123,15 @@ export function loadConfig(env = process.env) {
     cwd: env.CWD || "/app",
     // Dashboard data layer. Both must be set for the runner to
     // POST lifecycle + telemetry; if either is missing the
-    // dashboard helpers are no-ops and the runner falls back
-    // to the TUI mode in opencode.mjs (no telemetry captured).
+    // dashboard helpers are no-ops and the runner still posts the
+    // review to GitHub (telemetry is simply not captured).
     dashboardUrl: env.BOOP_DASHBOARD_URL || null,
     dashboardToken: env.BOOP_DASHBOARD_TOKEN || null,
     jobName: env.BOOP_JOB_NAME || null,
-    // QUB-94: feature flag for the in-process OpenRouter SDK path.
-    // When set to "1", runOpenCodeSkill takes the new code path
-    // (apps/runner/src/lib/openrouter.mjs) and skips the
-    // opencode subprocess entirely. The old path stays unchanged
-    // so a flag flip is the rollback. Default is "0" until the
-    // cutover PR lands and a week of clean runs passes.
-    openrouterSdkEnabled: env.BOOP_USE_OPENROUTER_SDK === "1",
-    // QUB-94: optional model override for the SDK path. When set,
-    // overrides the value read from the opencode.json ConfigMap
-    // (which still mounts during the cutover). After QUB-98
-    // deletes the ConfigMap, this becomes the only source of
-    // the model name.
+    // Model name forwarded to the OpenRouter SDK. The QUB-94
+    // cutover used opencode.json's `model` field as the
+    // fallback; QUB-98 deleted the opencode.json ConfigMap so
+    // this env var is now the only source of the model name.
     openrouterModel: env.OPENROUTER_MODEL || null,
   };
 }

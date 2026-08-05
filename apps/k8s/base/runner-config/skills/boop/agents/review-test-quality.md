@@ -11,7 +11,6 @@ description: >
   Audits conditional test absence (`importorskip`, `skipif`, `todo`,
   env-var gates) as a first-class Unverified path tier — CI green is
   not the same as coverage.
-compatibility: opencode-ai
 version: "1.0"
 ---
 

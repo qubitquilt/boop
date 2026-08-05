@@ -98,12 +98,14 @@ type Config struct {
 	BackupDir   string
 	BackupEvery time.Duration
 	BackupKeep  int
-	// QUB-94: cluster-wide default for the OpenRouter SDK feature
-	// flag. The runner takes the in-process SDK path when
-	// BOOP_USE_OPENROUTER_SDK=1; otherwise it falls back to the
-	// opencode subprocess. Per-PR overrides win over this default
-	// (see sdkEnabledLabel). Default "0" until the cutover PR
-	// ships and a week of clean runs passes.
+	// QUB-94 / QUB-98: cluster-wide default for the OpenRouter SDK
+	// feature flag. The runner's only invocation path is the
+	// in-process OpenRouter SDK; the flag is preserved for the
+	// QUB-N rollout, where a cluster that has not yet flipped
+	// the default to "1" still routes through the SDK in the
+	// runner (the flag is now informational). Per-PR overrides
+	// win over this default (see sdkEnabledLabel). A future PR
+	// removes the flag entirely.
 	OpenRouterSDKDefault string
 }
 
@@ -733,9 +735,11 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		// runner at a public URL (where the token would leak).
 		DashboardURL:   "http://boop-receiver.dev-tools.svc.cluster.local:8080",
 		DashboardToken: h.cfg.RunnerToken,
-		// QUB-94: forwarded into BOOP_USE_OPENROUTER_SDK so the
-		// runner takes the in-process SDK path. Defaults to "0"
-		// (opencode subprocess) until the cutover.
+		// QUB-94 / QUB-98: forwarded into BOOP_USE_OPENROUTER_SDK.
+		// The runner's only invocation path is the in-process
+		// OpenRouter SDK; the flag is preserved for the QUB-N
+		// rollout. Per-PR labels (boop:openrouter-sdk) override
+		// this for a single review.
 		OpenRouterSDKEnabled: sdkEnabled,
 	})
 	if err != nil {
@@ -955,11 +959,10 @@ const skipReviewLabel = "skip-review"
 // OpenRouter SDK path for its next review. The cluster-wide
 // default (Config.OpenRouterSDKDefault, sourced from
 // BOOP_USE_OPENROUTER_SDK on the receiver) still applies; the
-// label is a per-PR override. During the QUB-94 rollout the
-// cluster default stays at "0" (opencode subprocess) and the
-// label is how operators flip a single PR to the SDK path for
-// smoke-testing. After the cutover the cluster default flips to
-// "1" and the label becomes a no-op opt-in.
+// label is a per-PR override. QUB-98 made the SDK the runner's
+// only invocation path; the label is preserved for the QUB-N
+// rollout, where clusters that have not yet flipped the default
+// to "1" still route through the SDK in the runner.
 const sdkEnabledLabel = "boop:openrouter-sdk"
 
 func hasLabel(labels []string, name string) bool {
@@ -974,12 +977,8 @@ func hasLabel(labels []string, name string) bool {
 // resolveSDKEnabled picks the BOOP_USE_OPENROUTER_SDK value for
 // the next review Job on a PR. The cluster default
 // (h.cfg.OpenRouterSDKDefault) sets the floor; the per-PR label
-// is an opt-in. There is no opt-out label today: during the
-// rollout, the cluster default is "0" (opencode) and a label
-// switches a single PR to "1" (SDK). After the cutover, the
-// cluster default flips to "1" and the label becomes redundant.
-// The decision is logged so the operator can see why a given
-// Job landed on either path.
+// is an opt-in. The decision is logged so the operator can see
+// why a given Job landed on either value.
 func (h *Handler) resolveSDKEnabled(labels []string) string {
 	if hasLabel(labels, sdkEnabledLabel) {
 		return "1"

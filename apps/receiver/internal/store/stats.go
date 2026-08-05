@@ -376,7 +376,8 @@ type ModelRollup struct {
 
 // PerModel returns the per-model rollup. Pulled from the
 // telemetry table directly; runs without telemetry are excluded
-// (a run that didn't reach opencode has no model to attribute to).
+// (a run that didn't reach the SDK call has no model to
+// attribute to).
 func (s *Store) PerModel(ctx context.Context, from, to time.Time) ([]ModelRollup, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT t.model,

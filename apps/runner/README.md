@@ -9,10 +9,14 @@ PR. Invoked as a Kubernetes Job by the boop-receiver when a
 1. Mints a GitHub App installation token from the App credentials in
    the environment.
 2. Clones the PR at `PR_HEAD_SHA` into `/work/repo`.
-3. Starts OpenCode against `/home/opencode/.config/opencode` (mounted
-   from the `boop-runner-config` ConfigMap), runs the `boop` skill
-   on the repo, and captures the assistant's text output.
-4. Posts the result as a single review comment on the PR.
+3. Reads the boop skill (`SKILL.md` + the seven lens files) from
+   `/home/opencode/.config/opencode` (the `boop-runner-config`
+   ConfigMap mount) and inlines them into a prompt.
+4. Calls the OpenRouter SDK in-process to produce the review. The
+   response is parsed for the `=== SUMMARY === / === INLINE COMMENTS
+   === / === CONFIDENCE === / === END ===` block and posted to the
+   PR.
+5. Posts the result as a single review comment on the PR.
 
 ## Build
 
@@ -37,3 +41,4 @@ docker buildx build --platform linux/arm64 \
 | `PR_OWNER`, `PR_REPO`, `PR_NUMBER` | Job template |
 | `PR_HEAD_SHA`, `PR_BASE_REF` | Job template |
 | `OPENROUTER_API_KEY` | `boop-secrets` |
+| `OPENROUTER_MODEL` | Job template (model id, e.g. `minimax/minimax-m3`) |

@@ -56,7 +56,7 @@ import {
   runExperts,
 } from "./experts.mjs";
 import { cloneRepo } from "./git.mjs";
-import { runOpenCodeSkill as defaultRunOpenCodeSkill } from "./opencode.mjs";
+import { runOpenCodeSkill as defaultRunOpenCodeSkill } from "./openrouter.mjs";
 import {
   cleanupPriorReview as defaultCleanupPriorReview,
   makeOctokit,
@@ -633,8 +633,8 @@ async function classifySubStage(ctx, deps, overrides, state) {
   // The classifier is overridable so a test can inject a
   // deterministic classification. The default is the stub
   // in lib/classify.mjs; a follow-up PR wires the real LLM
-  // call (an `opencode run` invocation with a classification
-  // prompt + the PR diff as context).
+  // call (an OpenRouter SDK chat completion with a
+  // classification prompt + the PR diff as context).
   const classifyFn = overrides.classify || defaultClassify;
   const classification = await classifyFn(ctx, deps);
   state.classification = classification;

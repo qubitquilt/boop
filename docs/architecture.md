@@ -69,19 +69,19 @@ See [receiver.md](./receiver.md).
 
 ### boop-runner (`apps/runner/`)
 
-Short-lived. One pod per PR review. Clones the PR, runs the `boop` skill
-via OpenCode, posts the result.
+Short-lived. One pod per PR review. Clones the PR, calls the
+OpenRouter SDK in-process, posts the result.
 
 - **Image:** `ghcr.io/qubitquilt/boop-runner` (Ubuntu 24.04, Node 22,
-  `opencode-ai` from npm).
+  `@openrouter/sdk` from npm).
 - **Lifetime:** 1 pod, started by the receiver, runs to completion or 30
   min (`activeDeadlineSeconds: 1800`), GC'd 1 h after finish.
-- **Workspace:** `/work/repo` (the cloned PR) and `/tmp/opencode-*`
-  (writable copies of the read-only config mount).
+- **Workspace:** `/work/repo` (the cloned PR). The skill ConfigMap
+  mounts read-only at `/home/opencode/.config/opencode`; the runner
+  reads skill files directly from the mount.
 - **No outbound network** except: GitHub (clone + API), OpenRouter (LLM).
-- **OpenCode config:** mounted from the `boop-runner-config` ConfigMap at
-  `/home/opencode/.config/opencode`. Read-only. Materialized to
-  `/tmp/opencode-config/opencode/` for OpenCode's TUI.
+- **No subprocess.** The SDK call is in-process; the runner does
+  not shell out to any LLM CLI.
 
 See [runner.md](./runner.md).
 
@@ -92,7 +92,6 @@ ConfigMap. Contents:
 
 | Key | Path | Purpose |
 |---|---|---|
-| `opencode.json` | `/home/opencode/.config/opencode/opencode.json` | model, provider |
 | `skill-boop` | `…/skills/boop/SKILL.md` | orchestrator |
 | `skill-boop-agent-code-quality` | `…/skills/boop/agents/review-code-quality.md` | lens 1 |
 | `skill-boop-agent-design-pattern` | `…/skills/boop/agents/review-design-pattern.md` | lens 2 |
@@ -101,10 +100,11 @@ ConfigMap. Contents:
 | `skill-boop-agent-solid-principles` | `…/skills/boop/agents/review-solid-principles.md` | lens 5 |
 | `skill-boop-agent-test-quality` | `…/skills/boop/agents/review-test-quality.md` | lens 6 |
 | `skill-boop-agent-deep` | `…/skills/boop/agents/review-deep.md` | lens 7 |
-| `skill-gh-cli` | `…/skills/gh-cli/SKILL.md` | `gh` CLI reference (unused at runtime today) |
 
-The receiver's embedded Job template also declares these as `items` for
-the `runner-config` volume (so each key lands at the right path on mount).
+The model name comes from the `OPENROUTER_MODEL` Job env var (set
+by the receiver from the per-PR label + the cluster default). QUB-98
+removed the `opencode.json` ConfigMap key; the model is no longer
+sourced from the ConfigMap.
 
 ConfigMap limit: 1 MB (etcd hard cap). The current payload is well under.
 Bumping against the limit would require moving to a git-sync init
@@ -126,9 +126,9 @@ T+1s   runner PATCHes status → 🤝 paw-shaken in
 T+2s   runner clones PR (`git clone --depth 50` + `fetch --depth 200`)
 T+5s   runner PATCHes status → 🥎 fetched
 T+5s   runner builds prompt (orchestrator + 7 lenses inlined) and calls
-       `opencode run` (with PTY via `script -qfc`)
+       the OpenRouter SDK in-process
 T+5s   runner PATCHes status → 👃 sniffing
-T+60s..120s   opencode returns; runner strips ANSI, parses output
+T+60s..120s   OpenRouter SDK returns; runner parses the assistant text
 T+60s..120s   runner PATCHes status → 💤 napped (after summary + inlines)
 T+fail   on any error: PATCH status → 🔄 chased tail (with details)
 ```
@@ -174,7 +174,7 @@ spec the receiver submits; everything after that is a clean pod start.
 | Job already `failed` for head SHA | Old Job is deleted, a new one is submitted | Re-delivery from GitHub will hit the same path; transient K8s issues clear on the next event |
 | Token mint fails | 502 from receiver (`/webhook` for issue_comment) or 500 (Job fails) | Re-deliver; check `GITHUB_APP_PRIVATE_KEY` and `installation-id` |
 | LLM times out | `postStatus("failed")`, Job exits non-zero | The 25-min hard ceiling means a hung call is killed; the failure is visible in the status thread |
-| LLM returns empty stdout | Job throws, status is `failed` with detail | Same; the runner exits 1, the pod is GC'd by the TTL |
+| LLM returns empty / unparseable output | Status gate rejects with `summary parse failed: <reason>` | Same; the runner exits 1, the pod is GC'd by the TTL |
 | ConfigMap missing / unreadable | Status thread sees a `failed` with `lens … read attempt N failed` detail | The skill body is read with retry + 1s backoff to absorb transient `..data` symlink races right after pod start |
 
 ## Concurrency

@@ -5,7 +5,6 @@ description: >
   the changed code. Focuses on practical friction — not principle
   compliance. Does not invoke SOLID by name unless the label is
   genuinely helpful.
-compatibility: opencode-ai
 version: "1.0"
 ---
 

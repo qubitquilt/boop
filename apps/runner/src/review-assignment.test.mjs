@@ -12,7 +12,7 @@ import path from "node:path";
 // K8s retries per `backoffLimit`, and the PR status timeline shows
 // N copies of `auth -> review -> failed`.
 //
-// This test pins the contract: the opencode-skill call must assign
+// This test pins the contract: the review-skill call must assign
 // to a declared binding (a `let review;` followed by `review = ...`,
 // or a `state.review = ...` where `state` is declared in the same
 // file). Both shapes are valid; the bug the test guards against is
@@ -28,14 +28,15 @@ import path from "node:path";
 // again does not silently re-introduce the bug. The check is
 // source-text rather than runtime because the surrounding `run()`
 // does too much (mints tokens, clones the repo, posts status,
-// drives the opencode TUI) to exercise cheaply in a unit test.
+// drives the SDK chat completion) to exercise cheaply in a unit
+// test.
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const indexSrc = readFileSync(path.join(here, "index.mjs"), "utf8");
 const workflowSrc = readFileSync(path.join(here, "lib", "workflow.mjs"), "utf8");
 
-test("opencode-skill call assigns to a declared binding", () => {
-  // Find the file that has the opencode-skill call.
+test("review-skill call assigns to a declared binding", () => {
+  // Find the file that has the review-skill call.
   const callIdxByFile = [
     ["index.mjs", indexSrc],
     ["lib/workflow.mjs", workflowSrc],
@@ -68,7 +69,7 @@ test("opencode-skill call assigns to a declared binding", () => {
     assert.ok(
       safeDeclMatch.index < callIdx,
       `expected 'let review;' (offset ${safeDeclMatch.index}) to appear before ` +
-        `the opencode-skill call (offset ${callIdx}) in ${label}`,
+        `the review-skill call (offset ${callIdx}) in ${label}`,
     );
     return;
   }
@@ -80,7 +81,7 @@ test("opencode-skill call assigns to a declared binding", () => {
     /\bfunction\s+\w+\s*\([^)]*\bstate\b/.test(src);
   assert.ok(
     hasStateDecl,
-    `opencode-skill call in ${label} is not assigned to a declared binding ` +
+    `review-skill call in ${label} is not assigned to a declared binding ` +
       `(no 'let review;', no 'const state = ...', and no function parameter named 'state')`,
   );
 });

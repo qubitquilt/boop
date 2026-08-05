@@ -13,10 +13,10 @@ See also: [README](../apps/runner/README.md), [architecture](./architecture.md),
 4. PATCHes the status comment to "🥎 fetched".
 5. Builds the boop prompt (orchestrator + 7 lenses inlined).
 6. PATCHes the status comment to "👃 sniffing".
-7. Runs `opencode run` against the repo with the prompt (25-min hard
+7. Calls the OpenRouter SDK in-process with the prompt (25-min hard
    timeout).
 8. Parses the `=== SUMMARY === … === INLINE COMMENTS === … === END ===`
-   block from stdout.
+   block from the assistant text.
 9. PATCHes the status comment to "💤 napped" (or "🔄 chased tail" on
    failure).
 10. Posts the summary as a single PR comment and the inline comments as
@@ -35,10 +35,14 @@ apps/runner/
 │       ├── log.mjs                # makeLogger(ctx) — JSON logger with pr/sha stamped
 │       ├── security.mjs           # assertSafeRef, assertSafeSha, readSecretFile, shortSha
 │       ├── git.mjs                # writeNetrc, writeGitconfig, cloneRepo, createCleanupRegistry
-│       ├── opencode.mjs           # runOpencode, materializeConfig, buildBoopPrompt, parseReviewOutput, …
+│       ├── openrouter.mjs        # callOpenRouter, runOpenCodeSkill, buildBoopPrompt, parseReviewOutput, buildTelemetry, …
+│       ├── dashboard.mjs          # postTelemetry, postDashboardStatus — data-layer hooks
+│       ├── classify.mjs           # PR classifier stub (QUB-94 sub-workflow)
+│       ├── experts.mjs            # multi-expert review (QUB-95), meta-review (QUB-96)
+│       ├── workflow.mjs           # macro + sub-workflow executor
 │       └── github.mjs             # mintInstallationToken, postStatus, postReview, postInlineComments, cleanupPriorReview
-├── package.json                   # opencode-ai, @octokit/rest, jsonwebtoken
-├── Dockerfile                     # ubuntu 24.04, node 22, opencode-ai npm
+├── package.json                   # @octokit/rest, @openrouter/sdk, jsonwebtoken
+├── Dockerfile                     # ubuntu 24.04, node 22, npm ci
 └── Makefile                       # install / build / docker
 ```
 
@@ -54,10 +58,10 @@ real `git`.
 | Package | Why |
 |---|---|
 | `@octokit/rest` | GitHub API: post/edit comments, post inline review comments, react. |
+| `@openrouter/sdk` | In-process OpenRouter chat completion. The runner builds the prompt and sends it through one `client.chat.send` call. |
 | `jsonwebtoken` | Mint the App JWT for installation-token exchange. |
-| `opencode-ai` | The LLM CLI. Installed as a node_module; symlinked to `/usr/local/bin/opencode` so the runner can shell out to `opencode run`. |
 
-Node 22 required (matches the opencode-ai version's test matrix).
+Node 22 required (matches the `@openrouter/sdk` version's test matrix).
 
 ## Environment
 
@@ -75,6 +79,7 @@ Required env vars (provided by the Job template, see [receiver.md](./receiver.md
 | `PR_BASE_REF` | Job template | Base ref (e.g. `main`) for the diff context |
 | `PR_PREVIOUS_HEAD_SHA` | Job template | Head SHA of the most recent prior Boop summary; empty on first review. When set, the prompt tells the LLM to diff `PREVIOUS_HEAD_SHA...HEAD_SHA` instead of `BASE...HEAD`. |
 | `OPENROUTER_API_KEY` | `boop-secrets` | LLM API key |
+| `OPENROUTER_MODEL` | Job template | Model id (e.g. `minimax/minimax-m3`). The SDK is the only invocation path; this is where the model name comes from. |
 | `BOOP_STATUS_COMMENT_ID` | Job template | Status comment to PATCH (empty if none; runner falls back to posting fresh) |
 | `BOOP_REACTION_COMMENT_ID` | Job template | Comment to react on failure (usually the trigger comment) |
 | `BOOP_REVIEW_NUMBER` | Job template | 1-based index of this review; used for the `re-review #N` header |
@@ -93,15 +98,15 @@ sets all of them; if a value is missing the Job fails to start.
 4.  git clone --depth 50, fetch --depth 200, checkout HEAD_SHA
                                                    ← clone
 5.  PATCH status → "🥎 fetched"                    ← status: clone
-6.  Materialize config (cp -r the ConfigMap mount into a writable dir)
-7.  Build the boop prompt                         ← review prep
-8.  PATCH status → "👃 sniffing"                   ← status: review
-9.  spawn `script -qfc 'opencode run …'` (PTY wrapper)
-    ↳ hard-kill at 25 min
-10. Strip ANSI, parse review output
-11. Post summary as PR comment                    ← done
-12. Post each inline comment (best-effort)
-13. PATCH status → "💤 napped"                    ← status: done
+6.  Build the boop prompt (orchestrator + 7 lenses inlined from the
+    ConfigMap mount at /home/opencode/.config/opencode)
+7.  PATCH status → "👃 sniffing"                   ← status: review
+8.  Call the OpenRouter SDK in-process (no subprocess, no PTY wrap)
+     ↳ hard-kill at 25 min
+9.  Parse the assistant text for the structured block
+10. Post summary as PR comment                    ← done
+11. Post each inline comment (best-effort)
+12. PATCH status → "💤 napped"                    ← status: done
 ```
 
 Each `postStatus(stage, detail)` PATCHes the existing status comment
@@ -111,7 +116,7 @@ combined body exceeds 60 KB.
 
 On any error, `postStatus("failed", err.message)` runs and the runner
 exits 1. The Job's `activeDeadlineSeconds=1800` is the wall-clock
-ceiling; the runner's 25-min opencode timeout is a tighter inner ceiling.
+ceiling; the runner's 25-min SDK timeout is a tighter inner ceiling.
 
 ## GitHub App auth
 
@@ -137,53 +142,48 @@ Shallow clone (50 commits), then a deep-enough fetch of the base ref and
 head SHA so the diff between them is reachable. The checkout puts the
 working tree at the PR head. Each step has a 5-min timeout.
 
-## OpenCode invocation
+## OpenRouter SDK invocation
 
-The `opencode run` binary is a TUI. In a K8s pod there is no controlling
-terminal, which makes the binary hang at init. Workaround: wrap the call
-in `script -qfc …` to allocate a PTY. Combined with `--auto`, the binary
-boots headless and writes the assistant response to the pty master
-(which Node reads as stdout).
+The runner calls `@openrouter/sdk` in-process. One chat completion
+covers the whole review: the prompt is the assembled boop message,
+the model comes from `OPENROUTER_MODEL` (or a default the operator
+sets in the Job template), the API key is loaded from the mounted
+`boop-secrets` file at startup and passed via `env.OPENROUTER_API_KEY`.
 
-```js
-script -qfc 'opencode run "<repo-dir>" "<prompt>" --auto' /dev/null
-```
+The SDK is configured with the same 25-min hard-kill timer the
+runner has always used. The timer races the SDK call; on timeout,
+`AbortController.abort()` surfaces an `AbortError` and the runner
+treats it as a clean failure (`postStatus("failed", "openrouter run
+exceeded 25-min timeout")`).
 
-Env on the child:
+The SDK response carries the assistant text and the usage block
+(`prompt_tokens`, `completion_tokens`, `cost`, optional
+`cached_tokens` and `reasoning_tokens`). `buildTelemetry` rolls the
+SDK response into the runner's telemetry shape and the dashboard
+endpoint POSTs it on the runner's last status update.
 
-- `HOME=/tmp/opencode-home`, `XDG_CONFIG_HOME=/tmp/opencode-config` — the
-  `ConfigMap` mount is read-only; opencode needs a writable home.
-- `OPENCODE_CONFIG_CONTENT=<json>` — the resolved opencode.json (model,
-  provider, baseURL).
-- `OPENCODE_CONFIG_DIR=/tmp/opencode-config/opencode` — the materialized
-  copy.
-- `TERM=xterm-256color` — sane default if `TERM` is unset.
-
-`OPENCODE_DEBUG=1` adds `--log-level DEBUG --print-logs` for verbose
-diagnostics.
-
-The runner kills the subprocess with `SIGKILL` after 25 min, regardless
-of state.
+No subprocess. No PTY wrap. No env-scrub allowlist (the SDK is
+in-process, so a prompt-injected LLM that runs `env` sees the
+`{ OPENROUTER_API_KEY: <key> }` object the runner forwarded to it,
+which is the same surface a `cat .env` would reveal — the key has
+to be in the call regardless).
 
 ## Prompt construction (`buildBoopPrompt`)
 
 The orchestrator (`skills/boop/SKILL.md`) and each of the seven lenses
 (`skills/boop/agents/review-*.md`) are read from the ConfigMap mount at
 `/home/opencode/.config/opencode` and inlined into the prompt. The
-runner reads **directly from the source mount**, not from the writable
-copy — `cp -rL` on the `..data` symlink can pull all previous ConfigMap
-versions into the destination and OOM the container.
-
-Lens files are read with retry (1s backoff × 5 attempts) to absorb the
-`..data -> ..2026_…` symlink race right after pod start.
+runner reads **directly from the source mount**; no writable copy.
+The `..data -> ..2026_…` symlink can be transiently inconsistent right
+after pod start, so each read retries with a 1s linear backoff (5
+attempts).
 
 Frontmatter (`---\n…\n---\n`) is stripped from each file before inlining
 so the model sees clean prompt content.
 
 The final prompt has the structure:
 
-1. Role: "You are running inside a Kubernetes Job triggered by a GitHub
-   App. Review the pull request …"
+1. Role: "You are a code reviewer for the BoopPr GitHub App. ..."
 2. Output format spec (the `=== SUMMARY ===` / `=== INLINE COMMENTS ===`
    / `=== END ===` block — see
    [output format](./webhook-contract.md#output-format)).
@@ -208,13 +208,15 @@ path/to/other.ext:LINE: <comment body>
 
 The parser:
 
-1. Strips ANSI escape sequences (`\x1b[...m`, `\x1b[...A/B/C…`, OSC
-   sequences).
-2. Runs a regex that captures the SUMMARY body and the INLINE COMMENTS
+1. Runs a regex that captures the SUMMARY body and the INLINE COMMENTS
    body. The regex is case-insensitive and tolerates whitespace.
-3. If the structured block is missing, falls back to the whole stdout as
-   the summary (so a malformed model output still produces *something*).
-4. For each line in the INLINE COMMENTS block, matches
+2. Runs a structure sanity check on the SUMMARY body. A real review
+   is at least 200 bytes, contains a markdown heading or a finding
+   table, and does not look like a JS string-concat echo, a fake
+   shell transcript, or a raw error string. Failures return an
+   empty summary + a `parseError` reason; the runner skips the post
+   and surfaces the reason in the status thread.
+3. For each line in the INLINE COMMENTS block, matches
    `^(\S+?):(\d+):\s+(.*)$`. Skips lines that don't match. Builds
    `{ path, line, body }` records.
 
@@ -293,7 +295,7 @@ Tests are granular — one file per module under `src/lib/`:
 - `src/lib/log.test.mjs` — `makeLogger` shape and JSON stamping.
 - `src/lib/security.test.mjs` — `assertSafeRef`, `assertSafeSha`, `shortSha`, `readSecretFile`.
 - `src/lib/git.test.mjs` — `createCleanupRegistry` (parallel + idempotent) and `cloneRepo` (with mock fs + execFile; verifies each git argv, env, and the netrc/gitconfig content).
-- `src/lib/opencode.test.mjs` — `stripAnsi`, `parseReviewOutput`, `shellQuote`, `confidenceBadge`, `buildBoopPrompt` (with mock fs; verifies H5 markers, lens ordering, frontmatter stripping, re-review vs first-review diff range).
+- `src/lib/openrouter.test.mjs` — `callOpenRouter` (fake client, success / 4xx / abort / no text / token mapping), `buildTelemetry` (success / failure stamp), `parseReviewOutput` (structure sanity check + the five 2026-08-03 failure shapes), `buildBoopPrompt` (mock fs; verifies H5 markers, lens ordering, frontmatter stripping, re-review vs first-review diff range, `stripOpenRouterPrefix`), and `runOpenCodeSkill` (SDK branch happy path, SDK failure, AbortError).
 - `src/lib/github.test.mjs` — `mintInstallationToken`, `postStatus`, `postReview`, `postInlineComments` (parallel + partial failures), `cleanupPriorReview` (parallel fetches + pagination + error counting).
 
 `src/index.test.mjs` is the integration test: it drives `run(env, overrides)` end-to-end with every side effect stubbed — fetch returns canned responses, Octokit is a recording fake, `spawn` and `execFile` are stubs, `runOpenCodeSkill` returns a canned review — and asserts the orchestration order (auth → review → done), failure paths, re-review cleanup gating, and defense-in-depth gates.
@@ -313,10 +315,14 @@ runner is arm64; the cluster nodes are arm64). Multi-arch would require
 a QEMU buildx setup; not currently configured.
 
 `npm install` runs `os=linux --cpu=arm64` so npm pulls the right native
-binaries (opencode-ai ships a precompiled binary).
+binaries for the platform (the `@openrouter/sdk` postinstall has a
+`scripts/check-types.js` step that runs in the build environment).
 
-The image is run as the `ubuntu` user (uid 1000) so opencode-ai's
-postinstall has a writable HOME.
+The image is run as the `ubuntu` user (uid 1000) so `/work` and the
+home directory are writable for the runner. The ConfigMap mount
+target (`/home/opencode/.config/opencode`) is created at build time
+so the kubelet can mount there; the chown step intentionally
+excludes that path because the kubelet overlays it at runtime.
 
 ## Failure modes
 
@@ -327,13 +333,16 @@ postinstall has a writable HOME.
   webhook (push a commit) so the receiver submits a fresh Job.
 - **Clone fails.** `cloneRepo` throws; `main` catches, `postStatus("failed")`,
   rethrows, Job exits 1.
-- **OpenCode times out (25 min).** Killed with SIGKILL. `main` throws,
-  `postStatus("failed", "opencode run exceeded 25-min timeout")`, Job
-  exits 1.
-- **OpenCode exits non-zero.** `main` throws with the last 30 lines of
-  stderr in the message. Status is `failed` with that detail.
-- **OpenCode returns empty stdout.** `main` throws, `postStatus("failed")`,
-  Job exits 1.
+- **OpenRouter SDK times out (25 min).** AbortController fires,
+  `main` throws, `postStatus("failed", "openrouter run exceeded
+  25-min timeout")`, Job exits 1.
+- **OpenRouter SDK returns 4xx / 5xx.** `main` returns an empty
+  review with the SDK error stamped on the telemetry
+  (`telemetry.error`). The status gate rejects the empty summary
+  with the SDK error in the reason; the run ends as `failed`.
+- **OpenRouter SDK returns no assistant text.** `main` returns an
+  empty review; the status gate rejects with `summary parse
+  failed: no structured block`; the run ends as `failed`.
 - **Summary PATCH fails.** Non-fatal; logged, the next stage PATCH
   continues. The status thread may have a gap.
 - **Inline comment post fails.** Non-fatal; each one is independent and
@@ -348,7 +357,10 @@ kubectl describe job -n dev-tools boop-<owner>-<repo>-<N>-<sha7>
 ```
 
 The runner logs JSON to stdout. Stages: `start`, `auth`, `clone`,
-`skill`, `opencode`, `status`, `review`, `inline`, `done`, `fatal`.
+`skill`, `opencode` (the SDK call — log tag kept stable from the
+pre-SDK era so dashboard log queries that filter by
+`stage:"opencode"` survive the cutover), `status`, `review`,
+`inline`, `done`, `fatal`.
 
 ## See also
 
