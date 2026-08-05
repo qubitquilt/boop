@@ -15,7 +15,6 @@ resources:
 configMapGenerator:
   - name: boop-runner-config
     files:
-      - opencode.json=runner-config/opencode.json
       - skill-boop=runner-config/skills/boop/SKILL.md
       - skill-boop-agent-code-quality=runner-config/skills/boop/agents/review-code-quality.md
       - skill-boop-agent-design-pattern=runner-config/skills/boop/agents/review-design-pattern.md

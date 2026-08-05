@@ -98,7 +98,7 @@ async function writeGitconfig(fs, cleanup, paths) {
 // deps:
 //   fs         — node:fs/promises
 //   execFile   — promisified execFile
-//   paths      — { netrc, gitconfig, repoDir, configSrc }
+//   paths      — { netrc, gitconfig, repoDir }
 //   log        — logger
 //   postStatus — async (stage) => void; called with "clone" after the
 //                clone completes so the PR status timeline surfaces

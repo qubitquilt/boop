@@ -829,10 +829,10 @@ export async function cleanupPriorReview(token, ctx, deps) {
   return result;
 }
 
-// confidenceBadge mirrors the one in lib/opencode.mjs; inlined here
-// because the comment-rendering path doesn't need the opencode deps
+// confidenceBadge mirrors the one in lib/openrouter.mjs; inlined here
+// because the comment-rendering path doesn't need the OpenRouter deps
 // and tests for postReview can import this module without pulling in
-// the opencode pipeline.
+// the SDK pipeline.
 function confidenceBadgeLocal(c) {
   switch (c) {
     case "high":

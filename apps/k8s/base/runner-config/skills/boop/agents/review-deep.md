@@ -7,7 +7,6 @@ description: >
   flow) the way a curious engineer would when debugging. Catches
   magic-number dependency graphs, coupled invariants, and end-to-end
   bugs that per-lens checks miss.
-compatibility: opencode-ai
 version: "1.0"
 ---
 

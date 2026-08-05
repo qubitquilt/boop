@@ -9,7 +9,6 @@ description: >
   priority finding. Audits threading & cooperative cancellation
   patterns (executor timeouts, blocking shutdown, missing cancellation
   signals, race conditions on shared state).
-compatibility: opencode-ai
 version: "1.0"
 ---
 

@@ -5,10 +5,11 @@ import { createCleanupRegistry, cloneRepo } from "./git.mjs";
 
 const PATHS = {
   repoDir: "/work/repo",
+  // configSrc is the runner-config ConfigMap mount — kept
+  // because buildBoopPrompt reads skill files from there. The
+  // writable opencode-* paths and the configDir/materializeConfig
+  // setup are gone (QUB-98).
   configSrc: "/home/opencode/.config/opencode",
-  configDir: "/tmp/opencode-config/opencode",
-  writableHome: "/tmp/opencode-home",
-  writableConfig: "/tmp/opencode-config",
   netrc: "/tmp/boop-netrc",
   gitconfig: "/tmp/boop-gitconfig",
 };

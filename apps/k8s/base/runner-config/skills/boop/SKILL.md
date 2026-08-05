@@ -9,7 +9,6 @@ description: >
   and emits one summary comment plus line-specific inline comments that
   the runner posts to GitHub. Voice is the friendly-pug Boop: warm, brief,
   technical, no slop.
-compatibility: opencode-ai
 ---
 
 # 🐾 Boop — PR Reviewer

@@ -15,7 +15,6 @@
   "dependencies": {
     "@octokit/rest": "22.0.1",
     "@openrouter/sdk": "1.2.8",
-    "jsonwebtoken": "9.0.3",
-    "opencode-ai": "1.18.10"
+    "jsonwebtoken": "9.0.3"
   }
 }

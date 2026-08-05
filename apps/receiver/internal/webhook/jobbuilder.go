@@ -53,8 +53,11 @@ const (
 	secretFileMode int32 = 0o400
 
 	// Job timing knobs. The runner has a 25-min hard kill on
-	// opencode (see OPENCODE_TIMEOUT_MS in apps/runner/src/index.mjs),
-	// leaving 5 min of headroom against the 30-min active deadline.
+	// the OpenRouter SDK call (see OPENCODE_TIMEOUT_MS in
+	// apps/runner/src/lib/config.mjs; the constant name is
+	// preserved from the opencode era for dashboards that key
+	// off the 25-min budget), leaving 5 min of headroom against
+	// the 30-min active deadline.
 	jobTTLSeconds = 3600
 	// jobBackoffLimit is 0 (QUB-102). Combined with RestartPolicy
 	// Never, a single pod failure ends the Job in `Failed` state
@@ -300,9 +303,8 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 								// files (defaultMode 0400) and the runner
 								// reads them via fs.readFile. A
 								// prompt-injected LLM reaching them via
-								// /proc/self/environ or the opencode env
-								// tool would otherwise be a trivial secret
-								// exfil path.
+								// /proc/self/environ would otherwise be a
+								// trivial secret exfil path.
 								{Name: "BOOP_STATUS_COMMENT_ID", Value: v.StatusCommentID},
 								{Name: "BOOP_REACTION_COMMENT_ID", Value: v.ReactionCommentID},
 								{Name: "BOOP_REVIEW_NUMBER", Value: v.ReviewNumber},
@@ -315,14 +317,15 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 								{Name: "BOOP_SENDER_LOGIN", Value: v.TriggeredBy},
 								{Name: "BOOP_BOT_LOGIN", Value: v.BotLogin},
 							{Name: "BOOP_SKIP_SKILL", Value: "0"},
-							// QUB-94: feature flag for the
-							// in-process OpenRouter SDK path.
-							// Resolved at submitJob time from
-							// the receiver's BOOP_USE_OPENROUTER_SDK
-							// env var + the boop:openrouter-sdk
-							// per-PR label. "0" (default) keeps
-							// the opencode subprocess; "1"
-							// takes the SDK path.
+							// QUB-94 / QUB-98: cluster-wide SDK
+							// flag. The runner's only invocation path
+							// is the in-process OpenRouter SDK, so the
+							// flag no longer selects between branches
+							// — it is preserved for the QUB-N
+							// rollout. New reviews on clusters that
+							// have not yet flipped the default to "1"
+							// still go through the in-process SDK; a
+							// future PR removes the flag entirely.
 							{Name: "BOOP_USE_OPENROUTER_SDK", Value: v.OpenRouterSDKEnabled},
 							// Tell the runner where on disk to find
 							// each mounted secret. The runner reads
@@ -333,11 +336,7 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 								// Dashboard data layer. Both env vars are
 								// empty when the operator hasn't opted in
 								// (RUNNER_TOKEN unset); the runner treats
-								// the empty pair as "no telemetry" and
-								// falls back to the TUI mode in opencode.mjs.
-								// The URL is the in-cluster Service DNS so
-								// the runner cannot be pointed at a public
-								// endpoint by a misconfigured overlay.
+								// the empty pair as "no telemetry".
 								{Name: "BOOP_DASHBOARD_URL", Value: v.DashboardURL},
 								{Name: "BOOP_DASHBOARD_TOKEN", Value: v.DashboardToken},
 								{Name: "BOOP_JOB_NAME", Value: v.JobName},
@@ -388,7 +387,12 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 								ConfigMap: &corev1.ConfigMapVolumeSource{
 									LocalObjectReference: corev1.LocalObjectReference{Name: boopRunnerConfigConfigMap},
 									Items: []corev1.KeyToPath{
-										{Key: "opencode.json", Path: "opencode.json"},
+										// QUB-98: the opencode.json key is
+										// gone from the ConfigMap. The
+										// runner reads its model name from
+										// OPENROUTER_MODEL (a Job env var)
+										// and calls the OpenRouter SDK
+										// in-process.
 										{Key: "skill-boop", Path: "skills/boop/SKILL.md"},
 										{Key: "skill-boop-agent-code-quality", Path: "skills/boop/agents/review-code-quality.md"},
 										{Key: "skill-boop-agent-design-pattern", Path: "skills/boop/agents/review-design-pattern.md"},

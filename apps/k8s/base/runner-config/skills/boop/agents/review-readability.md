@@ -5,7 +5,6 @@ description: >
   in the changed code. Focuses on things that will slow the next
   reader down or cause a misread. Distinguishes preferences from
   genuine readability hazards.
-compatibility: opencode-ai
 version: "1.0"
 ---
 

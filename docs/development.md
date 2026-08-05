@@ -87,7 +87,7 @@ cd apps/runner
 make test                                              # all tests, under Bun
 bun test src/review-header.test.mjs                    # just the header fixtures
 bun test src/lib/github.test.mjs                       # GitHub API surface
-node --test src/lib/opencode.test.mjs                     # parser, prompt builder
+node --test src/lib/openrouter.test.mjs                # SDK call, prompt builder, parser
 ```
 
 ### Run locally (against a real PR, outside a Job)
@@ -158,10 +158,18 @@ kubectl -n dev-tools create configmap boop-runner-config \
 # 3. The next Job submits and picks up the new ConfigMap.
 ```
 
-For a faster preview, run the runner locally with the edited
-`opencode.json` and lens files materialized into a writable dir (the
-runner does this internally; for local, point `HOME` and
-`XDG_CONFIG_HOME` at a copy).
+For a faster preview, render the edited skill files into a
+local ConfigMap and point the runner at it:
+
+```
+# 1. Edit SKILL.md or any agents/review-*.md.
+# 2. Stage the edits as a ConfigMap and let the runner pick them up:
+kubectl -n dev-tools create configmap boop-runner-config \
+  --from-file=apps/k8s/base/runner-config/ \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 3. The next Job submits and picks up the new ConfigMap.
+```
 
 ## Image publishing (CI)
 
@@ -182,23 +190,21 @@ This pushes `stable`, `v0.2.0`, `0.2`, `0`. The default overlay pins
 `latest` (main HEAD); override to a specific tag for reproducible
 rollouts.
 
-## OpenRouter SDK rollout (QUB-94)
+## OpenRouter SDK invocation (post QUB-98)
 
-The runner ships two code paths for the LLM call:
+The runner calls
+[`@openrouter/sdk`](https://github.com/openrouterteam/typescript-sdk)
+in-process. There is no subprocess, no `script(1)` PTY wrap, and no
+`opencode.json` template. The model name comes from the
+`OPENROUTER_MODEL` Job env var; the API key comes from the
+`boop-secrets` mounted file. Telemetry is captured from the SDK
+response directly (`prompt_tokens`, `completion_tokens`, `cost`).
 
-1. **opencode subprocess** (legacy): the runner shells out to the
-   `opencode` CLI wrapped in `script(1)` for a PTY. Telemetry
-   surfaces only as raw TUI output, then a JSON-mode parser rolls
-   it up.
-2. **OpenRouter SDK** (new): the runner calls
-   [`@openrouter/sdk`](https://github.com/openrouterteam/typescript-sdk)
-   in-process. No subprocess, no PTY wrap, no opencode.json
-   template. Telemetry comes straight from the SDK response.
-
-The flag `BOOP_USE_OPENROUTER_SDK` on the **receiver** controls
-which path new review Jobs take. Default is `0` (opencode
-subprocess) until the cutover PR lands and a week of clean runs
-passes.
+The QUB-94 rollout was driven by the `BOOP_USE_OPENROUTER_SDK`
+flag on the **receiver**. The flag had two values: `0` (legacy
+opencode subprocess) and `1` (SDK). After QUB-98 the subprocess
+code path is gone; the flag is preserved on the receiver for the
+QUB-N rollout mechanism but the runner ignores it.
 
 ### Cluster-wide default
 
@@ -207,19 +213,19 @@ Set on the receiver Deployment as an env var:
 ```yaml
 env:
   - name: BOOP_USE_OPENROUTER_SDK
-    value: "1"   # 1 = SDK path, 0 = opencode subprocess
+    value: "1"   # post-cutover default; the flag is informational now
 ```
 
-A flag flip is the rollback — the opencode code path stays
-unchanged and a flip back to `0` restores it without a redeploy
-of the runner image.
+A flag flip back to `0` is a no-op for the runner (the subprocess
+code is gone). To re-enable a real fallback path, ship a runner
+image that includes it and redeploy.
 
 ### Per-PR override
 
 Add the label `boop:openrouter-sdk` to a PR to opt it into the
-SDK path even when the cluster default is `0`. The label is a
-no-op once the cluster default is `1`. The override applies to
-the next review only — push a new commit and the flag re-resolves.
+SDK path. After the cluster default flipped to `1`, the label is
+redundant. The override applies to the next review only — push a
+new commit and the flag re-resolves.
 
 The label is honored on the `pull_request` webhook path. The
 `issue_comment` (`@BoopPr review`) path uses the cluster
@@ -227,40 +233,15 @@ default; per-PR overrides from comments land in a follow-up.
 
 ### Smoke testing a single PR
 
-1. Add the `boop:openrouter-sdk` label to a test PR.
-2. Push a commit.
-3. Within a few seconds, a 🐾 status comment appears. Within
+1. Push a commit to a test PR.
+2. Within a few seconds, a 🐾 status comment appears. Within
    1-3 minutes, a `## 🐾 Boop's review` summary appears.
-4. Verify the runner logs include `path: "openrouter-sdk"` in
-   the `opencode/starting` log line. The `opencode/exit` line
-   carries `mode: "openrouter-sdk"` and the telemetry block
+3. Verify the runner logs include `path: "openrouter-sdk"` in
+   the `opencode/starting` log line (the `opencode` log tag is
+   preserved from the pre-SDK era so dashboard log queries
+   survive the cutover). The `opencode/exit` line carries
+   `mode: "openrouter-sdk"` and the telemetry block
    (`tokens_in`, `tokens_out`, `cost_usd`, `step_count`).
-
-### Cutover procedure
-
-1. After a week of clean runs on the SDK path, flip
-   `BOOP_USE_OPENROUTER_SDK=1` on the receiver. The label
-   becomes redundant.
-2. Open the QUB-98 PR. It removes the `opencode-ai` npm dep,
-   the `opencode.json` ConfigMap, the `opencode` binary in the
-   runner image, and the PTY wrap code. The SDK path becomes
-   the only path.
-
-### Rollback
-
-Rollback is **cluster-flip-only** today. Set
-`BOOP_USE_OPENROUTER_SDK=0` on the receiver Deployment and
-restart it; the next review Job takes the opencode subprocess.
-No runner image rebuild, no per-PR action.
-
-There is no per-PR opt-out label. The `boop:openrouter-sdk`
-label is an opt-in only: with the cluster default at `0`, a
-labeled PR uses the SDK path; with the default at `1`, every
-PR uses it. If you need a per-PR opt-out (e.g. a single flaky
-PR on the SDK path while the cluster default is `1`), the
-follow-up is a `boop:opencode` label added symmetrically to
-`resolveSDKEnabled` in
-`apps/receiver/internal/webhook/handler.go`.
 
 ### Diagnostic queries
 
@@ -268,12 +249,12 @@ follow-up is a `boop:opencode` label added symmetrically to
 # Show the BOOP_USE_OPENROUTER_SDK value the Job was launched with
 kubectl get job -n dev-tools <job-name> -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="BOOP_USE_OPENROUTER_SDK")].value}'
 
-# Show the path the runner took (openrouter-sdk vs the legacy modes)
+# Show the path the runner took (informational after QUB-98 — the
+# SDK is the only path)
 kubectl logs -n dev-tools -l app=boop,pr-number=<N> --tail=200 | grep '"stage":"opencode"'
 
-# Confirm the SDK call did not shell out to the opencode binary
-kubectl logs -n dev-tools -l app=boop,pr-number=<N> --tail=200 | grep -i opencode\\.run
-# (should be empty on the SDK path)
+# Show the SDK call's telemetry
+kubectl logs -n dev-tools -l app=boop,pr-number=<N> --tail=200 | grep '"stage":"opencode".*"msg":"exit"'
 ```
 
 ## End-to-end smoke test
@@ -286,12 +267,13 @@ kubectl logs -n dev-tools -l app=boop,pr-number=<N> --tail=200 | grep -i opencod
    comments.
 4. Push another commit. The status label should be `re-review #2`.
    The summary should review only the diff from the previous head
-   (look for the `Previous review head SHA: …` line in the opencode
-   logs), not the full `main..<head>` range. After the new review
-   posts, any prior Boop review threads on lines that are no longer
-   in the diff should be auto-resolved, and prior Boop status /
-   summary comments should be minimized — the PR thread should now
-   show only the new review at the top.
+   (look for the `Re-review #N` line in the prompt and the
+   `previous_head_sha:` field in the run logs), not the full
+   `main..<head>` range. After the new review posts, any prior
+   Boop review threads on lines that are no longer in the diff
+   should be auto-resolved, and prior Boop status / summary
+   comments should be minimized — the PR thread should now show
+   only the new review at the top.
 5. Comment `@BoopPr review` on a third push. The status should show
    `Triggered by @<your-handle>`.
 6. Comment `@BoopPr review` again on the same head SHA. The runner
@@ -331,11 +313,11 @@ kubectl describe job -n dev-tools boop-<owner>-<repo>-<N>-<sha7>
 kubectl describe pod -n dev-tools -l job-name=boop-<owner>-<repo>-<N>-<sha7>
 ```
 
-If the runner is timing out at 25 min, the Job is hung inside the
-OpenCode call. Re-push to clear (a new head SHA → new Job). If the
-Job is hitting the 30-min `activeDeadlineSeconds`, the opencode call
-finished but a post-review step is stuck — check the runner logs for
-the last `stage` JSON field.
+If the runner is timing out at 25 min, the Job is hung inside
+the OpenRouter SDK call. Re-push to clear (a new head SHA → new
+Job). If the Job is hitting the 30-min `activeDeadlineSeconds`,
+the SDK call finished but a post-review step is stuck — check
+the runner logs for the last `stage` JSON field.
 
 If the receiver is dropping webhooks with 401, the `WEBHOOK_SECRET` in
 the cluster does not match the GitHub App config. Compare
@@ -351,7 +333,7 @@ the cluster does not match the GitHub App config. Compare
 | Change the dedup key | `apps/receiver/internal/webhook/handler.go` `buildJobName` |
 | Change the request grammar | `apps/receiver/internal/webhook/handler.go` `reviewRequestRegex` |
 | Add a new env var to the Job | `apps/receiver/internal/webhook/job-template.yaml` + `apps/runner/src/lib/config.mjs` `loadConfig` (env destructuring) + `apps/runner/src/index.mjs` (ctx field uses) |
-| Bump the opencode version | `apps/runner/package.json` |
+| Bump the OpenRouter SDK version | `apps/runner/package.json` |
 | Add a new cluster overlay | [deployment.md](./deployment.md#to-add-a-new-cluster) |
 | Change a status emoji / label | Both the receiver's `STATUS` (`apps/receiver/internal/webhook/handler.go`) and the runner's `STATUS` (`apps/runner/src/lib/config.mjs`). The receiver builds the initial body; the runner appends the timeline. |
 | Change a pipeline step | The runner's pipeline is in `apps/runner/src/index.mjs` (orchestration) plus `apps/runner/src/lib/*.mjs` (steps). New tests belong next to the module they cover (`src/lib/<module>.test.mjs`); the integration test in `src/index.test.mjs` exercises the wiring. |

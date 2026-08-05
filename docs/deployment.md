@@ -269,7 +269,6 @@ apps/k8s/
 │   ├── kustomization.yaml         configMapGenerator, resources
 │   ├── job-template.yaml          LEGACY: superseded by the embedded one
 │   └── runner-config/             packed into boop-runner-config ConfigMap
-│       ├── opencode.json
 │       └── skills/boop/...
 └── overlays/
     └── pugquilt/                  home cluster
@@ -412,7 +411,7 @@ is consumed on the next Job submit. No coordination required.
 | Image | Base | Size | Why |
 |---|---|---|---|
 | `boop-receiver` | `gcr.io/distroless/static-debian12:nonroot` | small (~15 MB) | Static, no shell, no package manager, non-root. |
-| `boop-runner` | `ubuntu:24.04` + Node 22 + `opencode-ai` | larger (~500 MB) | The `opencode-ai` binary needs glibc 2.39; Ubuntu 24.04 ships it. Debian 12's glibc 2.36 deadlocks the binary. |
+| `boop-runner` | `ubuntu:24.04` + Node 22 + `@openrouter/sdk` | medium (~250 MB) | The SDK's TypeScript types and the Node 22 stdlib. Ubuntu 24.04's glibc 2.39 is the floor; Debian 12's glibc 2.36 is too old. |
 
 Both are built `linux/arm64` only. The cluster nodes are arm64; the
 `boop-runner-set` Actions runners are arm64.

@@ -331,7 +331,7 @@ test("runStages threads state between stages (handshake → fetch → sniff)", a
   assert.equal(receivedOpenrouterKey, "fake", "sniff must read openrouterApiKey from state");
 });
 
-test("runStages passes the opencode overrides through to the sniff stage", async () => {
+test("runStages passes the runOpenCodeSkill override through to the narrate stage", async () => {
   // The lib-split refactor in PR #71 introduced the overrides
   // hook so tests can stub runOpenCodeSkill without monkey-
   // patching the module. The QUB-89 refactor must preserve

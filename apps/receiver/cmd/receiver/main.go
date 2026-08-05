@@ -63,12 +63,11 @@ func main() {
 		BackupDir:   getenv("BACKUP_DIR", "/backups"),
 		BackupEvery: parseDurationEnv("BACKUP_EVERY", 0),
 		BackupKeep:  parseIntEnv("BACKUP_KEEP", 0),
-		// QUB-94: cluster-wide default for the OpenRouter SDK
-		// feature flag. "1" tells every new review Job to take the
-		// in-process SDK path; "0" keeps the opencode subprocess.
-		// Per-PR labels (boop:openrouter-sdk) override this for a
-		// single review. Default "0" until the cutover PR lands
-		// and a week of clean runs passes.
+		// QUB-94 / QUB-98: cluster-wide default for the OpenRouter
+		// SDK feature flag. The runner's only invocation path is
+		// the in-process OpenRouter SDK; the flag is preserved
+		// for the QUB-N rollout. Per-PR labels (boop:openrouter-sdk)
+		// override this for a single review.
 		OpenRouterSDKDefault: getenv("BOOP_USE_OPENROUTER_SDK", "0"),
 	}
 

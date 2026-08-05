@@ -39,12 +39,6 @@ updates:
     labels:
       - dependencies
       - skip-review
-    # opencode-ai is a precompiled binary (H4 in the security
-    # review). Any minor bump is a new binary; require a human
-    # review of the diff before auto-merge.
-    ignore:
-      - dependency-name: opencode-ai
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /

@@ -12,7 +12,7 @@
 //      the line-specific inline comments.
 //
 // Structure: this file is the orchestrator. The work is in
-// `./lib/*.mjs` (config, log, security, git, opencode, github,
+// `./lib/*.mjs` (config, log, security, git, openrouter, github,
 // dashboard, workflow). Each lib module accepts a `ctx` (loaded
 // config) and a `deps` bundle so the whole pipeline is
 // unit-testable without env vars, real Octokit, real network, or
@@ -30,9 +30,6 @@ import {
   loadConfig,
   REPO_DIR,
   CONFIG_SRC,
-  WRITABLE_HOME,
-  WRITABLE_CONFIG,
-  CONFIG_DIR,
   NETRC_PATH,
   GITCONFIG_PATH,
 } from "./lib/config.mjs";
@@ -111,9 +108,6 @@ function makeDeps(ctx, log, cleanup) {
     paths: {
       repoDir: REPO_DIR,
       configSrc: CONFIG_SRC,
-      configDir: CONFIG_DIR,
-      writableHome: WRITABLE_HOME,
-      writableConfig: WRITABLE_CONFIG,
       netrc: NETRC_PATH,
       gitconfig: GITCONFIG_PATH,
     },
