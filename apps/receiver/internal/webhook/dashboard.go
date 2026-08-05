@@ -342,8 +342,15 @@ func (h *Handler) RecordTelemetry(w http.ResponseWriter, r *http.Request) {
 		CostUSD:          body.CostUSD,
 		StepCount:        body.StepCount,
 	}); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			http.Error(w, "unknown run", http.StatusNotFound)
+		if errors.Is(err, store.ErrUnknownRun) {
+			// QUB-101: the store's default path is now to
+			// INSERT OR IGNORE a placeholder run row, so this
+			// branch only fires if a caller asked for the old
+			// strict behaviour. Match RecordStatus's 202 so
+			// the runner does not treat this as a hard
+			// failure.
+			h.logger.Info("record telemetry: unknown run, runner should retry on next stage", "run", id)
+			w.WriteHeader(http.StatusAccepted)
 			return
 		}
 		h.logger.Warn("record telemetry", "run", id, "err", err)
@@ -507,4 +514,118 @@ func (h *Handler) refreshInstallations(ctx context.Context) error {
 	}
 	h.logger.Info("installations refreshed", "count", len(installs))
 	return nil
+}
+
+// StartRetentionLoop kicks off the periodic cleanup pass that
+// prunes old runs, runs a WAL checkpoint, and (weekly) runs
+// incremental_vacuum. The loop is best-effort: each tick
+// runs independently and a transient error is logged and
+// swallowed. The returned cancel func stops the goroutine
+// (safe to call multiple times).
+//
+// retention is the time window before "now" used as the
+// PruneRuns cutoff (0 = store.DefaultRetention, 365 days).
+// cleanupEvery is the tick period (0 = store.DefaultCleanupEvery,
+// 5 min). vacuumInterval is the minimum time between
+// incremental_vacuum calls (0 = store.DefaultVacuumInterval, 7
+// days). The receiver logs the resolved values on startup so
+// an operator can see the effective schedule.
+func (h *Handler) StartRetentionLoop(ctx context.Context, retention, cleanupEvery, vacuumInterval time.Duration) func() {
+	if h.store == nil {
+		return func() {}
+	}
+	if retention <= 0 {
+		retention = store.DefaultRetention
+	}
+	if cleanupEvery <= 0 {
+		cleanupEvery = store.DefaultCleanupEvery
+	}
+	if vacuumInterval <= 0 {
+		vacuumInterval = store.DefaultVacuumInterval
+	}
+	// Floor the cleanup tick at 30s to keep a misconfigured
+	// zero/negative value from busy-looping the receiver.
+	if cleanupEvery < 30*time.Second {
+		cleanupEvery = 30 * time.Second
+	}
+	h.logger.Info("retention loop starting",
+		"retention", retention,
+		"cleanup_every", cleanupEvery,
+		"vacuum_interval", vacuumInterval,
+	)
+	pollerCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		// First tick after a small delay so the receiver has
+		// time to bind its port and serve the readiness
+		// probe before we start hammering SQLite.
+		t := time.NewTimer(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-pollerCtx.Done():
+				return
+			case <-t.C:
+			}
+			tickCtx, tickCancel := context.WithTimeout(pollerCtx, 2*time.Minute)
+			if _, err := h.store.RunRetention(tickCtx, retention, vacuumInterval); err != nil {
+				h.logger.Warn("retention tick failed", "err", err)
+			}
+			tickCancel()
+			t.Reset(cleanupEvery)
+		}
+	}()
+	return cancel
+}
+
+// StartBackupLoop kicks off the periodic snapshot pass. Each
+// tick writes a daily VACUUM-INTO snapshot to dir and prunes
+// older entries. The receiver is one replica and the data
+// PVC is RWO, so the backup has to happen in-process — a
+// separate CronJob would not be able to mount the same PVC
+// while the receiver holds it. The trade-off is that the
+// backup is only as fresh as the receiver is alive; for
+// point-in-time restore on a dead receiver, restore from the
+// most recent snapshot and accept the gap.
+//
+// dir is the destination directory (typically /backups,
+// backed by the boop-receiver-backups PVC). Empty dir
+// disables the loop. every is the period (0 = 24h). keep is
+// the number of daily snapshots to retain (0 = 30). All
+// defaults live in the store package; this method just
+// forwards them.
+//
+// The returned cancel func is safe to call multiple times.
+// First tick is delayed by 15s so the receiver has time to
+// serve the readiness probe and bind /backups before the
+// first VACUUM-INTO call.
+func (h *Handler) StartBackupLoop(ctx context.Context, dir string, every time.Duration, keep int) func() {
+	if h.store == nil || dir == "" {
+		return func() {}
+	}
+	if every <= 0 {
+		every = store.DefaultBackupEvery
+	}
+	if keep <= 0 {
+		keep = store.DefaultBackupKeep
+	}
+	h.logger.Info("backup loop starting", "dir", dir, "every", every, "keep", keep)
+	pollerCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		t := time.NewTimer(15 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-pollerCtx.Done():
+				return
+			case <-t.C:
+			}
+			tickCtx, tickCancel := context.WithTimeout(pollerCtx, 10*time.Minute)
+			if err := h.store.RunBackup(tickCtx, dir, keep); err != nil {
+				h.logger.Warn("backup tick failed", "err", err)
+			}
+			tickCancel()
+			t.Reset(every)
+		}
+	}()
+	return cancel
 }

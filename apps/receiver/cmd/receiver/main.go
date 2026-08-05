@@ -48,6 +48,21 @@ func main() {
 		BotLogin:        os.Getenv("BOT_LOGIN"), // optional; if empty, the receiver ignores all issue_comment events with sender == self check
 		DBPath:          getenv("DB_PATH", "/data/boop.db"),
 		RunnerToken:     os.Getenv("RUNNER_TOKEN"),
+		// QUB-101: retention knobs. Env-driven so the same
+		// image can run with a 7-day retention in staging and
+		// 365-day in prod. Empty / unparseable values fall
+		// through to the store package's defaults inside
+		// StartRetentionLoop.
+		Retention:      parseDurationEnv("DB_RETENTION", 0),
+		CleanupEvery:   parseDurationEnv("DB_CLEANUP_INTERVAL", 0),
+		VacuumInterval: parseDurationEnv("DB_VACUUM_INTERVAL", 0),
+		// QUB-101: backup knobs. Dir is /backups by default;
+		// the boop-receiver-backups PVC mounts there. Empty
+		// Dir disables the loop (useful for tests and for
+		// clusters that run their own snapshot tooling).
+		BackupDir:   getenv("BACKUP_DIR", "/backups"),
+		BackupEvery: parseDurationEnv("BACKUP_EVERY", 0),
+		BackupKeep:  parseIntEnv("BACKUP_KEEP", 0),
 		// QUB-94: cluster-wide default for the OpenRouter SDK
 		// feature flag. "1" tells every new review Job to take the
 		// in-process SDK path; "0" keeps the opencode subprocess.
@@ -106,6 +121,12 @@ func main() {
 	stopPoller := h.StartInstallationsPoller(ctx, cfg.InstallPollInterval)
 	defer stopPoller()
 
+	stopRetention := h.StartRetentionLoop(ctx, cfg.Retention, cfg.CleanupEvery, cfg.VacuumInterval)
+	defer stopRetention()
+
+	stopBackup := h.StartBackupLoop(ctx, cfg.BackupDir, cfg.BackupEvery, cfg.BackupKeep)
+	defer stopBackup()
+
 	go func() {
 		logger.Info("receiver starting", "port", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -133,6 +154,40 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseDurationEnv reads a Go duration string ("24h", "30m",
+// "168h") from the named env var. Empty input or a parse error
+// returns the supplied default; a default of 0 means "let the
+// store package pick". Used for QUB-101 retention knobs.
+func parseDurationEnv(name string, def time.Duration) time.Duration {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		slog.Warn("invalid duration env, using default", "name", name, "value", v, "default", def, "err", err)
+		return def
+	}
+	return d
+}
+
+// parseIntEnv reads a base-10 integer from the named env var.
+// Empty input or a parse error returns the supplied default; a
+// default of 0 means "let the store package pick". Used for
+// QUB-101 backup knobs (BACKUP_KEEP).
+func parseIntEnv(name string, def int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		slog.Warn("invalid int env, using default", "name", name, "value", v, "default", def, "err", err)
+		return def
+	}
+	return n
 }
 
 func parseInt64(s string) (int64, error) {
