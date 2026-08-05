@@ -97,11 +97,19 @@ spec:
       # fetches PR metadata via api.github.com. Ranges from
       # https://api.github.com/meta (hooks + api blocks).
       # Refresh when GitHub publishes new ranges.
+      #
+      # 20.29.134.0/24 covers the Azure-fronted api.github.com
+      # endpoint that 8.8.8.8 (and the cluster's CoreDNS) resolves
+      # to. Without this block the receiver's @BoopPr re-trigger
+      # and background installation polls fail with
+      # "dial tcp 20.29.134.17:443: connect: connection refused".
       to:
         - ipBlock:
             cidr: 140.82.112.0/20
         - ipBlock:
             cidr: 192.30.252.0/22
+        - ipBlock:
+            cidr: 20.29.134.0/24
       ports:
         - protocol: TCP
           port: 443
