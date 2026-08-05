@@ -3,19 +3,29 @@ package webhook
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"crypto/rand"
+	"crypto/rsa"
+	boopgithub "github.com/michaelruelas/boop-receiver/internal/github"
+	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"net/url"
 )
 
 // TestRenderStatusBody locks the initial status comment template the
@@ -543,7 +553,7 @@ func TestCurrentJobImage_PicksUpLatestDigest(t *testing.T) {
 	}
 	client := fake.NewSimpleClientset(cm)
 	h := &Handler{
-		cfg: Config{TargetNamespace: "dev-tools"},
+		cfg:  Config{TargetNamespace: "dev-tools"},
 		kube: client,
 	}
 	first, err := h.currentJobImage(context.Background())
@@ -820,9 +830,9 @@ func TestSubmitJob_FallsBackOnConfigMapReadFailure(t *testing.T) {
 			TargetNamespace: "dev-tools",
 			JobImage:        fallbackImage,
 		},
-		kube:   client,
-		logger: logger,
-		dedup:  newDeliveryDedup(4096),
+		kube:    client,
+		logger:  logger,
+		dedup:   newDeliveryDedup(4096),
 		limiter: nil, // not exercised in this test path
 	}
 
@@ -840,13 +850,13 @@ func TestSubmitJob_FallsBackOnConfigMapReadFailure(t *testing.T) {
 		18,
 		"7e895631f15f6ba1a542b5cbf68d7dc8d887de82",
 		"main",
-		"",                                // previousHeadSHA
+		"", // previousHeadSHA
 		"pull_request.opened",
-		0,                                 // reactionCommentID
-		5153677875,                        // statusCommentID (validates the Job runs the status thread)
-		12345,                             // installationID
-		1,                                 // reviewNumber
-		nil,                               // labels (no per-PR SDK opt-in)
+		0,          // reactionCommentID
+		5153677875, // statusCommentID (validates the Job runs the status thread)
+		12345,      // installationID
+		1,          // reviewNumber
+		nil,        // labels (no per-PR SDK opt-in)
 	)
 
 	// Pull the Job the handler created and assert its image.
@@ -929,4 +939,152 @@ func TestSubmitJob_UsesLiveConfigMapWhenAvailable(t *testing.T) {
 	if gotImage != liveImage {
 		t.Errorf("Job image = %q, want live %q", gotImage, liveImage)
 	}
+}
+
+func TestHandleWebhookBoundsSlowGitHubRequest(t *testing.T) {
+	// Drives the issue_comment path against a GitHub server that
+	// responds normally to /app and the installation-token
+	// endpoint, then hangs on PullRequests.Get. The 8s
+	// webhookTimeout must kick in and the handler must return a
+	// 5xx in well under 8s. A second concurrent webhook must NOT
+	// be 429'd, because the limiter token has been released.
+	const secret = "test-secret"
+	const installationID = int64(1)
+	const issueNumber = 42
+
+	hung := make(chan struct{})
+	t.Cleanup(func() { close(hung) })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/app":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":1,"slug":"BoopPr","name":"BoopPr"}`))
+		case strings.HasPrefix(r.URL.Path, "/app/installations/") && strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"token":"v1.test","expires_at":"2099-01-01T00:00:00Z"}`))
+		case strings.Contains(r.URL.Path, fmt.Sprintf("/pulls/%d", issueNumber)):
+			select {
+			case <-hung:
+			case <-r.Context().Done():
+			}
+		default:
+			t.Logf("unexpected request path %s", r.URL.Path)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	origApp := boopgithub.AppInfoURLForTest()
+	boopgithub.SetAppInfoURLForTest(srv.URL + "/app")
+	t.Cleanup(func() { boopgithub.SetAppInfoURLForTest(origApp) })
+
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("rsa.GenerateKey: %v", err)
+	}
+	mgr := boopgithub.NewManager(boopgithub.AppConfig{AppID: 1, PrivateKey: priv})
+	// go-github builds absolute URLs against api.github.com.
+	// Point the manager's HTTP client at a Transport that
+	// rewrites api.github.com -> srv.URL so the test server
+	// actually sees the request.
+	testURL, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatalf("parse test server URL: %v", err)
+	}
+	mgr.SetBaseHTTPForTest(&http.Client{
+		Transport: &rewriteTransport{base: testURL, inner: http.DefaultTransport},
+	})
+
+	// The slow PR fetch returns before claimJobSlot runs, so the
+	// handler does not need a kube client.
+	h := &Handler{
+		cfg:      Config{WebhookSecret: secret, BotLogin: "booppr[bot]"},
+		logger:   slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)),
+		ghClient: mgr,
+		dedup:    newDeliveryDedup(4096),
+		limiter:  rate.NewLimiter(rate.Limit(20), 40),
+	}
+
+	body := []byte(fmt.Sprintf(`{
+		"action":"created",
+		"installation":{"id":%d},
+		"repository":{"name":"repo","owner":{"login":"owner"}},
+		"issue":{"number":%d,"pull_request":{"url":"https://api.github.com/repos/owner/repo/pulls/%d"}},
+		"comment":{"id":7,"body":"@BoopPr review please"},
+		"sender":{"login":"alice"}
+	}`, installationID, issueNumber, issueNumber))
+
+	deliver := func(label string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/webhook", bytes.NewReader(body))
+		req.Header.Set("X-GitHub-Delivery", label)
+		req.Header.Set("X-GitHub-Event", "issue_comment")
+		req.Header.Set("X-Hub-Signature-256", signedPayload(secret, body))
+		w := httptest.NewRecorder()
+		h.HandleWebhook(w, req)
+		return w
+	}
+
+	started := time.Now()
+	w := deliver("slow-delivery")
+	elapsed := time.Since(started)
+	if elapsed >= webhookTimeout {
+		t.Fatalf("handler took %s, want less than %s", elapsed, webhookTimeout)
+	}
+	if w.Code < 500 || w.Code >= 600 {
+		t.Fatalf("handler returned %d, want 5xx; body=%s", w.Code, w.Body.String())
+	}
+
+	// A second concurrent webhook (sequential in this test,
+	// since httptest is single-goroutine here, but a real
+	// receiver handles them in parallel) must NOT be 429'd.
+	// The slow handler held a limiter token while it waited
+	// for the PR fetch. If the handler returned a 5xx within
+	// 8s — proving the bounded ctx fired — the token has been
+	// released by the time this second deliver runs, so the
+	// limiter still has tokens to spare. A regression that
+	// removed the bounded ctx would either run the first call
+	// for ~15s (the GitHub per-call timeout) and burn more
+	// tokens or — without any per-call timeout — block until
+	// the test server hung, exhausting the burst. The 8s
+	// bound is the regression guard; the second call's
+	// timing here is belt-and-braces.
+	secondStart := time.Now()
+	second := deliver("concurrent-delivery")
+	secondElapsed := time.Since(secondStart)
+	if second.Code == http.StatusTooManyRequests {
+		t.Fatal("concurrent webhook was rate limited; the slow handler held a limiter token too long")
+	}
+	if secondElapsed >= webhookTimeout {
+		t.Fatalf("concurrent webhook took %s, want less than %s", secondElapsed, webhookTimeout)
+	}
+}
+
+func signedPayload(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write(body)
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// rewriteTransport is an http.RoundTripper that rewrites every
+// request whose host is api.github.com to point at a test
+// server, then delegates to the inner RoundTripper. Used by
+// TestHandleWebhookBoundsSlowGitHubRequest to redirect go-github
+// (which builds absolute URLs against api.github.com) at a
+// httptest.Server.
+type rewriteTransport struct {
+	base  *url.URL
+	inner http.RoundTripper
+}
+
+func (t *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host == "api.github.com" {
+		clone := *req.URL
+		clone.Scheme = t.base.Scheme
+		clone.Host = t.base.Host
+		req = req.Clone(req.Context())
+		req.URL = &clone
+	}
+	return t.inner.RoundTrip(req)
 }

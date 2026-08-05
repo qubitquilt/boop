@@ -74,13 +74,13 @@ func requestsReview(body string) bool {
 }
 
 type Config struct {
-	Port            string
-	WebhookSecret   string
-	JobImage        string
-	TargetNamespace string
-	BotLogin        string // GitHub login of the bot, used to ignore self-comments
-	DBPath          string // sqlite path; empty disables the data layer (legacy mode)
-	RunnerToken     string // shared secret for the runner's POST endpoints; empty rejects all runner posts
+	Port                string
+	WebhookSecret       string
+	JobImage            string
+	TargetNamespace     string
+	BotLogin            string        // GitHub login of the bot, used to ignore self-comments
+	DBPath              string        // sqlite path; empty disables the data layer (legacy mode)
+	RunnerToken         string        // shared secret for the runner's POST endpoints; empty rejects all runner posts
 	InstallPollInterval time.Duration // how often to refresh installations from GitHub; 0 = 5m default
 	// QUB-94: cluster-wide default for the OpenRouter SDK feature
 	// flag. The runner takes the in-process SDK path when
@@ -230,8 +230,13 @@ func (h *Handler) Health(w http.ResponseWriter, _ *http.Request) {
 	_, _ = io.WriteString(w, "ok")
 }
 
+const (
+	webhookTimeout = 8 * time.Second
+)
+
 func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), webhookTimeout)
+	defer cancel()
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 	event := r.Header.Get("X-GitHub-Event")
 	sig := r.Header.Get("X-Hub-Signature-256")
@@ -360,6 +365,12 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 	// may mis-attribute one webhook. Failures are logged so a
 	// persistent outage surfaces in the receiver's metrics.
 	botLogin := h.cfg.BotLogin
+	// AppBotLogin is intentionally bounded only by the outer 8s
+	// webhookTimeout. It is non-fatal (logs Warn and falls back
+	// to the env var on error) so it shares the budget with the
+	// downstream GitHub calls rather than carving out its own
+	// 5s. Per-call wrapping lives in client.go for the calls
+	// that are on the critical path.
 	if h.ghClient != nil {
 		if apiLogin, err := h.ghClient.AppBotLogin(ctx, installationID); err == nil {
 			botLogin = apiLogin

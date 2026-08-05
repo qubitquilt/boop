@@ -29,11 +29,11 @@ type Manager struct {
 	cfg      AppConfig
 	baseHTTP *http.Client
 
-	mu                sync.Mutex
-	clients           map[int64]*Client
-	botLoginCache     map[int64]botLoginCacheEntry
-	installations     []Installation
-	installationsAt   time.Time
+	mu              sync.Mutex
+	clients         map[int64]*Client
+	botLoginCache   map[int64]botLoginCacheEntry
+	installations   []Installation
+	installationsAt time.Time
 }
 
 // botLoginCacheEntry stores the bot login for one installation,
@@ -58,6 +58,16 @@ func NewManager(cfg AppConfig) *Manager {
 		clients:       make(map[int64]*Client),
 		botLoginCache: make(map[int64]botLoginCacheEntry),
 	}
+}
+
+// SetBaseHTTPForTest replaces the manager's underlying HTTP
+// client. Tests use it to point GitHub calls at a httptest.Server
+// without having to stand up a TLS terminator. Test-only — the
+// `*_test.go` convention would scope this to the github package's
+// own tests, but the webhook package's tests also need it, so it
+// is exported. Do not call from production code.
+func (m *Manager) SetBaseHTTPForTest(c *http.Client) {
+	m.baseHTTP = c
 }
 
 // ClientFor returns the per-installation Client, creating and caching
@@ -258,8 +268,8 @@ func (m *Manager) ListInstallations(ctx context.Context) ([]Installation, error)
 		}
 
 		var pageInstalls []struct {
-			ID                  int64     `json:"id"`
-			Account             *struct {
+			ID      int64 `json:"id"`
+			Account *struct {
 				Login string `json:"login"`
 				Type  string `json:"type"`
 			} `json:"account"`
@@ -315,17 +325,27 @@ func hasNextPage(link string) bool {
 }
 
 const (
-	httpTimeout     = 15 * time.Second
-	tokenTTLRefresh = 5 * time.Minute
-	appJWTTTL       = 10 * time.Minute
-	appJWTLeeway    = 30 * time.Second
+	httpTimeout           = 15 * time.Second
+	tokenTTLRefresh       = 5 * time.Minute
+	appJWTTTL             = 10 * time.Minute
+	appJWTLeeway          = 30 * time.Second
 	installationsCacheTTL = 5 * time.Minute
 )
 
 // appInfoURL is the endpoint AppBotLogin queries. It is a var (not a
 // const) so tests can point it at a httptest.Server without standing
-// up a TLS terminator.
+// up a TLS terminator. Test-only accessors below the var; not
+// production API.
 var appInfoURL = "https://api.github.com/app"
+
+// AppInfoURLForTest returns the current appInfoURL value. Tests
+// use it to save and restore the original when they swap in a
+// httptest.Server. Test-only.
+func AppInfoURLForTest() string { return appInfoURL }
+
+// SetAppInfoURLForTest replaces the appInfoURL value. Tests use it
+// to point AppBotLogin at a httptest.Server. Test-only.
+func SetAppInfoURLForTest(s string) { appInfoURL = s }
 
 // installationsListURL is the App endpoint that returns every
 // installation of the App. Paged by GitHub; we walk pages until

@@ -96,7 +96,7 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 
@@ -116,9 +116,16 @@ func main() {
 
 	<-ctx.Done()
 	logger.Info("shutting down")
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("server shutdown", "err", err)
+	}
+	if h.Store() != nil {
+		if err := h.Store().Close(); err != nil {
+			logger.Error("close store", "err", err)
+		}
+	}
 }
 
 func getenv(k, def string) string {
