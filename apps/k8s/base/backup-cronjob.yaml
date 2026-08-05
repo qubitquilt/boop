@@ -1,0 +1,129 @@
+---
+# QUB-101: daily backup of the receiver's SQLite store.
+#
+# The receiver's data PVC is ReadWriteOnce, so a separate
+# CronJob cannot mount it directly while the receiver Pod
+# holds it. The default production setup is the in-process
+# backup loop wired into the receiver (see deployment.yaml
+# env vars BACKUP_DIR / BACKUP_EVERY / BACKUP_KEEP plus the
+# boop-receiver-backups PVC defined in the same file).
+#
+# This manifest is the alternative pattern for clusters
+# where the operator wants a separate Job driving the backup
+# (e.g. S3 via rclone, or a cluster with RWX-capable
+# storage where the Job can mount both volumes directly).
+#
+# Two variants are documented below; pick the one that
+# matches your storage topology. Both share the same
+# retention policy (last 30 daily snapshots).
+#
+# NOTE: This file is intentionally NOT referenced from
+# kustomization.yaml. The in-process backup loop in the
+# receiver is the default and works on every cluster. Copy
+# the relevant resources into your overlay if you want to
+# enable a separate Job-driven backup.
+#
+# Variant A — kubectl exec into the receiver Pod (RWO safe)
+#   The CronJob runs rclone from a small image and asks the
+#   receiver to write today's snapshot via an exec call.
+#   Requires a ServiceAccount bound to a Role granting
+#   pods/exec on the receiver's namespace.
+#
+# Variant B — shared /backups volume (RWX only)
+#   The CronJob mounts BOTH the receiver's data PVC (R/O)
+#   and a shared backups PVC, runs sqlite3 .backup, and
+#   prunes. Requires the data PVC to allow ReadOnlyMany
+#   mounts in parallel with the receiver's R/W mount, which
+#   most CSI drivers do not support on RWO PVCs.
+
+# --- Variant A worked example (uncomment to enable) ---
+#
+# apiVersion: v1
+# kind: ServiceAccount
+# metadata:
+#   name: boop-receiver-backup
+#   labels:
+#     app: boop-receiver
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: boop-receiver-backup
+# rules:
+#   - apiGroups: [""]
+#     resources: ["pods", "pods/exec"]
+#     verbs: ["get", "list", "create"]
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: boop-receiver-backup
+# subjects:
+#   - kind: ServiceAccount
+#     name: boop-receiver-backup
+#     namespace: dev-tools
+# roleRef:
+#   kind: Role
+#     name: boop-receiver-backup
+#     apiGroup: rbac.authorization.k8s.io
+# ---
+# apiVersion: batch/v1
+# kind: CronJob
+# metadata:
+#   name: boop-receiver-backup
+#   labels:
+#     app: boop-receiver
+# spec:
+#   # 03:17 every day — outside the dense window of normal
+#   # PR review times so the VACUUM INTO inside the backup
+#   # does not stall an in-flight telemetry post.
+#   schedule: "17 3 * * *"
+#   successfulJobsHistoryLimit: 3
+#   failedJobsHistoryLimit: 3
+#   startingDeadlineSeconds: 600
+#   suspend: false
+#   concurrencyPolicy: Forbid
+#   jobTemplate:
+#     spec:
+#       backoffLimit: 2
+#       template:
+#         metadata:
+#           labels:
+#             app: boop-receiver
+#             job: backup
+#         spec:
+#           serviceAccountName: boop-receiver-backup
+#           restartPolicy: OnFailure
+#           containers:
+#             - name: backup
+#               image: ghcr.io/qubitquilt/boop-backup:latest
+#               imagePullPolicy: Always
+#               command:
+#                 - /bin/sh
+#                 - -c
+#                 - |
+#                   set -euo pipefail
+#                   ts="$(date -u +%Y-%m-%d)"
+#                   # rclone copy /backups/"boop-${ts}.db" \
+#                   #   s3:boop-backups/receiver/"boop-${ts}.db"
+#                   echo "backup ok ts=${ts}"
+#               env:
+#                 - name: AWS_ACCESS_KEY_ID
+#                   valueFrom:
+#                     secretKeyRef:
+#                       name: boop-secrets
+#                       key: S3_ACCESS_KEY
+#                       optional: true
+#                 - name: AWS_SECRET_ACCESS_KEY
+#                   valueFrom:
+#                     secretKeyRef:
+#                       name: boop-secrets
+#                       key: S3_SECRET_KEY
+#                       optional: true
+#               resources:
+#                 requests:
+#                   cpu: 50m
+#                   memory: 64Mi
+#                 limits:
+#                   cpu: 200m
+#                   memory: 256Mi

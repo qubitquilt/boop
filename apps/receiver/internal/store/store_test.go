@@ -2,18 +2,22 @@ package store
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-// newTestStore opens an in-memory SQLite-backed store. Each test
-// gets a fresh database; the file is created in t.TempDir() so
-// the test framework cleans it up.
+// newTestStore opens a file-backed store. Each test gets a
+// fresh database; the file is created in t.TempDir() so the
+// test framework cleans it up. The path is passed as a raw
+// filesystem path (the QUB-101 canonical form); store.Open
+// builds the DSN internally so a misconfigured test cannot
+// silently drop a pragma.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	dsn := "file:" + filepath.Join(t.TempDir(), "boop.db") + "?cache=shared&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)"
-	s, err := Open(dsn)
+	path := filepath.Join(t.TempDir(), "boop.db")
+	s, err := Open(path)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -21,23 +25,23 @@ func newTestStore(t *testing.T) *Store {
 	return s
 }
 
-// sampleRun builds a Run with sensible defaults so each test only
-// specifies the fields it cares about. The id is derived from
-// owner/repo/number/sha so a test can refer to it back without
-// copy-pasting the same string.
+// sampleRun builds a Run with sensible defaults so each test
+// only specifies the fields it cares about. The id is derived
+// from owner/repo/number/sha so a test can refer to it back
+// without copy-pasting the same string.
 func sampleRun(id, owner, repo string, pr int, sha string, status RunStatus, startedAt time.Time) Run {
 	return Run{
-		ID:           id,
-		Owner:        owner,
-		Repo:         repo,
-		PRNumber:     pr,
-		CommitSHA:    sha,
-		BaseRef:      "main",
-		ReviewNumber: 1,
-		Reason:       "pull_request.opened",
+		ID:             id,
+		Owner:          owner,
+		Repo:           repo,
+		PRNumber:       pr,
+		CommitSHA:      sha,
+		BaseRef:        "main",
+		ReviewNumber:   1,
+		Reason:         "pull_request.opened",
 		InstallationID: 12345,
-		Status:       status,
-		StartedAt:    startedAt,
+		Status:         status,
+		StartedAt:      startedAt,
 	}
 }
 
@@ -292,10 +296,20 @@ func TestRecordTelemetry(t *testing.T) {
 }
 
 func TestRecordTelemetry_UnknownRun(t *testing.T) {
+	// QUB-101: a runner POST that lands before the receiver's
+	// UpsertRun has committed gets ErrUnknownRun back; the
+	// handler matches the sentinel and returns 202 to the
+	// runner. The runner does not retry, so the cost data is
+	// lost — this is the documented edge case. The test pins
+	// the contract: errors.Is(err, store.ErrUnknownRun) is the
+	// check the handler relies on.
 	s := newTestStore(t)
 	err := s.RecordTelemetry(context.Background(), Telemetry{RunID: "missing", Model: "x"})
 	if err == nil {
 		t.Fatal("expected error for unknown run")
+	}
+	if !errors.Is(err, ErrUnknownRun) {
+		t.Errorf("err = %v, want ErrUnknownRun", err)
 	}
 }
 
@@ -458,6 +472,258 @@ func TestUpsertInstallations_Replace(t *testing.T) {
 	}
 	if !latest.Equal(now.Add(time.Minute)) {
 		t.Errorf("latest = %v, want %v", latest, now.Add(time.Minute))
+	}
+}
+
+func TestOpen_AppliesPragmas(t *testing.T) {
+	// QUB-101: every connection-time pragma must land
+	// before the migration runs. A misconfigured DSN that
+	// dropped any of these would surface here.
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	checks := []struct {
+		name string
+		want string
+	}{
+		{"journal_mode", "wal"},
+		{"synchronous", "2"}, // FULL == 2 in SQLite's enum
+		{"foreign_keys", "1"},
+		{"auto_vacuum", "2"}, // INCREMENTAL == 2
+	}
+	for _, c := range checks {
+		var got string
+		if err := s.db.QueryRowContext(ctx, "PRAGMA "+c.name).Scan(&got); err != nil {
+			t.Fatalf("pragma %s: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Errorf("pragma %s = %q, want %q", c.name, got, c.want)
+		}
+	}
+	var v int64
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if v != int64(currentSchemaVersion) {
+		t.Errorf("user_version = %d, want %d", v, currentSchemaVersion)
+	}
+}
+
+func TestOpen_IdempotentMigration(t *testing.T) {
+	// Open a fresh store, then Open it again with the same
+	// path. The second Open should be a no-op for the schema
+	// (migrateV1 uses CREATE TABLE IF NOT EXISTS, so the
+	// re-run is harmless), and user_version should stay at
+	// currentSchemaVersion.
+	path := filepath.Join(t.TempDir(), "boop.db")
+	s1, err := Open(path)
+	if err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if _, err := s1.UpsertRun(context.Background(), sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusRunning, time.Now())); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := s1.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("second open: %v", err)
+	}
+	t.Cleanup(func() { _ = s2.Close() })
+
+	var v int64
+	if err := s2.db.QueryRowContext(context.Background(), "PRAGMA user_version").Scan(&v); err != nil {
+		t.Fatalf("user_version: %v", err)
+	}
+	if v != int64(currentSchemaVersion) {
+		t.Errorf("user_version = %d, want %d (idempotent re-open should not bump)", v, currentSchemaVersion)
+	}
+	// The row from the first Open should still be there.
+	if _, err := s2.GetRun(context.Background(), "boop-a-b-1-aaaaaaa"); err != nil {
+		t.Errorf("row from first open missing: %v", err)
+	}
+}
+
+func TestDeepCheck_FreshDB(t *testing.T) {
+	s := newTestStore(t)
+	ok, result, err := s.DeepCheck()
+	if err != nil {
+		t.Fatalf("deep check: %v", err)
+	}
+	if !ok {
+		t.Errorf("ok = false, result = %q", result)
+	}
+	if result != "ok" {
+		t.Errorf("result = %q, want %q", result, "ok")
+	}
+}
+
+func TestStats_FreshDB(t *testing.T) {
+	s := newTestStore(t)
+	got, err := s.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if got.Runs != 0 || got.Telemetry != 0 {
+		t.Errorf("fresh stats: %+v, want zero runs/telemetry", got)
+	}
+	if got.FileBytes <= 0 {
+		t.Errorf("file_bytes = %d, want > 0", got.FileBytes)
+	}
+	if got.FreelistCount != 0 {
+		t.Errorf("freelist_count = %d, want 0 on a fresh db", got.FreelistCount)
+	}
+}
+
+func TestStats_WithRows(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		if _, err := s.UpsertRun(ctx, sampleRun(
+			"boop-a-b-"+string(rune('1'+i))+"-"+string(rune('a'+i))+"aaaaaa",
+			"a", "b", i+1,
+			string(rune('a'+i))+"aaaaaa",
+			StatusSucceeded,
+			now,
+		)); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+	if err := s.RecordTelemetry(ctx, Telemetry{
+		RunID:      "boop-a-b-1-aaaaaaa",
+		Model:      "x",
+		InputTokens: 1,
+		OutputTokens: 1,
+		CostUSD:    0.01,
+		StepCount:  1,
+		RecordedAt: now,
+	}); err != nil {
+		t.Fatalf("telemetry: %v", err)
+	}
+
+	got, err := s.Stats(ctx)
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if got.Runs != 3 {
+		t.Errorf("runs = %d, want 3", got.Runs)
+	}
+	if got.Telemetry != 1 {
+		t.Errorf("telemetry = %d, want 1", got.Telemetry)
+	}
+}
+
+func TestPruneRuns_DeletesOld(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	// Anchor to wall-clock now so the prune cutoff (also
+	// wall-clock based) lines up with the row timestamps.
+	now := time.Now().UTC()
+	old := now.Add(-100 * 24 * time.Hour) // 100 days old
+	recent := now.Add(-1 * time.Hour)
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusSucceeded, old)); err != nil {
+		t.Fatalf("old: %v", err)
+	}
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-2-bbbbbbb", "a", "b", 2, "bbbbbbb", StatusSucceeded, recent)); err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+
+	// 30-day retention: old is deleted, recent survives.
+	pruned, err := s.PruneRuns(ctx, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned != 1 {
+		t.Errorf("pruned = %d, want 1", pruned)
+	}
+	if _, err := s.GetRun(ctx, "boop-a-b-1-aaaaaaa"); err == nil {
+		t.Errorf("old run still present")
+	}
+	if _, err := s.GetRun(ctx, "boop-a-b-2-bbbbbbb"); err != nil {
+		t.Errorf("recent run missing: %v", err)
+	}
+}
+
+func TestPruneRuns_CascadesToTelemetry(t *testing.T) {
+	// FK on telemetry.run_id is ON DELETE CASCADE; pruning
+	// the parent must remove the child too. If foreign_keys
+	// is not on (one of the QUB-101 pragmas), this test
+	// would fail with a dangling telemetry row.
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	old := now.Add(-100 * 24 * time.Hour)
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusSucceeded, old)); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := s.RecordTelemetry(ctx, Telemetry{
+		RunID:      "boop-a-b-1-aaaaaaa",
+		Model:      "x",
+		InputTokens: 1,
+		CostUSD:    0.01,
+		StepCount:  1,
+		RecordedAt: now,
+	}); err != nil {
+		t.Fatalf("telemetry: %v", err)
+	}
+
+	if _, err := s.PruneRuns(ctx, 30*24*time.Hour); err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if _, err := s.GetTelemetry(ctx, "boop-a-b-1-aaaaaaa"); err == nil {
+		t.Errorf("telemetry row survived parent prune (foreign_keys may be off)")
+	}
+}
+
+func TestRunRetention_FirstTickSkipsVacuum(t *testing.T) {
+	// The first retention tick after Open does not run
+	// incremental_vacuum — we don't know how long it's been
+	// since the previous one ran. The tick still prunes and
+	// checkpoints the WAL.
+	s := newTestStore(t)
+	ctx := context.Background()
+	res, err := s.RunRetention(ctx, 30*24*time.Hour, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("retention: %v", err)
+	}
+	if res.Vacuumed {
+		t.Errorf("first tick should not vacuum, got Vacuumed=true (pages=%d)", res.VacuumPages)
+	}
+	if !res.WALCheck {
+		t.Errorf("first tick should checkpoint WAL")
+	}
+}
+
+func TestRunRetention_PrunesAndCheckpoints(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	old := now.Add(-100 * 24 * time.Hour)
+	for i := 0; i < 3; i++ {
+		if _, err := s.UpsertRun(ctx, sampleRun(
+			"boop-a-b-"+string(rune('1'+i))+"-"+string(rune('a'+i))+"aaaaaa",
+			"a", "b", i+1,
+			string(rune('a'+i))+"aaaaaa",
+			StatusSucceeded,
+			old,
+		)); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+
+	res, err := s.RunRetention(ctx, 30*24*time.Hour, 7*24*time.Hour)
+	if err != nil {
+		t.Fatalf("retention: %v", err)
+	}
+	if res.Pruned != 3 {
+		t.Errorf("pruned = %d, want 3", res.Pruned)
+	}
+	stats, _ := s.Stats(ctx)
+	if stats.Runs != 0 {
+		t.Errorf("runs after prune = %d, want 0", stats.Runs)
 	}
 }
 

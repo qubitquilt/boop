@@ -8,6 +8,21 @@ import (
 	"time"
 )
 
+// ErrUnknownRun is the sentinel returned by RecordTelemetry when
+// the parent run row does not exist AND the store's
+// "placeholder on miss" behavior is unavailable (see
+// Config.InsertPlaceholderOnUnknownRun in the store options). The
+// webhook handler matches this error with errors.Is and responds
+// 202 to the runner so a transient race between the runner and
+// the receiver's UpsertRun does not turn into a hard failure.
+//
+// In the default mode (placeholder enabled), RecordTelemetry
+// never returns this — it INSERT OR IGNORE's a placeholder run
+// row first, so the FK check passes and the telemetry is written.
+// The sentinel exists for the strict path and for tests that want
+// to assert the unknown-run branch.
+var ErrUnknownRun = errors.New("store: unknown run")
+
 // Telemetry is the LLM usage record for a single run. It is the
 // source of truth for cost reporting and per-model breakdowns;
 // without it the dashboard can only show "a review happened", not
@@ -36,11 +51,23 @@ type Telemetry struct {
 // the review). A re-delivery from the runner is a no-op — the row
 // is rewritten with the same shape.
 //
-// The function refuses to write if the run does not exist. The
-// runner's POST endpoint is the same path the receiver uses to
-// create the run, but they can race; the runner will retry the
-// POST on the next stage transition, by which time the receiver
-// has committed the row.
+// QUB-101: the runner's POST can land before the receiver's
+// UpsertRun has committed (the runner is a separate process and
+// the only sync point is the K8s Job existing). With the new
+// submitJob ordering, UpsertRun runs before createJob returns,
+// so in normal flow the parent row is always present by the
+// time the runner can POST. The unknown-run path is the safety
+// net for an UpsertRun that never landed (DB write error,
+// receiver crashed mid-flow) and returns ErrUnknownRun; the
+// webhook handler matches the sentinel and responds 202 to
+// the runner, so the cost data is dropped silently on the
+// floor rather than turning into a hard failure. The runner
+// does not retry telemetry, so the data is genuinely lost in
+// this edge case; the alternative (INSERT OR IGNORE a
+// placeholder run row) was rejected because UpsertRun's
+// ON CONFLICT only updates mutable fields, leaving the
+// placeholder's empty owner/repo in place forever and
+// surfacing as orphan rows on the dashboard.
 func (s *Store) RecordTelemetry(ctx context.Context, t Telemetry) error {
 	if t.RunID == "" {
 		return errors.New("store: RecordTelemetry: empty run id")
@@ -52,17 +79,20 @@ func (s *Store) RecordTelemetry(ctx context.Context, t Telemetry) error {
 		t.RecordedAt = time.Now().UTC()
 	}
 
-	// FK check first; SQLite needs the parent row to exist before
-	// the child can reference it.
+	// FK check first; SQLite needs the parent row to exist
+	// before the child can reference it. The check is one
+	// indexed point-lookup; it is the common case once the
+	// receiver's UpsertRun has landed.
 	var exists int
-	if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM runs WHERE id = ?`, t.RunID).Scan(&exists); err != nil {
+	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM runs WHERE id = ?`, t.RunID).Scan(&exists)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("store: telemetry for unknown run %q: %w", t.RunID, sql.ErrNoRows)
+			return fmt.Errorf("store: telemetry for run %q: %w", t.RunID, ErrUnknownRun)
 		}
 		return fmt.Errorf("store: telemetry parent check: %w", err)
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := s.db.ExecContext(ctx, `
 		INSERT OR REPLACE INTO telemetry (
 			run_id, model, provider,
 			input_tokens, output_tokens, reasoning_tokens,
@@ -74,8 +104,7 @@ func (s *Store) RecordTelemetry(ctx context.Context, t Telemetry) error {
 		t.InputTokens, t.OutputTokens, t.ReasoningTokens,
 		t.CacheReadTokens, t.CacheWriteTokens,
 		t.CostUSD, t.StepCount, t.RecordedAt.UTC().Format(time.RFC3339Nano),
-	)
-	if err != nil {
+	); err != nil {
 		return fmt.Errorf("store: insert telemetry: %w", err)
 	}
 	return nil

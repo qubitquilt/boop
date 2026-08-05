@@ -82,6 +82,22 @@ type Config struct {
 	DBPath              string        // sqlite path; empty disables the data layer (legacy mode)
 	RunnerToken         string        // shared secret for the runner's POST endpoints; empty rejects all runner posts
 	InstallPollInterval time.Duration // how often to refresh installations from GitHub; 0 = 5m default
+	// QUB-101: data-layer retention knobs. 0 means "use the
+	// store package's default". The retention window deletes
+	// runs whose started_at is older than now-Retention; the
+	// cleanup loop ticks every CleanupEvery; the incremental
+	// vacuum runs at most once per VacuumInterval.
+	Retention      time.Duration
+	CleanupEvery   time.Duration
+	VacuumInterval time.Duration
+	// QUB-101: backup knobs. Dir is the directory the daily
+	// backup is written to (typically /backups, backed by the
+	// boop-receiver-backups PVC). Every is the backup period
+	// (0 = 24h). Keep is the number of daily snapshots to
+	// retain (0 = 30). An empty Dir disables the loop.
+	BackupDir   string
+	BackupEvery time.Duration
+	BackupKeep  int
 	// QUB-94: cluster-wide default for the OpenRouter SDK feature
 	// flag. The runner takes the in-process SDK path when
 	// BOOP_USE_OPENROUTER_SDK=1; otherwise it falls back to the
@@ -248,9 +264,59 @@ func NewHandler(cfg Config, ghClient ghClientAPI, logger *slog.Logger) (*Handler
 	return h, nil
 }
 
-func (h *Handler) Health(w http.ResponseWriter, _ *http.Request) {
+func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
+	// /health?deep=1 runs PRAGMA quick_check on the store and
+	// returns 503 if the result is anything other than "ok".
+	// Used by the readiness probe in front of the receiver and
+	// by operators debugging a suspect DB; the default /health
+	// stays a cheap always-200 so a broken DB does not cause
+	// the receiver to be killed by the kubelet.
+	if r.URL.Query().Get("deep") == "1" {
+		h.deepHealth(w, r)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, "ok")
+}
+
+// deepHealth runs PRAGMA quick_check on the store and reports
+// the result. 200 with a JSON body on success; 503 with the
+// check result on failure. The data layer must be enabled
+// (DB_PATH set) for this endpoint to do anything useful; a
+// disabled data layer still returns 200 because the dashboard
+// is not the receiver's critical-path surface.
+func (h *Handler) deepHealth(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"status":"ok","data_layer":"disabled"}`)
+		return
+	}
+	ok, result, err := h.store.DeepCheck()
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = fmt.Fprintf(w, `{"status":"error","err":%q}`, err.Error())
+		return
+	}
+	stats, _ := h.store.Stats(r.Context())
+	status := "ok"
+	httpStatus := http.StatusOK
+	if !ok {
+		status = "fail"
+		httpStatus = http.StatusServiceUnavailable
+	}
+	body := map[string]any{
+		"status":        status,
+		"quick_check":   result,
+		"runs":          stats.Runs,
+		"telemetry":     stats.Telemetry,
+		"file_bytes":    stats.FileBytes,
+		"freelist_pages": stats.FreelistCount,
+	}
+	buf, _ := json.Marshal(body)
+	w.WriteHeader(httpStatus)
+	_, _ = w.Write(buf)
 }
 
 const (
@@ -676,27 +742,24 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		return false, nil
 	}
 
-	if err := h.createJob(ctx, job); err != nil {
-		if isAlreadyExists(err) {
-			// Lost a race with another delivery for the same
-			// head SHA (between claimJobSlot and createJob).
-			// Treat as duplicate so the caller can decide
-			// whether to react / reply.
-			h.logger.Info("duplicate job race", "delivery", delivery, "job", jobName, "err", err)
-			writeAck(w, "duplicate", jobName, delivery)
-			return false, nil
-		}
-		h.logger.Error("create job", "delivery", delivery, "job", jobName, "err", err)
-		http.Error(w, "create job", http.StatusInternalServerError)
-		return false, fmt.Errorf("create job: %w", err)
-	}
-
-	// Persist the run row so the dashboard has it. This is
-	// best-effort: the receiver's job is to submit the Job and
-	// ack the webhook. A store write failure is logged but does
-	// not fail the webhook (the Job is already in flight; the
-	// dashboard will simply not show it, and the next runner
-	// status POST will write the row).
+	// QUB-101: persist the run row BEFORE creating the K8s Job.
+	// The previous order (createJob then UpsertRun) was the
+	// root cause of silently lost telemetry: the runner could
+	// start, post its cost data, and exit before the
+	// receiver's UpsertRun had landed. With the new order, by
+	// the time the Job exists the parent run row is already
+	// committed and the runner's first POST can find it.
+	//
+	// If UpsertRun fails, we abort the webhook (500). The
+	// reasoning is the same as for a failed createJob: the
+	// durable side effect is broken, the caller should retry,
+	// and creating a Job without a parent row would push the
+	// race onto the runner's first telemetry POST. The old
+	// "best-effort" path made sense when the runner could
+	// itself create the row on its first status POST; with
+	// that contract gone (UpdateRunStatus still uses
+	// sql.ErrNoRows on a missing row), the receiver has to
+	// be the one that ensures the row exists.
 	if h.store != nil {
 		_, err := h.store.UpsertRun(ctx, store.Run{
 			ID:             jobName,
@@ -712,8 +775,25 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 			StartedAt:      time.Now().UTC(),
 		})
 		if err != nil {
-			h.logger.Warn("upsert run", "delivery", delivery, "job", jobName, "err", err)
+			h.logger.Error("upsert run", "delivery", delivery, "job", jobName, "err", err)
+			http.Error(w, "store error", http.StatusInternalServerError)
+			return false, fmt.Errorf("upsert run: %w", err)
 		}
+	}
+
+	if err := h.createJob(ctx, job); err != nil {
+		if isAlreadyExists(err) {
+			// Lost a race with another delivery for the same
+			// head SHA (between claimJobSlot and createJob).
+			// Treat as duplicate so the caller can decide
+			// whether to react / reply.
+			h.logger.Info("duplicate job race", "delivery", delivery, "job", jobName, "err", err)
+			writeAck(w, "duplicate", jobName, delivery)
+			return false, nil
+		}
+		h.logger.Error("create job", "delivery", delivery, "job", jobName, "err", err)
+		http.Error(w, "create job", http.StatusInternalServerError)
+		return false, fmt.Errorf("create job: %w", err)
 	}
 
 	h.logger.Info("job created",

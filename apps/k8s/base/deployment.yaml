@@ -5,6 +5,20 @@ metadata:
   name: boop-receiver-data
   labels:
     app: boop-receiver
+  annotations:
+    # QUB-101: Retain on PVC delete so a `kubectl delete pvc`
+    # (or the namespace being torn down for migration) does not
+    # zero the volume by accident. The PV goes to "Released"
+    # instead of being deleted, and an operator can re-bind it
+    # or copy /data/boop.db out. The annotation works on
+    # StorageClasses that propagate reclaim policy from the
+    # PVC; the spec field below is the canonical way on
+    # clusters >= 1.31 and is silently ignored elsewhere.
+    # Reclaim policy is the layer that protects against
+    # accidental data loss; the daily backup loop (see
+    # backup-cronjob.yaml for the Job-driven alternative)
+    # is what protects against actual disk loss.
+    pv.kubernetes.io/reclaim-policy: Retain
 spec:
   accessModes:
     - ReadWriteOnce
@@ -14,12 +28,49 @@ spec:
   # any operator needs to think about growth. Resize is
   # in-place (StorageClass permitting); bumping is a one-line
   # change here, no consumer needs an update.
+  #
+  # The retention loop (DB_RETENTION, default 365d) and the
+  # incremental vacuum (DB_VACUUM_INTERVAL, default 7d) keep
+  # actual usage well below the 1Gi ceiling; the 2.5 KB/review
+  # estimate in the comment was right, but a busy 1k-PR
+  # monorepo day at ~2.5 MB/day fills 1Gi inside a year
+  # without retention. The daily backup (BACKUP_EVERY, default
+  # 24h; BACKUP_KEEP, default 30) lands in the separate
+  # boop-receiver-backups PVC, so the absolute floor for "no
+  # data loss" is one day between backups.
   resources:
     requests:
       storage: 1Gi
-  # No storageClassName — let the cluster's default provisioner
-  # handle it. Tied to a specific SC in the overlay if your
-  # cluster needs a non-default (e.g. local-path on bare metal).
+  # QUB-101: prefer the cluster's default provisioner unless
+  # the overlay sets a non-default. The overlay wires a
+  # specific StorageClass (e.g. local-path on bare metal).
+  # persistentVolumeReclaimPolicy is the PVC-level field
+  # introduced in K8s 1.31 (beta earlier); the annotation
+  # above covers older clusters.
+  persistentVolumeReclaimPolicy: Retain
+---
+# QUB-101: separate PVC for daily backup snapshots. The
+# receiver mounts this at /backups and writes one VACUUM
+# INTO file per day. Sized for 30 daily snapshots at peak
+# (50MiB each is generous): 2Gi covers the worst case with
+# headroom. Retain on delete, same reasoning as the data
+# PVC: an accidental `kubectl delete pvc` should not nuke
+# the only copies of the database.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: boop-receiver-backups
+  labels:
+    app: boop-receiver
+  annotations:
+    pv.kubernetes.io/reclaim-policy: Retain
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  persistentVolumeReclaimPolicy: Retain
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -89,6 +140,26 @@ spec:
             # automatically.
             - name: DB_PATH
               value: /data/boop.db
+            # QUB-101: retention knobs. All optional — the
+            # receiver falls back to sensible defaults
+            # (365d retention, 5m cleanup, 7d vacuum) when
+            # the env var is unset or unparseable.
+            - name: DB_RETENTION
+              value: "8760h"   # 365 days
+            - name: DB_CLEANUP_INTERVAL
+              value: "5m"
+            - name: DB_VACUUM_INTERVAL
+              value: "168h"    # 7 days
+            # QUB-101: backup knobs. BACKUP_DIR is the
+            # destination directory; default /backups
+            # matches the volumeMount below. Empty value
+            # disables the loop (useful for tests).
+            - name: BACKUP_DIR
+              value: /backups
+            - name: BACKUP_EVERY
+              value: "24h"
+            - name: BACKUP_KEEP
+              value: "30"
             # Shared secret for the runner's POST endpoints.
             # Generated once on first deploy and stored in the
             # boop-secrets Secret; the Job template below
@@ -104,6 +175,11 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            # QUB-101: separate volume for daily backups.
+            # The receiver writes one VACUUM INTO snapshot
+            # per day to this mount.
+            - name: backups
+              mountPath: /backups
           livenessProbe:
             httpGet:
               path: /health
@@ -127,6 +203,9 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: boop-receiver-data
+        - name: backups
+          persistentVolumeClaim:
+            claimName: boop-receiver-backups
 ---
 apiVersion: v1
 kind: Service

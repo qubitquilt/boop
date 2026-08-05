@@ -22,8 +22,8 @@ import (
 // after construction if they need to stub ListInstallations.
 func newTestHandlerWithStore(t *testing.T) *Handler {
 	t.Helper()
-	dsn := "file:" + filepath.Join(t.TempDir(), "boop.db") + "?cache=shared&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)"
-	s, err := store.Open(dsn)
+	path := filepath.Join(t.TempDir(), "boop.db")
+	s, err := store.Open(path)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -219,11 +219,15 @@ func TestRecordTelemetry_Auth(t *testing.T) {
 }
 
 func TestRecordTelemetry_UnknownRun(t *testing.T) {
+	// QUB-101: a runner POST that lands before the receiver's
+	// UpsertRun has committed gets ErrUnknownRun back from the
+	// store, which the handler matches and turns into a 202.
+	// Matches RecordStatus's behavior for the same condition.
 	h := newTestHandlerWithStore(t)
 	body := `{"model": "x", "input_tokens": 0, "output_tokens": 0, "cost_usd": 0, "step_count": 0}`
 	rr := doRequest(t, h, "POST", "/api/runs/nonexistent/telemetry", body, map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
-	if rr.Code != 404 {
-		t.Errorf("status = %d, want 404", rr.Code)
+	if rr.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want 202", rr.Code)
 	}
 }
 
