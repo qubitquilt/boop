@@ -354,7 +354,6 @@ func AppInfoURLForTest() string { return appInfoURL }
 // to point AppBotLogin at a httptest.Server. Test-only.
 func SetAppInfoURLForTest(s string) { appInfoURL = s }
 
-
 // installationsListURL is the App endpoint that returns every
 // installation of the App. Paged by GitHub; we walk pages until
 // NextPage is zero. Like appInfoURL it's a var so tests can

@@ -523,10 +523,6 @@ func renderStatusBody(stage, sha, by string, reviewNumber int) string {
 	return fmt.Sprintf("boop status: %s", stage)
 }
 
-func (h *Handler) postStatus(ctx context.Context, client ghIssueClientAPI, owner, repo string, number int, body string) (int64, error) {
-	return client.PostIssueComment(ctx, owner, repo, number, body)
-}
-
 // claimJobSlot checks whether a Job already exists for this head SHA.
 // Returns (true, "") when the caller may create a job.
 // Returns (false, status) when the caller must skip: status is

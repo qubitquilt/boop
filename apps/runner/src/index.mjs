@@ -67,20 +67,25 @@ const execFileAsync = promisify(execFile);
 // id on the slot, and reuses it for every subsequent PATCH (so a
 // pipeline retry hits the same comment instead of posting another
 // one). The slot is mutable; pass-by-reference is the point.
+//
+// currentCtx returns the ctx to hand to anything that needs the
+// live statusCommentId (postStatus PATCH, the QUB-92 resume
+// read/write, the workflow-state handoff). Until the slot is
+// populated by ensureStatusComment, the returned ctx has a null
+// statusCommentId and the caller should skip — the same shape
+// the env-var snapshot has on day one.
 function makeDeps(ctx, log, cleanup) {
   const octokitSlot = { value: null };
   const statusCommentSlot = { value: ctx.statusCommentId || null };
   const getOctokit = () => octokitSlot.value;
-  const patchStatusWithCtx = (stage, detail) => {
-    const effectiveCtx = statusCommentSlot.value
-      ? { ...ctx, statusCommentId: statusCommentSlot.value }
-      : ctx;
-    return postStatus(stage, detail, effectiveCtx, {
+  const currentCtx = () =>
+    statusCommentSlot.value ? { ...ctx, statusCommentId: statusCommentSlot.value } : ctx;
+  const patchStatusWithCtx = (stage, detail) =>
+    postStatus(stage, detail, currentCtx(), {
       log: log.log,
       errlog: log.errlog,
       octokit: getOctokit(),
     });
-  };
   const postStatusWrapper = async (stage, detail) => {
     if (!getOctokit()) {
       log.log("status", "skip (no octokit yet)", { stage });
@@ -116,6 +121,7 @@ function makeDeps(ctx, log, cleanup) {
     errlog: log.errlog,
     setOctokit: (octokit) => { octokitSlot.value = octokit; },
     getOctokit,
+    currentCtx,
     postStatus: postStatusWrapper,
     // cloneRepo is wrapped so its postStatus call goes through the
     // same lazy octokit-resolution + status-comment-creation path
@@ -201,12 +207,24 @@ export async function run(env = process.env, overrides = {}) {
   // twice would re-read the same prior state and double-
   // filter, possibly dropping stages the current run
   // already passed.
+  //
+  // QUB-99 + QUB-92 follow-up: readWorkflowState and
+  // writeWorkflowState both need the live statusCommentId
+  // from the slot, not the env-var snapshot on ctx
+  // (which is now null because the receiver no longer
+  // pre-creates the comment). currentCtx() supplies the
+  // effective ctx; the early-return on
+  // !statusCommentSlot.value skips the read/write path
+  // when the lazy-create has not happened yet (i.e., no
+  // first postStatus call has run).
   let stateInitialized = false;
   const onStagePassed = async (stageId) => {
     const octokit = deps.getOctokit();
-    if (!octokit || !ctx.statusCommentId) return;
+    if (!octokit) return;
+    const liveCtx = deps.currentCtx();
+    if (!liveCtx.statusCommentId) return;
     if (!stateInitialized) {
-      const prior = await readWorkflowState(octokit, ctx, {
+      const prior = await readWorkflowState(octokit, liveCtx, {
         log: log.log,
         errlog: log.errlog,
       });
@@ -238,7 +256,7 @@ export async function run(env = process.env, overrides = {}) {
     }
     await writeWorkflowState(
       octokit,
-      ctx,
+      liveCtx,
       { log: log.log, errlog: log.errlog },
       { passed: state.passed, sub: state.sub },
     );
