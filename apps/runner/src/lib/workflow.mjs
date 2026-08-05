@@ -571,6 +571,15 @@ async function summaryStage(ctx, deps, _overrides, state) {
     ctx.reviewNumber,
     state.review.confidence,
     ctx,
+    // QUB-103: forward the runner's logger so postReview's
+    // "patched existing summary comment" / "created summary
+    // comment" lines surface in the run logs. Without this
+    // the dedup-vs-create decision is invisible to operators
+    // triaging a duplicate-post incident. postInlineComments
+    // (in inlinesStage below) already passes its deps for
+    // the same reason; summaryStage is the missing
+    // counterpart.
+    { log: deps.log, errlog: deps.errlog },
   );
   deps.log("done", "summary comment posted", {
     review_number: ctx.reviewNumber,

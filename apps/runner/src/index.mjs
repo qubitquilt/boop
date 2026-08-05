@@ -19,6 +19,7 @@
 // real `git`.
 
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import jwt from "jsonwebtoken";
 import { spawn } from "node:child_process";
 import { execFile } from "node:child_process";
@@ -146,6 +147,15 @@ function makeDeps(ctx, log, cleanup) {
 // working.
 export async function run(env = process.env, overrides = {}) {
   const ctx = loadConfig(env);
+  // QUB-103: per-run review id lets the runner find the existing
+  // summary comment on retry and PATCH it instead of double-posting.
+  // Generated before the handshake so postReview (called from the
+  // `summary` macro-stage) can write the marker into the comment
+  // body on the first POST. The same UUID is consumed by
+  // postInlineComments for the dedup contract (each inline
+  // carries its own per-(path,line,body-hash) marker; the review
+  // id rides on the summary only).
+  ctx.reviewId = randomUUID();
   const log = makeLogger(ctx);
   const cleanup = createCleanupRegistry({ errlog: log.errlog });
 
@@ -176,6 +186,7 @@ export async function run(env = process.env, overrides = {}) {
     review_number: ctx.reviewNumber,
     previous_head_sha: ctx.previousHeadSha,
     bot_login: ctx.botLogin,
+    review_id: ctx.reviewId,
   });
 
   // QUB-92 resume: state.passed is the list of macro stages
