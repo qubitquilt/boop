@@ -737,6 +737,93 @@ func diff(a, b float64) float64 {
 	return b - a
 }
 
+// QUB-110: lineage round-trip. parent_run_id and
+// superseded_by_id are written via UpsertRun and read
+// back through GetRun. The dashboard's "vertical
+// timeline" view walks parent_run_id.
+func TestUpsertRun_LineageRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	prior := "boop-a-b-1-aaaaaaa"
+	next := "boop-a-b-1-aaaaaaa-r1"
+	if _, err := s.UpsertRun(ctx, sampleRun(prior, "a", "b", 1, "aaaaaaa", StatusSucceeded, time.Now())); err != nil {
+		t.Fatalf("upsert prior: %v", err)
+	}
+	if _, err := s.UpsertRun(ctx, Run{
+		ID:           next,
+		Owner:        "a",
+		Repo:         "b",
+		PRNumber:     1,
+		CommitSHA:    "aaaaaaa",
+		BaseRef:      "main",
+		ReviewNumber: 2,
+		Status:       StatusPending,
+		StartedAt:    time.Now().UTC(),
+		ParentRunID:  prior,
+	}); err != nil {
+		t.Fatalf("upsert next: %v", err)
+	}
+	if err := s.SetSupersededBy(ctx, prior, next); err != nil {
+		t.Fatalf("set superseded: %v", err)
+	}
+	got, err := s.GetRun(ctx, next)
+	if err != nil {
+		t.Fatalf("get next: %v", err)
+	}
+	if got.ParentRunID != prior {
+		t.Errorf("parent_run_id = %q, want %q", got.ParentRunID, prior)
+	}
+	priorRow, err := s.GetRun(ctx, prior)
+	if err != nil {
+		t.Fatalf("get prior: %v", err)
+	}
+	if priorRow.SupersededByID != next {
+		t.Errorf("superseded_by_id = %q, want %q", priorRow.SupersededByID, next)
+	}
+}
+
+// QUB-110: GetRun returns ErrUnknownRun for an unknown
+// id. The handler uses this to map to 404 instead of
+// 500.
+func TestGetRun_UnknownReturnsErrUnknownRun(t *testing.T) {
+	s := newTestStore(t)
+	_, err := s.GetRun(context.Background(), "no-such-run")
+	if !errors.Is(err, ErrUnknownRun) {
+		t.Errorf("err = %v, want ErrUnknownRun", err)
+	}
+}
+
+// QUB-110: CountRerunJobsForSHA returns 0 for a fresh
+// head SHA and increments as re-runs land. The -r{n}
+// suffix is what makes the count work — a Job name
+// without the suffix (the original) does not match.
+func TestCountRerunJobsForSHA_IncrementsOnReruns(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	original := "boop-a-b-1-aaaaaaa"
+	if _, err := s.UpsertRun(ctx, sampleRun(original, "a", "b", 1, "aaaaaaa", StatusSucceeded, time.Now())); err != nil {
+		t.Fatalf("upsert original: %v", err)
+	}
+	got, err := s.CountRerunJobsForSHA(ctx, "a", "b", 1, "aaaaaaa")
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("count = %d, want 0 (no reruns yet)", got)
+	}
+	if _, err := s.UpsertRun(ctx, Run{
+		ID: "boop-a-b-1-aaaaaaa-r1", Owner: "a", Repo: "b", PRNumber: 1,
+		CommitSHA: "aaaaaaa", BaseRef: "main", Status: StatusSucceeded,
+		StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("upsert r1: %v", err)
+	}
+	got, _ = s.CountRerunJobsForSHA(ctx, "a", "b", 1, "aaaaaaa")
+	if got != 1 {
+		t.Errorf("count = %d, want 1", got)
+	}
+}
+
 // QUB-108: failure_class round-trip. The reconciler writes
 // the K8s container exit reason into this column; the
 // dashboard reads it for the exception dock's filter chips.

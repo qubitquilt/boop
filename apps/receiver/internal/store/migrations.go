@@ -21,7 +21,7 @@ import (
 // N only after the entire block has run. A block that fails
 // half-way leaves user_version unchanged and the next Open
 // retries from that point.
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 // applyMigrations runs the schema migrations, gated on
 // PRAGMA user_version. The version starts at 0 on a fresh
@@ -106,6 +106,24 @@ func applyMigrations(db *sql.DB) error {
 			return fmt.Errorf("migration v3: write user_version: %w", err)
 		}
 		v = 3
+	}
+	// v4 (QUB-110) adds the re-run lineage. parent_run_id
+	// is the run this one was re-run from; superseded_by_id
+	// is the run that re-ran this one (at most one — a
+	// re-run never branches). ON DELETE SET NULL keeps the
+	// line in place even if the parent is retention-pruned
+	// (the operator's "show me the lineage" view still
+	// surfaces the id, with a "(pruned)" badge from the
+	// dashboard side). idx_runs_parent is the lookup the
+	// lineage walk uses: "every descendant of this run".
+	if v < 4 {
+		if err := migrateV4(ctx, db); err != nil {
+			return fmt.Errorf("migration v4: %w", err)
+		}
+		if err := writeUserVersion(ctx, db, 4); err != nil {
+			return fmt.Errorf("migration v4: write user_version: %w", err)
+		}
+		v = 4
 	}
 	// Add later migrations as additional `if v < N { ... }`
 	// blocks here. Each must set user_version = N on success.
@@ -339,6 +357,51 @@ func migrateV3(ctx context.Context, db *sql.DB) error {
 	for i, stmt := range stmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("migration v3 statement %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// migrateV4 (QUB-110) adds the re-run lineage columns.
+// The full re-run mechanism (preview endpoint, body-hash
+// dedup, prior-context prompt block) is a larger change
+// that lives in the API/runner code; this migration is
+// only the schema half.
+//
+// The "every descendant of this run" lookup is
+// idx_runs_parent. Without the index the lineage walk
+// is a full table scan; with it, the dashboard's
+// vertical-timeline render is one B-tree descent per
+// generation.
+func migrateV4(ctx context.Context, db *sql.DB) error {
+	colAdds := []struct {
+		table string
+		col   string
+		def   string
+	}{
+		{"runs", "parent_run_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL"},
+		{"runs", "superseded_by_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL"},
+	}
+	for _, c := range colAdds {
+		has, err := hasColumn(ctx, db, c.table, c.col)
+		if err != nil {
+			return fmt.Errorf("migration v4 hasColumn %s.%s: %w", c.table, c.col, err)
+		}
+		if has {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", c.table, c.col, c.def)
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v4 alter %s.%s: %w", c.table, c.col, err)
+		}
+	}
+	idxStmts := []string{
+		`CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_runs_superseded_by ON runs(superseded_by_id)`,
+	}
+	for i, stmt := range idxStmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v4 index %d: %w", i, err)
 		}
 	}
 	return nil

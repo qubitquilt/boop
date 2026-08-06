@@ -161,6 +161,7 @@ func (s *Store) ListStuckRuns(ctx context.Context, olderThan time.Duration, limi
 			review_number, reason, installation_id, status,
 			started_at, ended_at, duration_ms, error,
 			failure_class, last_heartbeat_at,
+			COALESCE(parent_run_id, ''), COALESCE(superseded_by_id, ''),
 			created_at, updated_at
 		FROM runs
 		WHERE status = 'running'
