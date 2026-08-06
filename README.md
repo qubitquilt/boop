@@ -13,17 +13,36 @@ The internal project here is `boop`. The GitHub App on the wire is
 
 ## What Boop does
 
-- **Multi-lens review** — runs a configurable set of reviewer lenses
-  (code quality, design patterns, error handling, readability, SOLID,
-  test quality, deep) against every PR head.
-- **Line-specific inline comments** — actionable feedback pinned to
-  the diff, not a wall of prose in a summary.
-- **Single summary post** — one short comment per PR with the headline
-  findings.
-- **At-mention re-review** — drop `@BoopPr review` on any PR comment
-  to re-trigger him.
-- **Friendly status updates** — a "Boop is reviewing…" comment is
-  posted up front and patched as the review progresses.
+- **Multi-expert review** — one LLM walkthrough + N parallel
+  expert calls (one per lens), then a narrator that
+  synthesizes them. Seven lenses: code quality, design
+  pattern, error handling, readability, SOLID, test quality,
+  deep. Each expert sees the same walkthrough as shared
+  context, so the findings read as one voice.
+- **Persona** — light pug flourishes sampled from a curated
+  pool. Used once per review in the summary's TL;DR,
+  "What this PR does well", or the line after the closing
+  signal. Never in inline comment bodies. See
+  [`resources/persona.md`](./apps/k8s/base/runner-config/skills/boop/resources/persona.md).
+- **Line-specific inline comments** — actionable feedback
+  pinned to the diff, not a wall of prose in a summary.
+- **Single summary post** — one short comment per PR with
+  the headline findings.
+- **Status thread (PR-opened triggers)** — a 🐾 "Boop's on
+  the case!" comment is posted up front and PATCHed at each
+  stage. Final stage is 🦴 on done, ❌ on failure.
+- **Reaction mode (PR-comment triggers)** — when a user
+  re-triggers via `@BoopPr review` on a comment, Boop
+  reacts 👀 on the trigger and adds a single terminal
+  reaction (🦴 on done, ❌ on failed) instead of a status
+  thread. One reaction change, one notification.
+- **At-mention re-review** — drop `@BoopPr review` on any
+  PR comment to re-trigger him.
+- **Re-review delta** — the runner diffs
+  `previous_head_sha..head_sha`, not the full PR base.
+- **rtk compression (QUB-85)** — file reads from the
+  skill ConfigMap route through rtk with a raw
+  `fs.readFile` fallback when the binary is missing.
 
 ## Documentation
 
@@ -43,21 +62,33 @@ Full documentation lives in [`docs/`](./docs/README.md):
 ## How it works
 
 ```
-PR opened ──▶ boop-receiver (Go) ──▶ K8s Job (boop-runner, Node)
-                                          │
-                                          ├── clone PR
-                                          ├── run multi-lens review
-                                          ├── post summary comment
-                                          └── post inline comments
+ PR opened ──▶ boop-receiver (Go) ──▶ K8s Job (boop-runner, Node)
+                                            │
+                                            ├── mints GitHub App install token
+                                            ├── clones PR
+                                            ├── walkthrough           (1 LLM call)
+                                            ├── classify              (1 LLM call)
+                                            ├── N × experts in parallel  (N LLM calls)
+                                            ├── gather / meta-review  (1 LLM call)
+                                            ├── narrate               (1 LLM call)
+                                            ├── ste-lint              (mechanical, best-effort)
+                                            ├── post summary comment
+                                            └── post inline comments
 ```
 
-- `apps/receiver/` — Go HTTP server. Validates the GitHub webhook,
-  filters reviewable events, submits a Job per PR.
-- `apps/runner/` — Node.js one-shot worker. Clones the PR, runs the
-  `boop` skill via OpenCode, posts the result.
+- `apps/receiver/` — Go HTTP server. Validates the GitHub
+  webhook, filters reviewable events, submits a Job per
+  PR. Persists every run + telemetry to SQLite
+  (see [secrets.md](./docs/secrets.md); optional via
+  `DB_PATH`).
+- `apps/runner/` — Node.js one-shot worker. Clones the PR,
+  runs the multi-expert pipeline via the OpenRouter SDK
+  in-process, posts the result. File reads go through the
+  [rtk adapter](./docs/runner.md#rtk-adapter-qub-85)
+  (QUB-85).
 - `apps/k8s/base/` — Kustomize manifests (cluster-agnostic).
-- `apps/k8s/overlays/<cluster>/` — per-cluster namespace + image
-  tags. `pugquilt` is the home cluster.
+- `apps/k8s/overlays/<cluster>/` — per-cluster namespace
+  + image tags. `pugquilt` is the home cluster.
 
 ## Image publishing
 

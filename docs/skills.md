@@ -13,20 +13,27 @@ See also: [architecture.md](./architecture.md), [product.md](./product.md),
 
 ```
 boop/                                  (orchestrator)
-├── SKILL.md                           voice, output spec, ID scheme
-└── agents/
-    ├── review-code-quality.md         lens 1
-    ├── review-design-pattern.md       lens 2
-    ├── review-error-handling.md       lens 3
-    ├── review-readability.md          lens 4
-    ├── review-solid-principles.md     lens 5
-    ├── review-test-quality.md         lens 6
-    └── review-deep.md                 lens 7
+├── SKILL.md                           voice, output spec, ID scheme, walkthrough/narrator role
+├── agents/
+│   ├── review-code-quality.md         lens 1
+│   ├── review-design-pattern.md       lens 2
+│   ├── review-error-handling.md       lens 3
+│   ├── review-readability.md          lens 4
+│   ├── review-solid-principles.md     lens 5
+│   ├── review-test-quality.md         lens 6
+│   └── review-deep.md                 lens 7
+└── resources/
+    ├── persona.md                     curated pool of pug flourishes
+    ├── output-format.md               the exact output block the narrator emits
+    └── lens-template.md               shared template every lens is built from
 ```
 
-The orchestrator drives the workflow; the lens files are checklists the
-orchestrator applies in one model call. They are **not** sub-agent
-invocations.
+The orchestrator drives the multi-expert pipeline
+([runner.md](./runner.md#prompt-construction-buildboopprompt)):
+one walkthrough call, then N parallel expert calls (one per lens,
+with the lens file as system prompt), then gather / meta-review /
+narrate. The lens files are reference material each expert reads
+individually; they are not chained calls in the same LLM thread.
 
 ## The orchestrator (`SKILL.md`)
 
@@ -46,6 +53,14 @@ Highlights:
    inline comments. Number globally in tier order.
 4. **Output.** Emit the `=== SUMMARY === … === INLINE COMMENTS === …
    === END ===` block.
+
+In the multi-expert pipeline the orchestrator runs as the
+**narrator** at the end (the SKILL.md you see is post-QUB-95).
+The lens walks happen as parallel LLM calls earlier in the
+pipeline (one LLM call per lens), then the narrator reads the
+gathered findings and synthesizes. The shape of the output the
+narrator emits is unchanged from the single-call path so the
+runner's parser does not care how the LLM calls were arranged.
 
 ### Voice contract (the single most important section)
 
@@ -83,6 +98,15 @@ human-in-the-loop edit. The voice contract enforces:
   - Articles stay.
 - **No emoji in finding bodies.** The 🐾 lives in the chrome (header,
   footer, status). Findings stay unadorned.
+- **Persona is for the summary only.** The narrator samples
+  ONE light pug flourish per review from the curated pool in
+  [`resources/persona.md`](../apps/k8s/base/runner-config/skills/boop/resources/persona.md).
+  Use it in the TL;DR opener, the "What this PR does well"
+  opener, or as a closing emote on the line after
+  `Approving | Changes requested | Commented`. Never in inline
+  comment bodies, never stacked, never on a one-line summary
+  where it would be noise. The emote format is `*wags tail*`
+  (asterisks, not 🐾).
 
 ### Self-lint before emitting
 
@@ -286,7 +310,8 @@ sync. **No image rebuild required.**
 To add a new lens:
 
 1. Drop the file in
-   `apps/k8s/base/runner-config/skills/boop/agents/review-<name>.md`.
+   `apps/k8s/base/runner-config/skills/boop/agents/review-<name>.md`
+   (use `resources/lens-template.md` as the starting structure).
 2. Add a `configMapGenerator.files` entry in
    `apps/k8s/base/kustomization.yaml` using the `key=path` form so the
    directory structure is preserved on mount:
@@ -300,7 +325,7 @@ To add a new lens:
      path: skills/boop/agents/review-<name>.md
    ```
 4. Add the lens to `LENS_FILES` in
-   `apps/runner/src/index.mjs`:
+   `apps/runner/src/lib/config.mjs`:
    ```js
    "agents/review-<name>.md",
    ```
@@ -311,6 +336,14 @@ To add a new lens:
 
 If you only edited an existing file, steps 1-5 are skipped; the file
 contents are repacked into the ConfigMap on the next sync.
+
+To add a new resource (e.g. a new curated phrasing pool):
+
+1. Drop the file in
+   `apps/k8s/base/runner-config/skills/boop/resources/<name>.md`.
+2. Add the `configMapGenerator.files` and Job-template `items`
+   entries (same `key=path` form as for lenses).
+3. Reference it from `SKILL.md` so the narrator knows to pull from it.
 
 The ConfigMap has a 1 MB hard cap (etcd). If you outgrow it, swap to a
 git-sync init container pattern (see `apps/dev-tools/openchamber` for
