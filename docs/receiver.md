@@ -191,14 +191,19 @@ Read from env vars at startup. All required. See
 | `LOG_LEVEL` | no | `info` | One of `debug`, `info`, `warn`, `error`. JSON to stdout. |
 | `DB_PATH` | no | `/data/boop.db` | SQLite file for the data layer. Empty disables the data layer (the new endpoints return 503; the webhook path is unaffected). |
 | `RUNNER_TOKEN` | no | (empty) | Shared secret for the runner's POST endpoints. Empty rejects every runner POST. Propagated to the runner as `BOOP_DASHBOARD_TOKEN`. |
+| `OPENROUTER_MODEL` | no | (empty) | Model id forwarded to every review Job as `OPENROUTER_MODEL`. The runner reads it and calls the OpenRouter SDK with it. Empty triggers a loud startup Warn and the runner's "OPENROUTER_MODEL is unset or empty" throw on the first review; pin to a concrete id (e.g. `minimax/minimax-m3`) so reviews actually run. |
 
 ## Event handling
 
 ### `pull_request`
 
-Reviewable actions: `opened`, `reopened`, `synchronize`, `ready_for_review`.
-Anything else (`closed`, `edited`, `assigned`, …) is acked `ignored` and
-discarded.
+Reviewable actions: `opened` only. Any other pull_request action
+(`reopened`, `synchronize`, `ready_for_review`, `closed`, `edited`,
+`assigned`, …) is acked `ignored` and discarded. The narrow trigger
+matches the product contract: Boop fires on the first open of a PR, and
+re-runs after that go through the issue_comment path (`@BoopPr review`).
+Subsequent pushes and reopens are deliberately not reviewable — a fresh
+review on every push would race with the in-flight one.
 
 On a reviewable action, the receiver:
 

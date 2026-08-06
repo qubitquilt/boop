@@ -243,6 +243,61 @@ func TestBuildJobForwardsOpenRouterSDKEnabled(t *testing.T) {
 	}
 }
 
+func TestBuildJobForwardsOpenRouterModel(t *testing.T) {
+	// QUB-106: the receiver's OPENROUTER_MODEL env var must
+	// land on the runner container as OPENROUTER_MODEL. The
+	// runner's openrouter.mjs reads it as ctx.openrouterModel
+	// and throws "OPENROUTER_MODEL is unset or empty" if it
+	// is missing — that throw is the right behaviour for a
+	// misconfigured receiver Deployment, but only if the
+	// wire-up here is exercised. A unit test catches a
+	// regression where a future refactor drops the field
+	// from the env list (the runner's existing throw test
+	// in openrouter.test.mjs can't, because it runs in the
+	// runner process with no Job spec in sight).
+	cases := []struct {
+		name  string
+		model string
+	}{
+		{"populated", "minimax/minimax-m3"},
+		{"prefixed form passes through unchanged", "openrouter/anthropic/claude-3.5-sonnet"},
+		{"empty is preserved so the runner's throw fires", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			job, err := buildJob(templateVars{
+				Owner:           "o",
+				Repo:            "r",
+				Number:          "1",
+				SHA:             "0123456789abcdef",
+				SHA7:            "0123456",
+				BaseRef:         "main",
+				Image:           "img",
+				InstallationID:  "1",
+				OpenRouterModel: c.model,
+			})
+			if err != nil {
+				t.Fatalf("buildJob: %v", err)
+			}
+			env := job.Spec.Template.Spec.Containers[0].Env
+			var found bool
+			var got string
+			for _, e := range env {
+				if e.Name == "OPENROUTER_MODEL" {
+					found = true
+					got = e.Value
+				}
+			}
+			if !found {
+				t.Fatalf("OPENROUTER_MODEL not present in container env: %+v", env)
+			}
+			if got != c.model {
+				t.Errorf("OPENROUTER_MODEL = %q, want %q", got, c.model)
+			}
+		})
+	}
+}
+
 func TestBuildJob(t *testing.T) {
 	job, err := buildJob(templateVars{
 		Owner:           "michaelruelas",

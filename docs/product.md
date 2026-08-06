@@ -10,9 +10,11 @@ the surface.
 
 BoopPr reviews in two ways:
 
-1. **Automatic on PR lifecycle events.** `opened`, `reopened`, `synchronize`
-   (new push), `ready_for_review`. Boop sees the PR, posts a status comment,
-   and starts a review.
+1. **Automatic on first open.** When a PR is first opened, Boop sees it,
+   posts a status comment, and starts a review. Subsequent pushes
+   (`synchronize`), reopens, and "ready for review" transitions do **not**
+   re-trigger — a fresh review on every push would race with the
+   in-flight one.
 2. **On demand.** Comment on any PR (the issue, a review, the conversation
    tab) with `@BoopPr review` (and a small set of natural phrasings). Boop
    re-runs against the current head SHA. See the [request grammar](./webhook-contract.md#request-grammar)

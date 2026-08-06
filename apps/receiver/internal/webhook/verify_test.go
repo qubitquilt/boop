@@ -18,12 +18,20 @@ func TestVerifySignature(t *testing.T) {
 }
 
 func TestIsReviewableAction(t *testing.T) {
-	for _, a := range []string{"opened", "reopened", "synchronize", "ready_for_review"} {
+	// Product contract: Boop fires on the first open of a PR.
+	// Subsequent pushes, reopens, and "ready for_review" transitions
+	// are ignored — the author's intent is to update an in-flight
+	// review, not start a new one. Re-runs after the initial open
+	// go through the issue_comment path.
+	for _, a := range []string{"opened"} {
 		if !isReviewableAction(a) {
 			t.Errorf("expected %q to be reviewable", a)
 		}
 	}
-	for _, a := range []string{"closed", "edited", "assigned", "labeled"} {
+	for _, a := range []string{
+		"reopened", "synchronize", "ready_for_review",
+		"closed", "edited", "assigned", "labeled",
+	} {
 		if isReviewableAction(a) {
 			t.Errorf("expected %q to NOT be reviewable", a)
 		}

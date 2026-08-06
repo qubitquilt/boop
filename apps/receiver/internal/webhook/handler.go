@@ -2,7 +2,7 @@
 //
 // Responsibilities:
 //   - Verify the X-Hub-Signature-256 HMAC on every request.
-//   - Filter to pull_request events (opened/reopened/synchronize) and
+//   - Filter to pull_request events that are first opened and
 //     issue_comment events that ask for a review with `@BoopPr review`.
 //   - Render the Job template and submit it via the in-cluster K8s API.
 //   - Be idempotent: re-deliveries for the same head SHA are no-ops.
@@ -107,6 +107,17 @@ type Config struct {
 	// win over this default (see sdkEnabledLabel). A future PR
 	// removes the flag entirely.
 	OpenRouterSDKDefault string
+	// QUB-106: model id forwarded to every runner Job as
+	// OPENROUTER_MODEL. Sourced from the receiver's own
+	// OPENROUTER_MODEL env var (typically pinned in the
+	// receiver Deployment manifest). An empty value is
+	// preserved so the runner's existing "unset or empty"
+	// throw (openrouter.mjs) fires loudly at the first
+	// review, instead of silently landing a Job that always
+	// fails — the operator can see the missing wire-up in
+	// the receiver's startup log without needing to diff
+	// a Job spec.
+	OpenRouterModel string
 }
 
 // ghClientAPI captures the GitHub client surface the webhook
@@ -741,6 +752,16 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		// rollout. Per-PR labels (boop:openrouter-sdk) override
 		// this for a single review.
 		OpenRouterSDKEnabled: sdkEnabled,
+		// QUB-106: forwarded into OPENROUTER_MODEL. The
+		// receiver's Config.OpenRouterModel is sourced from
+		// the OPENROUTER_MODEL env var on the receiver
+		// Deployment; the runner reads it as
+		// ctx.openrouterModel and calls the OpenRouter SDK
+		// with it. An empty value here is preserved so the
+		// runner's existing "unset or empty" throw surfaces
+		// the misconfiguration instead of silently
+		// succeeding.
+		OpenRouterModel: h.cfg.OpenRouterModel,
 	})
 	if err != nil {
 		// Base-ref or installation-id validation failure: this is a
@@ -937,6 +958,14 @@ type templateVars struct {
 	DashboardToken       string // shared secret for the runner's POSTs; empty disables telemetry capture
 	JobName              string // the K8s Job name, which the runner reports back as the run id
 	OpenRouterSDKEnabled string // QUB-94: BOOP_USE_OPENROUTER_SDK value
+	// QUB-106: model id forwarded as OPENROUTER_MODEL. Sourced
+	// from the receiver's OPENROUTER_MODEL env var. The runner
+	// reads it via ctx.openrouterModel and calls the OpenRouter
+	// SDK with it; an empty value triggers the "OPENROUTER_MODEL
+	// is unset or empty" throw in openrouter.mjs, which is the
+	// desired loud-failure behaviour when the operator has not
+	// yet wired the receiver Deployment.
+	OpenRouterModel string
 }
 
 type prMeta struct {
@@ -1095,12 +1124,18 @@ func parseIssueComment(body []byte) (issueCommentMeta, error) {
 	return out, nil
 }
 
+// isReviewableAction reports whether a pull_request action should
+// trigger a Boop review. The product contract is narrow: Boop
+// fires on the first open of a PR, and on an explicit
+// `@BoopPr ... review` comment after that. Subsequent pushes
+// (`synchronize`), reopens, and "ready for review" transitions
+// are deliberately ignored — the author's intent on those
+// events is to update an in-flight review, not start a new
+// one, and silently starting a fresh review would race with
+// the existing one. Re-runs after the initial open go through
+// the issue_comment path (see requestsReview).
 func isReviewableAction(a string) bool {
-	switch a {
-	case "opened", "reopened", "synchronize", "ready_for_review":
-		return true
-	}
-	return false
+	return a == "opened"
 }
 
 var jobNameSanitizer = regexp.MustCompile(`[^a-z0-9-]`)

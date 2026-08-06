@@ -26,8 +26,8 @@ Body is read up to 1 MiB (`1<<20`); over that → 400.
 
 | Event | Action filter | Effect |
 |---|---|---|
-| `pull_request` | `opened`, `reopened`, `synchronize`, `ready_for_review` | Submit a Job, post 🐾 |
-| `pull_request` | any other (`closed`, `edited`, `assigned`, `labeled`, `unlabeled`, `review_requested`, `review_request_removed`, …) | Ack `ignored`, no Job |
+| `pull_request` | `opened` | Submit a Job, post 🐾 |
+| `pull_request` | any other (`reopened`, `synchronize`, `ready_for_review`, `closed`, `edited`, `assigned`, `labeled`, `unlabeled`, `review_requested`, `review_request_removed`, …) | Ack `ignored`, no Job |
 | `issue_comment` | `created` on a PR (`issue.pull_request` set) + comment body matches the request grammar | Submit a Job, react 👀, post 🐾 |
 | `issue_comment` | `created` on a plain issue | Ack `ignored` |
 | `issue_comment` | `created` from a sender matching `BOT_LOGIN` (when set) | Ack `ignored` (self-mention) |
