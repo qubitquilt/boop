@@ -44,10 +44,16 @@ spec:
   # QUB-101: prefer the cluster's default provisioner unless
   # the overlay sets a non-default. The overlay wires a
   # specific StorageClass (e.g. local-path on bare metal).
-  # persistentVolumeReclaimPolicy is the PVC-level field
-  # introduced in K8s 1.31 (beta earlier); the annotation
-  # above covers older clusters.
-  persistentVolumeReclaimPolicy: Retain
+  #
+  # Reclaim policy is set via the annotation above. The
+  # spec.persistentVolumeReclaimPolicy field (K8s 1.31+)
+  # would be canonical but is omitted: ArgoCD's bundled
+  # OpenAPI schema pre-dates the field and rejects
+  # server-side-apply patches with
+  # ".spec.persistentVolumeReclaimPolicy: field not declared
+  # in schema". The annotation is portable across all
+  # supported K8s versions.
+
 ---
 # QUB-101: separate PVC for daily backup snapshots. The
 # receiver mounts this at /backups and writes one VACUUM
@@ -70,7 +76,10 @@ spec:
   resources:
     requests:
       storage: 2Gi
-  persistentVolumeReclaimPolicy: Retain
+  # Reclaim policy is set via the annotation above; the
+  # spec.persistentVolumeReclaimPolicy field (K8s 1.31+)
+  # is omitted for the same ArgoCD schema reason as the
+  # data PVC above.
 ---
 apiVersion: apps/v1
 kind: Deployment
