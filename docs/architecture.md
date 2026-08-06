@@ -5,29 +5,30 @@ End-to-end view of how a webhook becomes a PR review.
 ## Topology
 
 ```
-                                  ┌─────────────────┐
-                                  │  OpenRouter LLM │
-                                  └────────▲────────┘
-                                           │ HTTPS
-                                           │
+                                   ┌─────────────────┐
+                                   │  OpenRouter LLM │
+                                   └────────▲────────┘
+                                            │ HTTPS (parallel + serial calls)
+                                            │
    GitHub (PR / comment)                    │
         │ webhook                           │
         ▼                                   │
-┌──────────────────┐  submit Job    ┌───────┴──────┐
-│  boop-receiver   │ ──────────────▶│  boop-runner │
-│  (Deployment,    │                │  (Job,       │
-│   1 replica,     │                │   1 pod / PR)│
-│   in-cluster)    │ ◀─── telemetry ┊              │
-│                  │      status    │  - clone PR  │
-│  - HMAC verify   │                │  - run skill │
-│  - filter events │                │  - post 📝   │
-│  - dedupe by SHA │                │  - post 📌   │
-│  - post 🐾       │                │  - post 📊   │
-│  - mint comments │                │              │
-│  - data layer    │                │              │
-│   (SQLite +      │                │              │
-│    PVC)          │                │              │
-└────────▲─────────┘                └───────▲──────┘
+┌──────────────────┐  submit Job    ┌───────┴──────────────────────────────┐
+│  boop-receiver   │ ──────────────▶│  boop-runner                         │
+│  (Deployment,    │                │  (Job, 1 pod / PR)                   │
+│   1 replica,     │                │                                       │
+│   in-cluster)    │ ◀── telemetry  │  - clone PR         [fetch]          │
+│                  │      status    │  - walkthrough      [1 SDK call]     │
+│  - HMAC verify   │                │  - classify         [1 SDK call]     │
+│  - filter events │                │  - N experts        [N parallel]     │
+│  - dedupe by SHA │                │  - gather           [in-process]     │
+│  - post 🐾       │                │  - meta-review      [1 SDK call]     │
+│  - react 👀      │                │  - narrate          [1 SDK call]     │
+│  - mint comments │                │  - ste-lint         [mechanical]     │
+│  - data layer    │                │  - post summary                      │
+│   (SQLite +      │                │  - post inlines                      │
+│    PVC)          │                │  - post final reaction (QUB-114)     │
+└────────▲─────────┘                └───────▲──────────────────────────────┘
          │                                  │
          │     ┌────────────────────────┐   │
          └──── │  Kubernetes API server │ ──┘
@@ -36,7 +37,10 @@ End-to-end view of how a webhook becomes a PR review.
 ```
 
 Two services, one pipeline. The receiver is a long-lived HTTP server. The
-runner is a one-shot Kubernetes Job per PR.
+runner is a one-shot Kubernetes Job per PR. The runner's N-expert
+pipeline (one walkthrough + N parallel experts + gather + meta-review +
+narrate) spans the LLM box; the receiver and the K8s API sit between
+GitHub and the runner.
 
 ## Components
 
@@ -69,21 +73,85 @@ See [receiver.md](./receiver.md).
 
 ### boop-runner (`apps/runner/`)
 
-Short-lived. One pod per PR review. Clones the PR, calls the
-OpenRouter SDK in-process, posts the result.
+Short-lived. One pod per PR review. Clones the PR, runs the
+multi-expert review pipeline via the OpenRouter SDK in-process,
+posts the result.
 
 - **Image:** `ghcr.io/qubitquilt/boop-runner` (Ubuntu 24.04, Node 22,
-  `@openrouter/sdk` from npm).
+  `@openrouter/sdk` from npm, `rtk` 0.44.2 binary). The image is
+  ~250 MB; rtk adds ~25 MB.
 - **Lifetime:** 1 pod, started by the receiver, runs to completion or 30
   min (`activeDeadlineSeconds: 1800`), GC'd 1 h after finish.
 - **Workspace:** `/work/repo` (the cloned PR). The skill ConfigMap
   mounts read-only at `/home/opencode/.config/opencode`; the runner
-  reads skill files directly from the mount.
+  reads skill files directly from the mount, going through the
+  [rtk adapter](#file-reads-rtk-adapter-qub-85) when rtk is present.
 - **No outbound network** except: GitHub (clone + API), OpenRouter (LLM).
-- **No subprocess.** The SDK call is in-process; the runner does
-  not shell out to any LLM CLI.
+- **No subprocess for the LLM.** The SDK call is in-process; the
+  runner does not shell out to an LLM CLI. (`rtk read` is the one
+  subprocess left, see [rtk adapter](#file-reads-rtk-adapter-qub-85).)
+
+#### Pipeline shape (multi-expert, QUB-95 + QUB-114)
+
+The runner's `lib/workflow.mjs` walks six macro stages:
+**handshake → fetch → sniff → summary → inlines → cleanup**. The
+`sniff` stage wraps a six-step sub-workflow (`REVIEW_SUB_STAGES`):
+
+1. **walkthrough** — one LLM call reads the diff and produces a
+   10-20 sentence human-readable summary. Every expert reads it
+   as shared context. (Failure is non-fatal: experts can fall back
+   to reading the diff directly.)
+2. **classify** — one LLM call tags the PR type
+   (`bug fix | feature | refactor | docs | test-only | infra`).
+3. **dispatch** — N parallel LLM calls, one per active lens, with
+   the lens file as system prompt and walkthrough + diff as user
+   message. Each expert returns `{ findings: Finding[] }`.
+4. **gather** — de-duplicates and flattens the expert findings.
+5. **meta-review** — scans the gathered findings for things that
+   "stick out as potentially wrong" and, if any, requests a
+   bounded re-pass of the specific experts that produced them.
+   Bounded to one re-pass per run (no loops).
+6. **narrate** — one final LLM call synthesizes the walkthrough
+   and gathered findings into the structured
+   `=== SUMMARY === / === INLINE COMMENTS === / === END ===`
+   block the runner parses.
+
+The narrator picks up the persona
+(`apps/k8s/base/runner-config/skills/boop/resources/persona.md`) —
+one light pug flourish per review, in the TL;DR opener, "What
+this PR does well" opener, or the line after the closing
+`Approving | Changes requested | Commented` token. Never in inline
+comment bodies.
+
+After parse, the runner's `lib/ste-lint.mjs` runs the same
+STE-flavored checks the skill mandates (no contractions, no
+marketing adjectives, ≤20-word sentences, no emoji in bodies) on
+the LLM output before posting. The linter is mechanical and
+best-effort — drift is logged and not re-fed to the LLM; the
+LLM is the source of truth.
 
 See [runner.md](./runner.md).
+
+### File reads: rtk adapter (QUB-85)
+
+Every file read the runner does — the orchestrator
+(`SKILL.md`), the seven lens files
+(`agents/review-*.md`), and the persona resource
+(`resources/persona.md`) — routes through `lib/rtk.mjs`. The
+adapter shells out to `rtk read` for compression; when rtk is
+missing or `BOOP_RTK_DISABLED=1` is set, the adapter falls back
+to raw `fs.readFile` transparently. The adapter is the single
+place rtk is invoked.
+
+The image bakes the rtk binary (`/usr/local/bin/rtk`), the rtk
+config (`/home/opencode/.config/rtk/config.toml`), the boop
+filter bundle (`filters.toml`), and the trust store populated
+at build time (`rtk trust --yes`). Telemetry is off at three
+layers (config, baked env, per-call env). The custom filter
+caps lens file reads at 400 lines / 500 chars/line so a
+runaway file cannot blow up the prompt context.
+
+See [runner.md](./runner.md#rtk-adapter-qub-85).
 
 ### Skills & config ConfigMap
 
@@ -100,11 +168,14 @@ ConfigMap. Contents:
 | `skill-boop-agent-solid-principles` | `…/skills/boop/agents/review-solid-principles.md` | lens 5 |
 | `skill-boop-agent-test-quality` | `…/skills/boop/agents/review-test-quality.md` | lens 6 |
 | `skill-boop-agent-deep` | `…/skills/boop/agents/review-deep.md` | lens 7 |
+| `skill-boop-resource-persona` | `…/skills/boop/resources/persona.md` | curated persona pool (QUB-114) |
+| `skill-boop-resource-lens-template` | `…/skills/boop/resources/lens-template.md` | shared lens-template format |
+| `skill-boop-resource-output-format` | `…/skills/boop/resources/output-format.md` | the exact output block the narrator must emit |
 
 The model name comes from the `OPENROUTER_MODEL` Job env var (set
-by the receiver from the per-PR label + the cluster default). QUB-98
-removed the `opencode.json` ConfigMap key; the model is no longer
-sourced from the ConfigMap.
+by the receiver from the cluster default). QUB-98 removed the
+`opencode.json` ConfigMap key; the model is no longer sourced
+from the ConfigMap.
 
 ConfigMap limit: 1 MB (etcd hard cap). The current payload is well under.
 Bumping against the limit would require moving to a git-sync init
@@ -114,29 +185,71 @@ See [skills.md](./skills.md).
 
 ## Request lifecycle
 
+The PR-opened path (status-thread surface) and the comment-triggered
+path (reaction surface, QUB-114) share the underlying pipeline;
+they differ in the user-visible surface only.
+
+### PR-opened path (status-thread surface)
+
 ```
 T+0s   GitHub delivers a pull_request webhook to /webhook
 T+0s   Receiver verifies X-Hub-Signature-256 (HMAC-SHA256, constant-time)
 T+0s   Receiver parses, filters, dedupes by Job name (= head SHA)
-T+0s   Receiver posts 🐾 status comment (and PATCHes in trigger attribution
-       + review label for issue_comment triggers)
+T+0s   Receiver posts 🐾 status comment (no trigger attribution;
+       no label change for first review)
 T+0s   Receiver renders Job template, submits Job
 T+1s   Job pod starts; runner mints installation token
 T+1s   runner PATCHes status → 🤝 paw-shaken in
 T+2s   runner clones PR (`git clone --depth 50` + `fetch --depth 200`)
 T+5s   runner PATCHes status → 🥎 fetched
-T+5s   runner builds prompt (orchestrator + 7 lenses inlined) and calls
-       the OpenRouter SDK in-process
-T+5s   runner PATCHes status → 👃 sniffing
-T+60s..120s   OpenRouter SDK returns; runner parses the assistant text
-T+60s..120s   runner PATCHes status → 💤 napped (after summary + inlines)
-T+fail   on any error: PATCH status → 🔄 chased tail (with details)
+T+5s   runner PATCHes status → 👃 sniffing (sniff macro-stage starts)
+T+5s     walkthrough LLM call (1 SDK call)
+T+5s     classify LLM call (1 SDK call)
+T+5s     N expert LLM calls in parallel (7 today)
+T+?s       meta-review may re-pass up to N experts (bounded once)
+T+?s     narrate LLM call (1 SDK call) → structured block
+T+?s     ste-lint runs mechanically, logs drift
+T+60s..120s   runner parses the structured block
+T+60s..120s   runner posts summary comment + 0-8 inline comments
+T+60s..120s   runner PATCHes status → 🦴 bone delivered
+T+fail   on any error: PATCH status → ❌ lost the bone
 ```
 
-Total wall-clock for a typical PR: 1-3 minutes. Dominated by the LLM
-call. LLM calls have a 25-min hard ceiling; the Job's
-`activeDeadlineSeconds` is 30 min, leaving 5 min of headroom for
-post-review work.
+### Comment-triggered path (reaction surface, QUB-114)
+
+```
+T+0s   GitHub delivers an issue_comment webhook to /webhook
+T+0s   Receiver verifies, parses, drops self-mentions and reference
+       mentions; only `@BoopPr review` (per the request grammar)
+       submits a Job
+T+0s   Receiver dedupes by Job name; if a Job for the same head
+       already succeeded, post "Already sniffed" and ack duplicate
+T+0s   Receiver reacts 👀 on the trigger comment (NOT a 🐾 post)
+T+0s   Receiver renders Job template with BOOP_NO_STATUS_COMMENT=1,
+       submits Job
+T+1s   runner mints installation token; postStatus wrapper is
+       a no-op (no octokit yet, no status comment id)
+T+?s   runner clones PR
+T+?s   runner runs the same multi-expert pipeline
+T+?s   runner posts summary + inline comments to the PR
+T+?s   runner adds a single terminal reaction on the trigger
+       comment: 🦴 on done, ❌ on failed
+```
+
+The author's view on a comment-triggered re-review is a one-step
+transition: 👀 → 🦴 (or ❌). One reaction change, one notification,
+no PATCH loop.
+
+### Total wall-clock
+
+1-3 minutes for a typical PR. Dominated by the LLM calls.
+- One walkthrough + one classify + N expert calls (N=7 today,
+  in parallel) + one narrate is the LLM budget per review.
+  Meta-review adds at most one more pass through the experts it
+  flags, never a loop.
+- The SDK call has a 25-min hard ceiling; the Job's
+  `activeDeadlineSeconds` is 30 min, leaving 5 min of headroom for
+  post-review work.
 
 ## State
 
@@ -173,9 +286,11 @@ spec the receiver submits; everything after that is a clean pod start.
 | Job already `succeeded` for head SHA | 202 `duplicate` ack; for `@BoopPr review` triggers, a short "Already sniffed" PR reply is posted | Push a new commit to trigger a fresh review |
 | Job already `failed` for head SHA | Old Job is deleted, a new one is submitted | Re-delivery from GitHub will hit the same path; transient K8s issues clear on the next event |
 | Token mint fails | 502 from receiver (`/webhook` for issue_comment) or 500 (Job fails) | Re-deliver; check `GITHUB_APP_PRIVATE_KEY` and `installation-id` |
-| LLM times out | `postStatus("failed")`, Job exits non-zero | The 25-min hard ceiling means a hung call is killed; the failure is visible in the status thread |
+| LLM times out | `postStatus("failed")` (or terminal ❌ reaction in reaction mode), Job exits non-zero | The 25-min hard ceiling means a hung call is killed; the failure is visible in the status thread / on the trigger comment |
 | LLM returns empty / unparseable output | Status gate rejects with `summary parse failed: <reason>` | Same; the runner exits 1, the pod is GC'd by the TTL |
-| ConfigMap missing / unreadable | Status thread sees a `failed` with `lens … read attempt N failed` detail | The skill body is read with retry + 1s backoff to absorb transient `..data` symlink races right after pod start |
+| ConfigMap missing / unreadable | Status thread sees a `failed` with `lens … read attempt N failed` detail | The skill body is read with retry + 1s backoff to absorb transient `..data` symlink races right after pod start. Reads go through the rtk adapter, which falls back to `fs.readFile` if rtk is missing |
+| Orphan status comment between postStatus and createJob (QUB-99) | The receiver pre-creates the status comment only after Job submit succeeds. A failed Job submit on the FIRST event does not leave an orphan 🐾; a redelivery posts one. | Re-deliver the event; the receiver now reports `queued` in the ack on the path where the Job submit is still in flight |
+| Duplicate review from a sibling runner pod (QUB-125) | The second pod sees `state.passed` from the first pod via the workflow-state comment marker and aborts as `parseFailed` | No operator action; the abort path is the deduplication belt-and-suspenders for K8s scheduling races |
 
 ## Concurrency
 

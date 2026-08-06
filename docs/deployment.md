@@ -411,10 +411,18 @@ is consumed on the next Job submit. No coordination required.
 | Image | Base | Size | Why |
 |---|---|---|---|
 | `boop-receiver` | `gcr.io/distroless/static-debian12:nonroot` | small (~15 MB) | Static, no shell, no package manager, non-root. |
-| `boop-runner` | `ubuntu:24.04` + Node 22 + `@openrouter/sdk` | medium (~250 MB) | The SDK's TypeScript types and the Node 22 stdlib. Ubuntu 24.04's glibc 2.39 is the floor; Debian 12's glibc 2.36 is too old. |
+| `boop-runner` | `ubuntu:24.04` + Node 22 + `@openrouter/sdk` + `rtk` 0.44.2 | medium (~275 MB) | The SDK's TypeScript types and the Node 22 stdlib. Ubuntu 24.04's glibc 2.39 is the floor; Debian 12's glibc 2.36 is too old. rtk adds ~25 MB and runs from a per-arch prebuilt tarball pulled at build time with a pinned SHA-256. |
 
 Both are built `linux/arm64` only. The cluster nodes are arm64; the
 `boop-runner-set` Actions runners are arm64.
+
+The runner image bakes the rtk binary, its config.toml, the
+boop `filters.toml`, and the `rtk trust --yes` trust store at
+build time so the first file read in the pod does not hit an
+interactive prompt. Telemetry is off at three layers (config,
+baked env, per-call env forwarded by the adapter). See
+[`runner.md`](./runner.md#rtk-adapter-qub-85) for the adapter
+contract.
 
 ## Local K8s smoke test
 

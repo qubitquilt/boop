@@ -17,11 +17,16 @@ calls the OpenRouter SDK in-process. Only the skill files mount here.
 |------|---------|
 | `skills/boop/SKILL.md` | Boop orchestrator: persona, voice contract, output spec |
 | `skills/boop/agents/review-*.md` | Seven review lenses the orchestrator walks |
+| `skills/boop/resources/persona.md` | Curated pool of pug flourishes the narrator samples (one per review) |
+| `skills/boop/resources/output-format.md` | The exact `=== SUMMARY === / === INLINE COMMENTS === / === END ===` block the narrator emits |
+| `skills/boop/resources/lens-template.md` | Shared template every lens file is built from |
 
-The runner reads `skills/boop/SKILL.md` and inlines the lens files into the
-prompt. Boop walks all seven lenses in a single OpenRouter SDK call, then
-emits a `=== SUMMARY === ... === INLINE COMMENTS === ... === END ===` block
-that the runner parses and posts to the PR.
+The runner reads `skills/boop/SKILL.md` and inlines the lens files and
+the persona resource into the prompt as the multi-expert pipeline walks
+each stage. Boop does one walkthrough LLM call, then N parallel
+expert calls (one per lens), then one final narrator call. The
+narrator synthesises the walkthrough and gathered findings into the
+structured block the runner parses and posts to the PR.
 
 ## The seven lenses
 
@@ -35,9 +40,12 @@ that the runner parses and posts to the PR.
 | Test quality | `skills/boop/agents/review-test-quality.md` | Test assertions vs. name, fixtures, composition |
 | Deep | `skills/boop/agents/review-deep.md` | End-to-end walkthrough, coupled invariants |
 
-The orchestrator reads each lens in order, applies it, and synthesizes the
-findings into a single review. The lenses are reference material, not
-sub-agent invocations.
+The orchestrator drives the multi-expert pipeline: a walkthrough call
+produces shared context, then one expert call per lens runs in
+parallel, then a gather/meta-review/narrate cycle produces the
+structured block. The lenses are reference material each expert
+reads as its system prompt; they are not sub-agent invocations
+in the AI-agent sense (there is no per-agent runtime context).
 
 ## Editing flow
 

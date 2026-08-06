@@ -28,7 +28,7 @@ Body is read up to 1 MiB (`1<<20`); over that → 400.
 |---|---|---|
 | `pull_request` | `opened` | Submit a Job, post 🐾 |
 | `pull_request` | any other (`reopened`, `synchronize`, `ready_for_review`, `closed`, `edited`, `assigned`, `labeled`, `unlabeled`, `review_requested`, `review_request_removed`, …) | Ack `ignored`, no Job |
-| `issue_comment` | `created` on a PR (`issue.pull_request` set) + comment body matches the request grammar | Submit a Job, react 👀, post 🐾 |
+| `issue_comment` | `created` on a PR (`issue.pull_request` set) + comment body matches the request grammar | Submit a Job, react 👀 (QUB-114 reaction mode); no status comment |
 | `issue_comment` | `created` on a plain issue | Ack `ignored` |
 | `issue_comment` | `created` from a sender matching `BOT_LOGIN` (when set) | Ack `ignored` (self-mention) |
 | `issue_comment` | `created` on a PR but body does not match the request grammar | Ack `ignored` |
@@ -109,9 +109,10 @@ head":
 | succeeded | Ack `duplicate`. For `issue_comment` triggers, post a short "Already sniffed `<sha>`" reply. For `pull_request` triggers, no PR reply (the run already produced one). |
 | failed | Delete the failed Job (background propagation), submit a new one. |
 
-This runs **before** any external side effect (status comment, reaction,
-PR reply) so a duplicate delivery cannot leave stranded 🐾 comments or
-orphaned status threads.
+This runs **before** any external side effect (status comment,
+reaction, PR reply) so a duplicate delivery cannot leave stranded
+🐾 comments, orphan status threads, or spurious 👀 reactions on
+the trigger comment.
 
 ## Status thread
 
@@ -137,11 +138,12 @@ Stages and emojis (must match across receiver and runner):
 
 | Stage | Emoji | Short label | Source of body |
 |---|---|---|---|
-| `auth` | 🤝 | `🤝 paw-shaken in` | receiver `renderStatusBody(StatusAuth, …)` |
+| (header) | 🐾 | `🐾 Boop's on the case!` | receiver `renderStatusBody(StatusInitial, …)` — the initial header the runner appends the timeline below |
+| `auth` | 🤝 | `🤝 paw-shaken in` | receiver `renderStatusBody(StatusAuth, …)` (PATCH replaces header status line) |
 | `clone` | 🥎 | `🥎 fetched` | receiver `renderStatusBody(StatusClone, …)` |
 | `review` | 👃 | `👃 sniffing` | receiver `renderStatusBody(StatusReview, …)` |
-| `done` | 💤 | `💤 napped` | runner `STATUS.done` (PATCH after summary posted) |
-| `failed` | 🔄 | `🔄 chased tail` | runner `STATUS.failed` (with a `<details>` block carrying the error tail) |
+| `done` | 🦴 | `🦴 bone delivered` | runner `STATUS.done` (PATCH after summary posted) |
+| `failed` | ❌ | `❌ lost the bone` | runner `STATUS.failed` (with a `<details>` block carrying the error tail) |
 
 The receiver's `StatusInitial` is the body the comment is created with
 (no timeline yet). The runner's first PATCH (`auth`) appends
@@ -151,6 +153,26 @@ The receiver's `StatusInitial` is the body the comment is created with
 Body trim: the runner keeps the combined body under 60 KB. If the
 cumulative timeline would push it over, the runner slices at the
 separator and trims the oldest entries, keeping the most recent 58 KB.
+
+### Reaction mode (QUB-114)
+
+`issue_comment` triggers skip the entire status-comment path. The
+receiver does not call `renderStatusBody` or post a 🐾 comment;
+instead it `AddCommentReaction(👀)` on the trigger comment and sets
+`BOOP_NO_STATUS_COMMENT=1` on the Job. The runner's `postStatus`
+wrapper is a no-op the whole way through, and `postFinalReaction`
+adds a single terminal reaction on the trigger comment when the
+review finishes:
+
+| Run result | Final reaction | Resulting transition |
+|---|---|---|
+| succeeded | 🦴 | 👀 → 🦴 |
+| failed | ❌ | 👀 → ❌ |
+
+The author's view is one reaction change, one notification. No
+PATCH loop on a status comment that never existed. Pull-request
+triggers (`pull_request` `opened`) keep the status-thread path
+above unchanged.
 
 ## Review number
 

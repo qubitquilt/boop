@@ -279,11 +279,21 @@ kubectl logs -n dev-tools -l app=boop,pr-number=<N> --tail=200 | grep '"stage":"
    should be auto-resolved, and prior Boop status / summary
    comments should be minimized — the PR thread should now show
    only the new review at the top.
-5. Comment `@BoopPr review` on a third push. The status should show
-   `Triggered by @<your-handle>`.
+5. Comment `@BoopPr review` on a third push. The status should NOT
+   post a 🐾 status comment. The receiver should react 👀 on your
+   trigger comment; within 1-3 minutes the runner should add a
+   single terminal reaction (🦴 on success, ❌ on failure) on your
+   trigger comment. The reaction's "Triggered by @<your-handle>"
+   attribution is in the status-comment model that does not apply
+   here — the comment + reactions are the user-visible surface
+   (QUB-114 reaction mode).
 6. Comment `@BoopPr review` again on the same head SHA. The runner
-   should NOT re-run; the receiver should post a "Already sniffed"
+   should NOT re-run; the receiver should post an "Already sniffed"
    reply.
+7. To exercise the reaction-only path against a single new head SHA
+   when you already have a 🐾 on an earlier review, push a fresh
+   commit and add a `@BoopPr review` comment — the receiver skips
+   the status comment path entirely and the 👀 appears immediately.
 
 ## Test commands
 

@@ -29,8 +29,8 @@ A typical review produces three things on the PR's conversation tab, in order:
 
 ### 1. Status comment (the "reviewing…" thread)
 
-Posted up front by the receiver. PATCHed by the runner at each stage. Looks
-like:
+Posted up front by the receiver on PR-opened events. PATCHed by
+the runner at each stage. Looks like:
 
 > 🐾 **Boop's on the case!** (review)
 >
@@ -40,7 +40,7 @@ like:
 > - 🤝 paw-shaken in
 > - 🥎 fetched
 > - 👃 sniffing
-> - 💤 napped
+> - 🦴 bone delivered
 
 A re-review (second-or-later run on the same PR) shows up as:
 
@@ -55,6 +55,22 @@ run produced which comments. Each re-review gets its own status thread.
 
 If the review fails, the timeline ends with a "details" block containing
 the runner's error tail.
+
+#### Reaction mode (comment-triggered re-reviews)
+
+When a re-review is triggered by a PR comment
+(`@BoopPr review`), the receiver does **not** post a status comment
+(QUB-114). Instead, it reacts 👀 on the trigger comment. The runner
+reacts with a single terminal emoji when it finishes:
+
+| Event | Receiver | Runner terminal reaction |
+|---|---|---|
+| `@BoopPr review` accepted, review succeeds | reacts 👀 on the trigger comment | reacts 🦴 on the trigger comment |
+| `@BoopPr review` accepted, review fails | reacts 👀 on the trigger comment | reacts ❌ on the trigger comment |
+
+The author sees a single reaction change (`👀` → `🦴`, or `👀` → `❌`)
+and one notification per re-review. No PATCH loop on a status
+comment that never existed.
 
 ### 2. Summary comment (the headline)
 
@@ -135,6 +151,17 @@ edit step. The voice contract enforces:
   openers, sometimes one sentence.
 - **No "definitely will break."** "Probably…" is right; "definitely…"
   is rarely true.
+- **Persona is for the summary only.** The narrator samples
+  one light pug flourish from
+  [`resources/persona.md`](../apps/k8s/base/runner-config/skills/boop/resources/persona.md)
+  per review. It lives in the TL;DR opener, "What this PR does
+  well" opener, or the line after the closing `Approving | Changes
+  requested | Commented` token. Never in inline comment bodies, and
+  not stacked on a single-line review.
+
+The runner's `lib/ste-lint.mjs` runs the mechanical checks on the
+LLM output before posting; drift is logged (LLM is the source of
+truth).
 
 Full list with rationale:
 [`apps/k8s/base/runner-config/skills/boop/SKILL.md`](../apps/k8s/base/runner-config/skills/boop/SKILL.md).
@@ -192,6 +219,11 @@ works. The canonical form is:
 
 Also accepted (case-insensitive): `@BoopPr please review`, `@BoopPr, can
 you review this`, `@BoopPr re-review`, `@BoopPr to review`.
+
+The reaction mode surface (QUB-114) applies to this path: a
+comment-triggered re-review leaves 👀 on your comment and adds 🦴
+when it finishes (or ❌ on failure). A PR-opened review gets the 🐾
+status thread instead.
 
 ## Limits
 
