@@ -21,7 +21,7 @@ import (
 // N only after the entire block has run. A block that fails
 // half-way leaves user_version unchanged and the next Open
 // retries from that point.
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 // applyMigrations runs the schema migrations, gated on
 // PRAGMA user_version. The version starts at 0 on a fresh
@@ -68,6 +68,26 @@ func applyMigrations(db *sql.DB) error {
 			return fmt.Errorf("migration v1: write user_version: %w", err)
 		}
 		v = 1
+	}
+	// v2 (QUB-108) unlocks the exception dock: failure_class
+	// (so the dashboard can filter OOMKilled on day one), the
+	// run_stages table (waterfall), the refunds table (Phase 5
+	// audit trail for the "zero out cost" action), a
+	// last_heartbeat_at on runs (Phase 2 stuck-run detection),
+	// and the paused / lens_opt_out columns on installations
+	// (Phase 4 install controls). Everything is wrapped in a
+	// SQLite-compatible IF NOT EXISTS / column-existence guard
+	// so the block is idempotent — a partial upgrade that
+	// crashed after ALTER TABLE but before the user_version
+	// write retries cleanly on next Open.
+	if v < 2 {
+		if err := migrateV2(ctx, db); err != nil {
+			return fmt.Errorf("migration v2: %w", err)
+		}
+		if err := writeUserVersion(ctx, db, 2); err != nil {
+			return fmt.Errorf("migration v2: write user_version: %w", err)
+		}
+		v = 2
 	}
 	// Add later migrations as additional `if v < N { ... }`
 	// blocks here. Each must set user_version = N on success.
@@ -139,6 +159,130 @@ func migrateV1(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// migrateV2 (QUB-108) is the dashboard foundation. It must
+// be safe on a database that was partially upgraded — every
+// statement is guarded either by IF NOT EXISTS (for new
+// tables/indices) or by the hasColumn() helper (for new
+// columns on existing tables, because SQLite has no
+// ADD COLUMN IF NOT EXISTS prior to 3.35). The failure_class
+// column is the load-bearing one for the exception dock
+// (Phase 4); the others are forward-compat for later phases
+// and would otherwise need their own migrations.
+//
+// The UNIQUE(run_id, stage) constraint on run_stages is what
+// makes the runner's at-least-once POSTs safe — a re-delivery
+// of the same stage hits the conflict and gets ON CONFLICT
+// DO UPDATE, not a duplicate row.
+func migrateV2(ctx context.Context, db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS run_stages (
+			id          INTEGER PRIMARY KEY,
+			run_id      TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+			stage       TEXT NOT NULL,
+			started_at  TEXT NOT NULL,
+			ended_at    TEXT,
+			duration_ms INTEGER,
+			meta        TEXT,
+			UNIQUE(run_id, stage)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_run_stages_run_id ON run_stages(run_id)`,
+		`CREATE TABLE IF NOT EXISTS refunds (
+			id           INTEGER PRIMARY KEY,
+			run_id       TEXT,
+			lens         TEXT,
+			tokens       INTEGER,
+			refunded_at  TEXT NOT NULL,
+			refunded_by  TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_refunds_run_id ON refunds(run_id)`,
+	}
+	for i, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v2 statement %d: %w", i, err)
+		}
+	}
+
+	// Column adds. ALTER TABLE ADD COLUMN fails if the column
+	// already exists, so each one is guarded by a pragma
+	// check. The hasColumn() helper is the only SQLite-
+	// compatible way to do "ADD COLUMN IF NOT EXISTS" on
+	// 3.32 and earlier.
+	colAdds := []struct {
+		table string
+		col   string
+		def   string
+	}{
+		{"runs", "failure_class", "TEXT"},
+		{"runs", "last_heartbeat_at", "TEXT"},
+		// installations needs to exist before its ALTERs run;
+		// v1 created it so this is fine for the in-place
+		// upgrade path. A fresh install also has it from v1.
+		{"installations", "paused", "INTEGER NOT NULL DEFAULT 0"},
+		{"installations", "lens_opt_out", "TEXT NOT NULL DEFAULT '[]'"},
+	}
+	for _, c := range colAdds {
+		has, err := hasColumn(ctx, db, c.table, c.col)
+		if err != nil {
+			return fmt.Errorf("migration v2 hasColumn %s.%s: %w", c.table, c.col, err)
+		}
+		if has {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", c.table, c.col, c.def)
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v2 alter %s.%s: %w", c.table, c.col, err)
+		}
+	}
+
+	// Indices that touch the new columns. The
+	// failure_class index makes the exception dock's
+	// `WHERE failure_class IN (...)` a single B-tree walk
+	// instead of a full scan; the heartbeat index feeds
+	// Phase 2's stuck-runs panel.
+	idxStmts := []string{
+		`CREATE INDEX IF NOT EXISTS idx_runs_failure_class ON runs(failure_class)`,
+		`CREATE INDEX IF NOT EXISTS idx_runs_last_heartbeat_at ON runs(last_heartbeat_at)`,
+	}
+	for i, stmt := range idxStmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v2 index %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// hasColumn reports whether the given table already has the
+// given column. SQLite has no portable ADD COLUMN IF NOT
+// EXISTS, so the only idempotent path is the pragma. Used by
+// migrateV2; not part of the public API.
+func hasColumn(ctx context.Context, db *sql.DB, table, col string) (bool, error) {
+	rows, err := db.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == col {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // readUserVersion returns the current PRAGMA user_version, or 0

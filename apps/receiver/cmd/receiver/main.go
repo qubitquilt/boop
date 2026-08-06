@@ -149,6 +149,15 @@ func main() {
 	stopBackup := h.StartBackupLoop(ctx, cfg.BackupDir, cfg.BackupEvery, cfg.BackupKeep)
 	defer stopBackup()
 
+	// QUB-108: K8s Job reconciler. Polls Jobs in the
+	// receiver's namespace and backfills the failure_class
+	// column on terminal Jobs from the pod's last container
+	// state. The interval is env-driven so a cluster that
+	// wants fresher OOMKilled visibility can opt into a
+	// tighter poll without rebuilding the image.
+	stopReconciler := h.StartJobReconciler(ctx, parseDurationEnv("RECONCILER_INTERVAL", 0))
+	defer stopReconciler()
+
 	go func() {
 		logger.Info("receiver starting", "port", cfg.Port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

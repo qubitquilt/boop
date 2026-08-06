@@ -425,6 +425,13 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 		writeAck(w, "ignored", "skip-review label present", delivery)
 		return
 	}
+	// QUB-108: operator-controlled pause short-circuits the
+	// webhook before any K8s / GitHub work. The ack still
+	// goes out so GitHub doesn't retry.
+	if h.isPaused(ctx, delivery, installationID) {
+		writeAck(w, "ignored", "installation paused", delivery)
+		return
+	}
 	client := h.ghClient.ClientFor(installationID)
 	// Check for duplicate before submitting a Job — otherwise a
 	// re-delivery of the same head SHA can schedule a second K8s Job.
@@ -453,6 +460,13 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 	if err != nil {
 		h.logger.Warn("parse issue_comment", "delivery", delivery, "err", err)
 		http.Error(w, "parse issue_comment", http.StatusBadRequest)
+		return
+	}
+	// QUB-108: operator-controlled pause short-circuits the
+	// webhook before any K8s / GitHub work. The ack still
+	// goes out so GitHub doesn't retry.
+	if h.isPaused(ctx, delivery, installationID) {
+		writeAck(w, "ignored", "installation paused", delivery)
 		return
 	}
 	if ic.Action != "created" {
@@ -1164,6 +1178,29 @@ func parseIssueComment(body []byte) (issueCommentMeta, error) {
 // the issue_comment path (see requestsReview).
 func isReviewableAction(a string) bool {
 	return a == "opened"
+}
+
+// isPaused is the operator-controlled mute check. Returns
+// true if the operator has paused this installation via the
+// dashboard (QUB-108). The check is intentionally cheap —
+// a single SELECT against the installations table — and
+// runs before any K8s or GitHub work so a paused install
+// costs only an SQLite read per webhook. An error from the
+// store is treated as "not paused" (fail-open) so a
+// transient DB hiccup doesn't mute every install.
+func (h *Handler) isPaused(ctx context.Context, delivery string, installationID int64) bool {
+	if h.store == nil {
+		return false
+	}
+	paused, err := h.store.IsInstallationPaused(ctx, installationID)
+	if err != nil {
+		h.logger.Warn("is paused check", "delivery", delivery, "installation", installationID, "err", err)
+		return false
+	}
+	if paused {
+		h.logger.Info("installation paused, dropping webhook", "delivery", delivery, "installation", installationID)
+	}
+	return paused
 }
 
 var jobNameSanitizer = regexp.MustCompile(`[^a-z0-9-]`)
