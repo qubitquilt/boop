@@ -12,6 +12,7 @@ import {
   buildBoopPrompt,
   stripOpenRouterPrefix,
 } from "./openrouter.mjs";
+import { LENS_FILES } from "./config.mjs";
 
 // A fake OpenRouter client. Mirrors the shape that the real SDK's
 // `client.chat.send` returns: an `APIPromise` that resolves to a
@@ -838,6 +839,82 @@ test("buildBoopPrompt source preserves H5 ordering invariant", () => {
   assert.ok(systemIdx > -1);
   assert.ok(dataIdx > -1);
   assert.ok(systemIdx < dataIdx);
+});
+
+// QUB-85: when `deps.rtk` is present, every file read routes
+// through the adapter instead of `fs.readFile`. The test pins the
+// read source (rtk vs fs) by counting calls on each — if the
+// adapter is bypassed, fs.readFile is called instead and the test
+// fails.
+test("buildBoopPrompt routes SKILL.md and lens reads through deps.rtk when present", async () => {
+  const fakeFs = makeFakeFs({
+    // The fs is intentionally empty for the read paths — if
+    // buildBoopPrompt ever falls back to it, the read throws
+    // ENOENT and the test fails with a clear signal.
+  });
+  const skillPath = `${paths.configSrc}/skills/boop/SKILL.md`;
+  const personaPath = `${paths.configSrc}/skills/boop/resources/persona.md`;
+  const lensPaths = LENS_FILES.map(
+    (rel) => `${paths.configSrc}/skills/boop/${rel}`,
+  );
+  const rtkCalls = [];
+  const rtk = {
+    readFile: async (p, _encoding) => {
+      rtkCalls.push(p);
+      if (p === skillPath) return "skill body\n";
+      if (p === personaPath) return "persona body\n";
+      if (lensPaths.includes(p)) return `lens body for ${p.split("/").pop()}\n`;
+      throw new Error(`unexpected rtk read: ${p}`);
+    },
+  };
+  const prompt = await buildBoopPrompt(baseCtx, {
+    fs: fakeFs,
+    rtk,
+    paths,
+    log: () => {},
+    ...fastRetries,
+  });
+  // SKILL.md + the persona file + every lens file. Order is
+  // the read order (the SKILL first, then the persona, then
+  // the lens files in LENS_FILES order).
+  assert.deepEqual(rtkCalls, [skillPath, personaPath, ...lensPaths]);
+  // The prompt is built from the adapter output, not from the fs.
+  assert.match(prompt, /skill body/);
+  assert.match(prompt, /persona body/);
+  for (const lensPath of lensPaths) {
+    const marker = `lens body for ${lensPath.split("/").pop()}`;
+    assert.ok(
+      prompt.includes(marker),
+      `prompt missing marker ${JSON.stringify(marker)}`,
+    );
+  }
+});
+
+test("buildBoopPrompt falls back to fs.readFile when deps.rtk is absent", async () => {
+  // Backwards-compat: tests and any future caller that does not
+  // pass an rtk adapter must keep working. The fs read path is
+  // the pre-QUB-85 behavior; the adapter is an opt-in.
+  const fakeFs = makeFakeFs({
+    [`${paths.configSrc}/skills/boop/SKILL.md`]: "raw skill\n",
+  });
+  let fsReadCount = 0;
+  const countingFs = {
+    readFile: async (p) => {
+      fsReadCount++;
+      return fakeFs.readFile(p);
+    },
+  };
+  const prompt = await buildBoopPrompt(baseCtx, {
+    fs: countingFs,
+    paths,
+    log: () => {},
+    ...fastRetries,
+  });
+  // At least one read went through the fs (the SKILL.md). We don't
+  // pin the exact count because the lens reads are best-effort and
+  // some may have errored silently without a fixture.
+  assert.ok(fsReadCount >= 1, "expected fs.readFile to be called at least once");
+  assert.match(prompt, /raw skill/);
 });
 
 // --- runOpenCodeSkill ---------------------------------------------------

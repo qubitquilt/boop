@@ -134,3 +134,46 @@ test("loadConfig defaults reviewNumber to 1 when invalid", () => {
   const ctx = loadConfig({ ...validEnv, BOOP_REVIEW_NUMBER: "foo" });
   assert.equal(ctx.reviewNumber, 1);
 });
+
+// QUB-85: BOOP_RTK_DISABLED=1 is the operator kill switch for the
+// rtk adapter. The flag is read once at loadConfig and threaded
+// through to the adapter; the test pins that the field name matches
+// the documented env var and that the default is `false` (rtk on).
+test("loadConfig defaults rtkDisabled to false", () => {
+  const ctx = loadConfig(validEnv);
+  assert.equal(ctx.rtkDisabled, false);
+});
+
+test("loadConfig parses BOOP_RTK_DISABLED=1", () => {
+  const ctx = loadConfig({ ...validEnv, BOOP_RTK_DISABLED: "1" });
+  assert.equal(ctx.rtkDisabled, true);
+});
+
+test("loadConfig treats other BOOP_RTK_DISABLED values as enabled", () => {
+  // Anything other than "1" is "rtk on" — the flag is strictly
+  // opt-out. Operators who set BOOP_RTK_DISABLED=true or =yes
+  // still get rtk reads. Pin this so a future refactor that
+  // loosens the parser surfaces it in the test failure.
+  for (const value of ["0", "true", "yes", "on", ""]) {
+    const ctx = loadConfig({ ...validEnv, BOOP_RTK_DISABLED: value });
+    assert.equal(
+      ctx.rtkDisabled,
+      false,
+      `BOOP_RTK_DISABLED=${JSON.stringify(value)} should be treated as enabled`,
+    );
+  }
+});
+
+// QUB-114: BOOP_NO_STATUS_COMMENT=1 means the runner uses
+// reactions on the trigger comment instead of a status
+// comment thread. The receiver sets this for issue_comment
+// triggers; the runner reads it via loadConfig.
+test("loadConfig defaults noStatusComment to false", () => {
+  const ctx = loadConfig(validEnv);
+  assert.equal(ctx.noStatusComment, false);
+});
+
+test("loadConfig parses BOOP_NO_STATUS_COMMENT=1", () => {
+  const ctx = loadConfig({ ...validEnv, BOOP_NO_STATUS_COMMENT: "1" });
+  assert.equal(ctx.noStatusComment, true);
+});

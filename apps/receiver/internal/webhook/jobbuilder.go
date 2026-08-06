@@ -305,9 +305,16 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 								// prompt-injected LLM reaching them via
 								// /proc/self/environ would otherwise be a
 								// trivial secret exfil path.
-								{Name: "BOOP_STATUS_COMMENT_ID", Value: v.StatusCommentID},
-								{Name: "BOOP_REACTION_COMMENT_ID", Value: v.ReactionCommentID},
-								{Name: "BOOP_REVIEW_NUMBER", Value: v.ReviewNumber},
+							{Name: "BOOP_STATUS_COMMENT_ID", Value: v.StatusCommentID},
+							{Name: "BOOP_REACTION_COMMENT_ID", Value: v.ReactionCommentID},
+							// QUB-114: in reaction mode (issue_comment trigger)
+							// the runner does not post a status comment. It
+							// adds a single terminal reaction to the
+							// trigger comment instead. "1" / ""; the
+							// runner's loadConfig treats any non-"1"
+							// value as "comment thread mode".
+							{Name: "BOOP_NO_STATUS_COMMENT", Value: v.NoStatusComment},
+							{Name: "BOOP_REVIEW_NUMBER", Value: v.ReviewNumber},
 								// QUB-99: the issue_comment sender login
 								// (empty for pull_request-driven runs).
 								// The runner uses this to render the

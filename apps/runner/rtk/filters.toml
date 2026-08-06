@@ -1,0 +1,20 @@
+# Boop custom TOML filter for rtk.
+#
+# Baked into the runner image at
+# /home/opencode/.config/rtk/filters.toml. The runner image's `rtk trust`
+# command is run at build time so this file is in the trust store when
+# the pod starts; the trust store lives at
+# /home/opencode/.local/share/rtk/trusted_filters.json.
+#
+# The filter is intentionally narrow: it caps `rtk read` output to
+# bound the prompt context the lens sees. The runner's adapter also
+# passes an explicit `--max-lines` and `--truncate-lines-at` per call;
+# the filter here is the safety net.
+schema_version = 1
+
+[filters.boop-review-read]
+description = "Boop review lens: cap rtk read output so a runaway file does not blow up the prompt"
+match_command = "^rtk\\s+read\\b"
+truncate_lines_at = 500
+max_lines = 400
+on_empty = ""

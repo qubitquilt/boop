@@ -56,11 +56,11 @@ func TestRenderStatusBody(t *testing.T) {
 	}
 	// Done and Failed stages keep the brand mascot and the merge signal.
 	done := renderStatusBody(StatusDone, sha, "", 2)
-	if !strings.Contains(done, "💤 **Boop napped") || !strings.Contains(done, "See the comment below") {
+	if !strings.Contains(done, "🦴 **Boop brought you a bone") || !strings.Contains(done, "See the comment below") {
 		t.Errorf("done body off-brand: %q", done)
 	}
 	failed := renderStatusBody(StatusFailed, sha, "", 1)
-	if !strings.Contains(failed, "🔄 **Boop chased his tail") {
+	if !strings.Contains(failed, "❌ **Boop lost the bone") {
 		t.Errorf("failed body off-brand: %q", failed)
 	}
 }
@@ -920,6 +920,7 @@ func TestSubmitJob_FallsBackOnConfigMapReadFailure(t *testing.T) {
 		12345,      // installationID
 		1,          // reviewNumber
 		nil,        // labels (no per-PR SDK opt-in)
+		false,      // noStatusComment (pull_request uses the status thread)
 	)
 
 	// Pull the Job the handler created and assert its image.
@@ -991,6 +992,7 @@ func TestSubmitJob_UsesLiveConfigMapWhenAvailable(t *testing.T) {
 		12345,
 		1,
 		nil,
+		false, // noStatusComment (pull_request uses the status thread)
 	)
 	jobs, err := client.BatchV1().Jobs("dev-tools").List(context.Background(), metav1.ListOptions{})
 	if err != nil {

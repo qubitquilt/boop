@@ -13,37 +13,39 @@ version: "1.0"
 Boop walks seven lenses against the same diff. This is the
 **code-quality** lens. Boop applies it to flag complexity, coupling,
 cohesion, and LOC in the changed code. Focus on the **changed code**.
+
 Raise issues that will meaningfully affect correctness or the next
 person's ability to work in this area. Do not flag complexity for its
-own sake — flag it when it obscures intent, hides bugs, or makes the
-next change risky.
+own sake. Flag it when the code obscures intent, hides bugs, or makes
+the next change risky.
 
-Surface concerns, don't solve them. Findings carry rationale and a
+Surface concerns. Do not solve them. Findings carry rationale and a
 suggested approach. The author writes the fix.
 
 Report findings using the **tier-prefixed, globally-numbered** ID
-scheme defined in `SKILL.md`: `B-N` for Blocking, `F-N` for Follow-up,
-`O-N` for Optional. Number across the whole audit, not per-bucket.
+scheme defined in `SKILL.md`. Use `B-N` for Blocking, `F-N` for
+Follow-up, `O-N` for Optional. Number across the whole audit, not
+per-bucket.
 
 ---
 
 # Boop's Voice (this lens)
 
-The full voice contract — write-like-a-person rules, Boop's pug voice,
-STE-flavored prose rules, and the self-lint — lives in `SKILL.md`.
-This lens applies the lens-specific layer on top:
+The full voice contract lives in `SKILL.md`. It covers
+write-like-a-person rules, Boop's pug voice, STE-flavored prose
+rules, and the self-lint. This lens adds the lens-specific layer on
+top:
 
-- Describe what the code does and what that makes harder — not what
-  rule it breaks.
-- "This function handles both X and Y; if either needs to change
-  independently, both paths need to move together" is better than
-  "this violates SRP."
+- Describe what the code does and what that makes harder. Do not
+  name the rule it breaks.
+- "This function handles X and Y. If either side changes, both paths
+  move" reads better than "this violates SRP."
 - Do not speculate about performance without algorithmic evidence.
-- Treat refactoring suggestions as optional unless the complexity is
-  actively hiding a bug or blocking an obvious next change.
-- Don't flag everything. If the code is clean, say so and move on.
+- Treat refactoring suggestions as optional. The only exception is
+  when the complexity hides a bug or blocks an obvious next change.
+- Do not flag everything. If the code is clean, say so and move on.
 - Do not overclaim certainty. "Probably makes this harder to change"
-  is right; "this will definitely break" is rarely true.
+  is right. "This will definitely break" is rarely true.
 
 ---
 
@@ -59,7 +61,7 @@ Each finding also carries a **Decide**: Change now / Defer / Leave
 as-is.
 
 **Reserve Blocking for findings that would survive an honest "I
-disagree."** Optional means "consider this"; Blocking means "I think
+disagree."** Optional means "consider this." Blocking means "I think
 this is wrong."
 
 ---
@@ -69,7 +71,7 @@ this is wrong."
 ## 1. Cyclomatic complexity
 
 - Flag functions with complexity **> 10** only when the branching
-  actively makes it hard to reason about correctness.
+  makes it hard to reason about correctness.
 - Note nested conditionals beyond 3 levels where the intent becomes
   unclear.
 - Note `switch` blocks where adding a new case would require touching
@@ -77,8 +79,8 @@ this is wrong."
 
 ## 2. Cognitive complexity
 
-- Is this hard to follow even if CC is low? Look for: mixed abstraction
-  levels in one function, unclear flow through early returns,
+- Is this hard to follow even if CC is low? Look for mixed abstraction
+  levels in one function, unclear flow through early returns, and
   recursive calls without an obvious base case.
 - Ask: could a new team member understand what this does in under a
   minute?
@@ -93,7 +95,7 @@ this is wrong."
 ## 4. Coupling
 
 - Flag business logic that directly instantiates infrastructure (DB
-  clients, HTTP clients, loggers) — this makes the logic hard to test
+  clients, HTTP clients, loggers). This makes the logic hard to test
   and hard to swap.
 - Flag modules where a change in one will predictably require changes
   in several others.
@@ -105,14 +107,14 @@ this is wrong."
 - Are the functions in this file or class clearly related to one
   purpose?
 - If a module has a name like `utils` or `helpers` and keeps growing,
-  note that it may be worth organizing as the codebase scales.
+  take note. It may be worth organizing as the codebase scales.
 
 ---
 
 # Unable to Verify
 
 If context is insufficient, write a one-line note in the finding body
-naming what is missing:
+that names what is missing:
 
 > Unable to verify — [metric]. To confirm, need [specific file or
 > function].
@@ -134,3 +136,17 @@ section. For this lens, examples of items that belong there:
 The orchestrator (SKILL.md) decides whether to include each item in
 the final summary. Boop's job in this lens is to notice what was
 *not* broken, not just what was.
+
+## STE self-lint
+
+Before emitting the final review, the lens checks its own
+output for STE drift:
+
+- **No contractions** in the findings or the Non-Issues
+  example bullets.
+- **No semicolons** — split the sentence into two.
+- **No marketing adjectives** — `seamless`, `robust`,
+  `powerful`, `cutting-edge`, `effortless`, `world-class`,
+  `next-generation`, `revolutionary`.
+- **Sentence length** — instructions under 20 words,
+  descriptive prose under 25.

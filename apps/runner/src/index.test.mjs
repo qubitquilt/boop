@@ -167,6 +167,25 @@ function standardOverrides(extra = {}) {
       return fakeReview();
     },
     cleanupPriorReview: async () => ({ resolved: 0, minimized: 0, errors: 0 }),
+    // QUB-95 + multi-expert: the sub-workflow's first
+    // stage (walkthrough) and the dispatch (experts) make
+    // real OpenRouter calls. The integration tests stub
+    // both. The walkthrough override returns a canned
+    // string so the narrate stage can consume it; the
+    // expert override returns no findings (the runOpenCodeSkill
+    // override on the narrate stage owns the final review).
+    generateWalkthrough: async () => ({
+      walkthrough: "(test fixture walkthrough)",
+      telemetry: null,
+    }),
+    expertOverrides: {
+      "regression-hunter": async () => ({ findings: [] }),
+      "test-quality": async () => ({ findings: [] }),
+      "api-design": async () => ({ findings: [] }),
+      "error-handling": async () => ({ findings: [] }),
+      "design-pattern": async () => ({ findings: [] }),
+      "readability": async () => ({ findings: [] }),
+    },
     ...extra,
   };
 }
@@ -187,7 +206,7 @@ test("run: happy path posts auth, runs review, posts done", async () => {
   assert.ok(statuses.some((s) => /paw-shaken in/.test(s)), "missing auth status");
   assert.ok(statuses.some((s) => /fetched/.test(s)), "missing clone status");
   assert.ok(statuses.some((s) => /sniffing/.test(s)), "missing review status");
-  assert.ok(statuses.some((s) => /napped/.test(s)), "missing done status");
+  assert.ok(statuses.some((s) => /bone delivered/.test(s)), "missing done status");
   // Review summary posted.
   assert.equal(octokit.calls.createComment.length, 1);
   assert.match(octokit.calls.createComment[0].body, /## TL;DR/);
@@ -202,7 +221,7 @@ test("run: cloneRepo failure → run rethrows (clone is not best-effort)", async
   // Otherwise the prompt would run against an empty
   // /work/repo and the LLM would produce nonsense findings (or
   // crash on missing files). We re-throw; the outer catch in run()
-  // turns the failure into a "🔄 chased tail" status update.
+  // turns the failure into a "❌ lost the bone" status update.
   const octokit = fakeOctokit();
   const overrides = standardOverrides({
     makeOctokit: () => octokit,
@@ -213,7 +232,7 @@ test("run: cloneRepo failure → run rethrows (clone is not best-effort)", async
   // auth still happened; clone did not; review/done must not.
   assert.ok(statuses.some((s) => /paw-shaken in/.test(s)));
   assert.ok(!statuses.some((s) => /sniffing/.test(s)), "review must not run after clone failure");
-  assert.ok(!statuses.some((s) => /napped/.test(s)), "done must not run after clone failure");
+  assert.ok(!statuses.some((s) => /bone delivered/.test(s)), "done must not run after clone failure");
 });
 
 test("run: re-review calls cleanupPriorReview", async () => {
@@ -250,7 +269,7 @@ test("run: cleanupPriorReview failures are logged but do not abort the run", asy
   });
   await run(env3, overrides);
   const statuses = octokit.calls.updateComment.map((c) => c.body);
-  assert.ok(statuses.some((s) => /napped/.test(s)));
+  assert.ok(statuses.some((s) => /bone delivered/.test(s)));
 });
 
 // --- failure paths ------------------------------------------------------
@@ -263,7 +282,7 @@ test("run: review-skill failure → postStatus failed + rethrows", async () => {
   });
   await assert.rejects(() => run(env, overrides), /review-skill blew up/);
   const failedStatus = octokit.calls.updateComment.find(
-    (c) => /chased tail/.test(c.body),
+    (c) => /lost the bone/.test(c.body),
   );
   assert.ok(failedStatus, "expected failed status update");
   assert.match(failedStatus.body, /review-skill blew up/);
@@ -293,6 +312,61 @@ test("run: postStatus failure is swallowed (best-effort)", async () => {
   // The run completes despite postStatus errors.
   await run(env, overrides);
   assert.equal(octokit.calls.createComment.length, 1);
+});
+
+// QUB-114: end-to-end test for reaction mode. The
+// receiver sets BOOP_NO_STATUS_COMMENT=1 on issue_comment
+// triggers; the runner must not post or PATCH a status
+// comment, and must add a single terminal reaction (bone on
+// done, x on failed) to the trigger comment. This is the
+// end-to-end test that catches the postFinalReaction-octokit
+// bug the reviewer flagged.
+test("run: reaction mode (BOOP_NO_STATUS_COMMENT=1) posts no status comment + adds terminal reaction", async () => {
+  const reactionCalls = [];
+  const octokit = {
+    ...fakeOctokit(),
+    rest: {
+      ...fakeOctokit().rest,
+      reactions: {
+        createForIssueComment: async (args) => {
+          reactionCalls.push(args);
+          return { data: { id: 1 } };
+        },
+      },
+    },
+  };
+  // Use the standard issue_comment trigger: the receiver
+  // passes a non-zero reactionCommentId, no status comment id.
+  // statusCommentId is 0 in the env so ensureStatusComment
+  // would create one — but the noStatusComment flag short-
+  // circuits the whole status-comment path.
+  const reactionEnv = {
+    ...env,
+    BOOP_NO_STATUS_COMMENT: "1",
+    BOOP_REACTION_COMMENT_ID: "987654",
+    BOOP_STATUS_COMMENT_ID: "0",
+  };
+  const overrides = standardOverrides({ makeOctokit: () => octokit });
+  await run(reactionEnv, overrides);
+  // The status-comment path must be a no-op: no createComment
+  // (the runner's lazy-create), no updateComment (no PATCH loop).
+  assert.equal(
+    octokit.calls.createComment.length,
+    0,
+    "no status comment created in reaction mode",
+  );
+  assert.equal(
+    octokit.calls.updateComment.length,
+    0,
+    "no status comment PATCHed in reaction mode",
+  );
+  // The terminal reaction was added exactly once with the
+  // correct content (bone for done).
+  assert.equal(reactionCalls.length, 1, "exactly one terminal reaction");
+  assert.equal(reactionCalls[0].content, "bone");
+  assert.equal(reactionCalls[0].comment_id, 987654);
+  assert.equal(reactionCalls[0].owner, "qubitquilt");
+  assert.equal(reactionCalls[0].repo, "boop");
 });
 
 test("run: cleanup hooks run even on failure", async () => {
@@ -455,7 +529,7 @@ test("run: botLogin unset → skip cleanupPriorReview on re-review", async () =>
 // was the JS string-concat echo of the test fixture in the diff
 // (PR #90, #92). The old runner posted that body to the PR. Now:
 // the parser returns an empty summary, the runner logs the parse
-// failure, the status timeline shows a "chased tail" entry with the
+// failure, the status timeline shows a "lost the bone" entry with the
 // reason, and no comment is posted.
 
 test("run: parse failure skips postReview + postInlineComments + cleanupPriorReview", async () => {
@@ -485,11 +559,11 @@ test("run: parse failure skips postReview + postInlineComments + cleanupPriorRev
   // prior one is still the current one on the PR).
   assert.equal(cleanupCalled, false);
   // Status timeline shows the parse failure with the reason in the
-  // "chased tail" entry's details block.
+  // "lost the bone" entry's details block.
   const statuses = octokit.calls.updateComment.map((c) => c.body);
   assert.ok(
-    statuses.some((s) => /chased tail/.test(s)),
-    "expected a 'chased tail' status entry on parse failure",
+    statuses.some((s) => /lost the bone/.test(s)),
+    "expected a 'lost the bone' status entry on parse failure",
   );
   assert.ok(
     statuses.some((s) => /summary parse failed: JS string-concat echo/.test(s)),
@@ -515,7 +589,7 @@ test("run: parse failure on first review also skips the post (no cleanup either 
   assert.equal(octokit.calls.createComment.length, 0);
   assert.equal(octokit.calls.createReviewComment.length, 0);
   const statuses = octokit.calls.updateComment.map((c) => c.body);
-  assert.ok(statuses.some((s) => /chased tail/.test(s)));
+  assert.ok(statuses.some((s) => /lost the bone/.test(s)));
   assert.ok(statuses.some((s) => /summary parse failed: no structured block/.test(s)));
 });
 
@@ -715,8 +789,8 @@ test("run: pod-1-fails-mid-sniff + pod-2-starts -> no duplicate posts (QUB-102)"
   // are present, not the order.
   const lastFailed = [...octokit.calls.updateComment]
     .reverse()
-    .find((c) => /chased tail/.test(c.body));
-  assert.ok(lastFailed, "expected a 'chased tail' status post on pod 2");
+    .find((c) => /lost the bone/.test(c.body));
+  assert.ok(lastFailed, "expected a 'lost the bone' status post on pod 2");
   assert.match(
     lastFailed.body,
     /another pod already passed \[[^\]]+\]/,
@@ -792,8 +866,8 @@ test("run: pod-1-posted-summary-and-inlines + pod-2-starts -> no duplicate posts
   // sees pod 1 finished through inlines.
   const lastFailed = [...octokit.calls.updateComment]
     .reverse()
-    .find((c) => /chased tail/.test(c.body));
-  assert.ok(lastFailed, "expected a 'chased tail' status post on pod 2");
+    .find((c) => /lost the bone/.test(c.body));
+  assert.ok(lastFailed, "expected a 'lost the bone' status post on pod 2");
   for (const stage of ["handshake", "fetch", "sniff", "summary", "inlines"]) {
     assert.ok(
       lastFailed.body.includes(stage),
@@ -818,8 +892,8 @@ test("run: pod-1-posted-summary + pod-2-starts -> no duplicate posts (QUB-102)",
   assert.equal(octokit.calls.createReviewComment.length, 0);
   const lastFailed = [...octokit.calls.updateComment]
     .reverse()
-    .find((c) => /chased tail/.test(c.body));
-  assert.ok(lastFailed, "expected a 'chased tail' status post on pod 2");
+    .find((c) => /lost the bone/.test(c.body));
+  assert.ok(lastFailed, "expected a 'lost the bone' status post on pod 2");
   assert.ok(lastFailed.body.includes("summary"));
 });
 

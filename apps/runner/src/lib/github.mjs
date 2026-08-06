@@ -214,6 +214,13 @@ async function minimizeComment(token, commentNodeId, deps) {
 // the initial status comment on its first PATCH when
 // ctx.statusCommentId is missing.
 //
+// QUB-114: when BOOP_NO_STATUS_COMMENT=1 (issue_comment-
+// triggered re-review), the runner does not create or PATCH a
+// status comment. The author already saw the 👀 reaction the
+// receiver added; the runner adds a single terminal reaction
+// (🦴 on done, ❌ on failed) on the trigger comment via
+// postFinalReaction. postStatus is a no-op in this mode.
+//
 // The caller (makeDeps in index.mjs) wraps deps.postStatus with a
 // `ensureStatusComment` step that lazy-creates the initial comment
 // on first call and patches the slot for subsequent calls. This
@@ -221,6 +228,14 @@ async function minimizeComment(token, commentNodeId, deps) {
 // (same best-effort behaviour as before — no comment, no crash).
 export async function postStatus(stage, detail, ctx, deps) {
   const { octokit, log, errlog } = deps;
+  // QUB-114: skip the entire status-comment path when the
+  // review was triggered by an issue_comment. The runner
+  // adds a single terminal reaction (see postFinalReaction)
+  // on done/failed; interim stages are silent.
+  if (ctx.noStatusComment) {
+    log("status", "skip (reaction mode)", { stage });
+    return;
+  }
   if (!octokit || !ctx.statusCommentId) {
     log("status", "skip (no client or comment id)", { stage });
     return;
@@ -315,6 +330,7 @@ export function renderInitialStatusBody(ctx, opts = {}) {
 // repeat the create on PATCH retries). The `by` parameter is
 // forwarded from BOOP_SENDER_LOGIN into the initial body.
 export async function ensureStatusComment(octokit, ctx, deps, slot, by) {
+  if (ctx.noStatusComment) return null;
   if (slot && slot.value) return slot.value;
   if (!octokit) return null;
   const { log, errlog } = deps;
@@ -336,6 +352,72 @@ export async function ensureStatusComment(octokit, ctx, deps, slot, by) {
       err: String(err?.message ?? err),
     });
     return null;
+  }
+}
+
+// postFinalReaction adds a single terminal reaction to the
+// trigger comment. Used in QUB-114's reaction mode (no
+// status comment): the receiver added 👀 on job submission,
+// the runner adds 🦴 on done or ❌ on failed. One reaction,
+// one notification, no PATCH loop.
+//
+// The octokit instance is resolved from the deps slot via
+// `deps.getOctokit?.()` (the same pattern `postStatus` uses).
+// Falling back to `deps.octokit` keeps test fixtures that
+// inject a pre-built octokit directly. Without this resolution
+// the function would always short-circuit on the slot-only
+// shape that the live runner passes — see the review that
+// caught this in `apps/runner/src/index.mjs`.
+//
+// `content` is the GitHub reaction emoji name (e.g. "eyes",
+// "bone", "x"). GitHub's reaction API rejects
+// duplicate (user, comment, content) triples with 422, which
+// is the same surface we already get on a redelivery — so
+// the orderly path does not need extra handling.
+//
+// `reactionCommentId` (ctx.reactionCommentId) is the
+// issue_comment id the receiver threaded through. Empty
+// for pull_request-driven runs — those have no trigger
+// comment to react to, so postFinalReaction is a no-op.
+export async function postFinalReaction(stage, ctx, deps) {
+  const { log, errlog } = deps;
+  const octokit = deps.getOctokit ? deps.getOctokit() : deps.octokit;
+  if (!octokit || !ctx.reactionCommentId) {
+    log("status", "skip final reaction (no octokit or comment id)", {
+      stage,
+      hasOctokit: !!octokit,
+      hasReactionCommentId: !!ctx.reactionCommentId,
+    });
+    return;
+  }
+  const content =
+    stage === "done"
+      ? "bone"
+      : stage === "failed"
+        ? "x"
+        : null;
+  if (!content) {
+    log("status", "skip final reaction (unknown stage)", { stage });
+    return;
+  }
+  try {
+    await octokit.rest.reactions.createForIssueComment({
+      owner: ctx.prOwner,
+      repo: ctx.prRepo,
+      comment_id: Number(ctx.reactionCommentId),
+      content,
+    });
+    log("status", "final reaction added", {
+      stage,
+      content,
+      comment_id: ctx.reactionCommentId,
+    });
+  } catch (err) {
+    errlog("status", "final reaction failed", {
+      stage,
+      content,
+      err: String(err?.message ?? err),
+    });
   }
 }
 

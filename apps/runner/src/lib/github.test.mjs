@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   mintInstallationToken,
   postStatus,
+  postFinalReaction,
   postReview,
   postInlineComments,
   cleanupPriorReview,
@@ -160,6 +161,183 @@ test("postStatus skips when octokit or statusCommentId is missing", async () => 
   assert.ok(
     log.out.some((l) => /skip/.test(l.msg)),
     "expected a 'skip' log entry when octokit or statusCommentId missing",
+  );
+});
+
+// QUB-114: in reaction mode (issue_comment trigger), postStatus
+// is a no-op regardless of the other inputs. The runner adds a
+// single terminal reaction at the end of the run instead.
+test("postStatus skips when noStatusComment is true (QUB-114 reaction mode)", async () => {
+  const log = recordingLogger();
+  const updateCalls = [];
+  const octokit = {
+    rest: {
+      issues: {
+        getComment: async () => ({ data: { body: "current body" } }),
+        updateComment: async (args) => {
+          updateCalls.push(args);
+          return { data: { id: 1 } };
+        },
+        createComment: async () => ({ data: { id: 1 } }),
+      },
+    },
+  };
+  await postStatus(
+    "auth",
+    undefined,
+    { ...ctx, noStatusComment: true, statusCommentId: 111 },
+    { octokit, ...log },
+  );
+  assert.equal(updateCalls.length, 0, "postStatus must not PATCH the status comment in reaction mode");
+  assert.ok(
+    log.out.some((l) => /reaction mode/.test(l.msg)),
+    "expected a 'reaction mode' skip log entry",
+  );
+});
+
+// QUB-114: postFinalReaction adds the terminal reaction to
+// the trigger comment on done (bone) or failed (x). The
+// function resolves the octokit via deps.getOctokit?.() so
+// the live runner's slot-only deps shape works (the prior
+// version destructured deps.octokit and silently no-op'd).
+
+function reactionFakeOctokit(contentToCapture) {
+  const calls = [];
+  return {
+    calls,
+    rest: {
+      reactions: {
+        createForIssueComment: async (args) => {
+          calls.push(args);
+          contentToCapture.value = args.content;
+          return { data: { id: 1 } };
+        },
+      },
+    },
+  };
+}
+
+test("postFinalReaction adds bone reaction on done (deps.getOctokit slot)", async () => {
+  // This is the bug the reviewer caught: deps in the live
+  // runner exposes getOctokit (a function), not octokit (the
+  // instance). The function must resolve via the slot.
+  const log = recordingLogger();
+  const octokit = reactionFakeOctokit({ value: null });
+  const deps = { log: log.log, errlog: log.errlog, getOctokit: () => octokit };
+  await postFinalReaction("done", { ...ctx, reactionCommentId: 200 }, deps);
+  assert.equal(octokit.calls.length, 1);
+  assert.equal(octokit.calls[0].content, "bone");
+  assert.equal(octokit.calls[0].comment_id, 200);
+  assert.equal(octokit.calls[0].owner, ctx.prOwner);
+  assert.equal(octokit.calls[0].repo, ctx.prRepo);
+  assert.ok(
+    log.out.some((l) => /final reaction added/.test(l.msg)),
+    "expected a 'final reaction added' log entry",
+  );
+});
+
+test("postFinalReaction adds x reaction on failed", async () => {
+  const log = recordingLogger();
+  const octokit = reactionFakeOctokit({ value: null });
+  const deps = { log: log.log, errlog: log.errlog, getOctokit: () => octokit };
+  await postFinalReaction("failed", { ...ctx, reactionCommentId: 201 }, deps);
+  assert.equal(octokit.calls.length, 1);
+  assert.equal(octokit.calls[0].content, "x");
+  assert.equal(octokit.calls[0].comment_id, 201);
+});
+
+test("postFinalReaction falls back to deps.octokit when getOctokit is missing", async () => {
+  // The function must work with both shapes: the live
+  // runner passes a slot (deps.getOctokit), test fixtures
+  // sometimes pass the octokit directly (deps.octokit).
+  const log = recordingLogger();
+  const octokit = reactionFakeOctokit({ value: null });
+  const deps = { log: log.log, errlog: log.errlog, octokit };
+  await postFinalReaction("done", { ...ctx, reactionCommentId: 202 }, deps);
+  assert.equal(octokit.calls.length, 1);
+  assert.equal(octokit.calls[0].content, "bone");
+  assert.equal(octokit.calls[0].comment_id, 202);
+});
+
+test("postFinalReaction skips when no octokit is available", async () => {
+  // Reaction mode is the only path that calls this; the
+  // runner should still not throw if the handshake never
+  // ran (octokit is null). Best-effort: log + skip.
+  const log = recordingLogger();
+  const deps = { log: log.log, errlog: log.errlog, getOctokit: () => null };
+  await postFinalReaction(
+    "done",
+    { ...ctx, reactionCommentId: 203 },
+    deps,
+  );
+  assert.ok(
+    log.out.some((l) => /skip final reaction/.test(l.msg)),
+    "expected a 'skip' log entry when octokit is null",
+  );
+});
+
+test("postFinalReaction skips when reactionCommentId is missing (pull_request path)", async () => {
+  // pull_request-driven runs do not have a trigger
+  // comment; reactionCommentId is empty. The function is a
+  // no-op there.
+  const log = recordingLogger();
+  const octokit = reactionFakeOctokit({ value: null });
+  const deps = { log: log.log, errlog: log.errlog, getOctokit: () => octokit };
+  await postFinalReaction(
+    "done",
+    { ...ctx, reactionCommentId: null },
+    deps,
+  );
+  assert.equal(octokit.calls.length, 0, "no reaction when no trigger comment");
+  assert.ok(
+    log.out.some((l) => /skip final reaction/.test(l.msg)),
+    "expected a 'skip' log entry when reactionCommentId is empty",
+  );
+});
+
+test("postFinalReaction swallows API errors (best-effort)", async () => {
+  // The function must not fail the run on a reaction API
+  // error. Errors are logged.
+  const log = recordingLogger();
+  const calls = [];
+  const octokit = {
+    rest: {
+      reactions: {
+        createForIssueComment: async () => {
+          calls.push("called");
+          throw new Error("rate-limited");
+        },
+      },
+    },
+  };
+  const deps = { log: log.log, errlog: log.errlog, getOctokit: () => octokit };
+  await postFinalReaction(
+    "done",
+    { ...ctx, reactionCommentId: 204 },
+    deps,
+  );
+  assert.equal(calls.length, 1);
+  assert.ok(
+    log.out.some(
+      (l) => l.level === "ERROR" && /final reaction failed/.test(l.msg),
+    ),
+    "expected a 'final reaction failed' error log entry",
+  );
+});
+
+test("postFinalReaction skips on unknown stage", async () => {
+  const log = recordingLogger();
+  const octokit = reactionFakeOctokit({ value: null });
+  const deps = { log: log.log, errlog: log.errlog, getOctokit: () => octokit };
+  await postFinalReaction(
+    "review", // not in the {done, failed} set
+    { ...ctx, reactionCommentId: 205 },
+    deps,
+  );
+  assert.equal(octokit.calls.length, 0);
+  assert.ok(
+    log.out.some((l) => /unknown stage/.test(l.msg)),
+    "expected an 'unknown stage' log entry",
   );
 });
 

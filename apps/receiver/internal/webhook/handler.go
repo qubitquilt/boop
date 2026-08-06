@@ -443,7 +443,9 @@ func (h *Handler) handlePullRequest(ctx context.Context, w http.ResponseWriter, 
 	// events, so the call returns without further side effects.
 	// The runner creates the initial status comment on its first
 	// PATCH (BOOP_STATUS_COMMENT_ID is passed as 0).
-	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("pull_request.%s", pr.Action), 0, 0, "", installationID, reviewNumber, pr.Labels)
+	// QUB-114: pull_request-driven runs use the status-comment
+	// surface (default behavior). noStatusComment=false.
+	h.submitJob(ctx, w, delivery, pr.Owner, pr.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("pull_request.%s", pr.Action), 0, 0, "", installationID, reviewNumber, pr.Labels, false)
 }
 
 func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter, delivery string, installationID int64, body []byte) {
@@ -530,7 +532,7 @@ func (h *Handler) handleIssueComment(ctx context.Context, w http.ResponseWriter,
 	// (it receives an empty BOOP_STATUS_COMMENT_ID). The sender
 	// login is forwarded via BOOP_SENDER_LOGIN so the runner can
 	// render the "Triggered by @user" line.
-	jobCreated, submitErr := h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, 0, ic.SenderLogin, installationID, reviewNumber, nil)
+	jobCreated, submitErr := h.submitJob(ctx, w, delivery, ic.Owner, ic.Repo, pr.Number, pr.HeadSHA, pr.BaseRef, previousHeadSHA, fmt.Sprintf("issue_comment.by=%s", ic.SenderLogin), ic.CommentID, 0, ic.SenderLogin, installationID, reviewNumber, nil, true)
 	if submitErr != nil || !jobCreated {
 		return
 	}
@@ -602,9 +604,9 @@ func renderStatusBody(stage, sha, by string, reviewNumber int) string {
 	case StatusReview:
 		return fmt.Sprintf("👃 **Boop is sniffing** — running the multi-lens review on `%s`. (%s)", short, reviewLabel)
 	case StatusDone:
-		return "💤 **Boop napped.** See the comment below."
+		return "🦴 **Boop brought you a bone.** See the comment below."
 	case StatusFailed:
-		return fmt.Sprintf("🔄 **Boop chased his tail.** Check the Job logs for details. (%s)", reviewLabel)
+		return fmt.Sprintf("❌ **Boop lost the bone.** Check the Job logs for details. (%s)", reviewLabel)
 	}
 	return fmt.Sprintf("boop status: %s", stage)
 }
@@ -697,7 +699,17 @@ func duplicateReviewReply(status, headSHA string) string {
 // BOOP_SENDER_LOGIN so the runner can render its "Triggered by @user"
 // attribution on the initial status comment). Empty for
 // pull_request triggers.
-func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID int64, triggeredBy string, installationID int64, reviewNumber int, labels []string) (bool, error) {
+// boolToString maps a Go bool to the "1" / "" env-var form
+// the runner uses. Empty means "off" (the runner's default
+// for every boolean switch).
+func boolToString(b bool) string {
+	if b {
+		return "1"
+	}
+	return ""
+}
+
+func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID int64, triggeredBy string, installationID int64, reviewNumber int, labels []string, noStatusComment bool) (bool, error) {
 	jobName := buildJobName(owner, repo, number, headSHA)
 
 	// QUB-94: resolve the BOOP_USE_OPENROUTER_SDK value for this
@@ -752,6 +764,13 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		// rollout. Per-PR labels (boop:openrouter-sdk) override
 		// this for a single review.
 		OpenRouterSDKEnabled: sdkEnabled,
+		// QUB-114: in reaction mode (issue_comment trigger) the
+		// runner does not post a status comment; it adds a
+		// single terminal reaction to the trigger comment
+		// instead. The author's view is 👀 (set by the
+		// receiver) → 🦴 / ❌ (set by the runner). No
+		// PATCH loop, no per-stage notifications.
+		NoStatusComment: boolToString(noStatusComment),
 		// QUB-106: forwarded into OPENROUTER_MODEL. The
 		// receiver's Config.OpenRouterModel is sourced from
 		// the OPENROUTER_MODEL env var on the receiver
@@ -966,6 +985,15 @@ type templateVars struct {
 	// desired loud-failure behaviour when the operator has not
 	// yet wired the receiver Deployment.
 	OpenRouterModel string
+	// QUB-114: when true, the runner uses reactions on the
+	// trigger comment instead of posting a status comment.
+	// "1" for issue_comment triggers; empty otherwise. Skips
+	// the PATCH loop so the author is not dinged on every
+	// status update. The trigger comment received the 👀
+	// reaction from the receiver; the runner adds a single
+	// terminal reaction (🦴 on done, ❌ on failed) at the
+	// end of the run.
+	NoStatusComment string
 }
 
 type prMeta struct {

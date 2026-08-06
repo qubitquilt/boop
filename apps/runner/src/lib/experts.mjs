@@ -5,23 +5,31 @@
 // them in parallel as independent LLM invocations, then
 // gathers the findings. The narrate sub-stage produces the
 // cohesive summary + inline-comment set from the gathered
-// findings (replacing the single-LLM-call path of
-// runOpenCodeSkill).
+// findings.
 //
-// Today every expert is a stub: each returns a placeholder
-// finding. The real LLM call (an OpenRouter SDK chat
-// completion per expert with a tailored prompt + tool
-// surface) is a follow-up. The override hook lets a test
-// inject specific experts.
+// Each expert is an independent OpenRouter SDK call. The
+// system prompt is the lens file (one of eight
+// `agents/review-*.md`). The user message is the
+// walkthrough + the diff + the PR context. The expert
+// returns a JSON object with a `findings` array; the
+// orchestrator in workflow.mjs (gather / meta-review /
+// narrate) consumes that shape.
 //
 // The expert model:
 //   - Each expert is an async function (ctx, deps, shared)
 //     that returns { findings: Finding[] }.
 //   - Findings are simple records: { id, expert, severity,
-//     title, body }.
+//     title, body, path?, line? }.
 //   - The orchestrator (pickExperts) maps a PR type to a
 //     set of expert names; the runner resolves each name to
 //     an expert function via EXPERT_POOL.
+//
+// Per-expert failure handling lives in the dispatch stage:
+// runExperts awaits all experts in parallel. A single
+// failure rejects the whole dispatch, and the workflow's
+// retry machinery re-attempts the dispatch. The experts
+// themselves are deterministic per call (no shared state
+// across retries), so re-attempts are safe.
 
 // pickExperts is the orchestrator. Maps a PR type to a
 // list of expert names. The default mapping is a starting
@@ -53,10 +61,24 @@ export function pickExperts(classification) {
   }
 }
 
+// LENS_TO_EXPERT maps a lens file name (without the .md) to
+// the expert name in the pool. The mapping is a contract:
+// renaming a lens file means updating this map.
+const LENS_TO_EXPERT = {
+  "review-code-quality": null, // not yet a per-expert lens
+  "review-design-pattern": "design-pattern",
+  "review-error-handling": "error-handling",
+  "review-readability": "readability",
+  "review-solid-principles": null, // not yet a per-expert lens
+  "review-test-quality": "test-quality",
+  "review-deep": "regression-hunter", // deep ↔ regression-hunter for now
+};
+
 // EXPERT_POOL is the registry of expert functions. Each
-// function is an async (ctx, deps) -> { findings }. The
-// default implementations are stubs; the real LLM
-// invocations land in a follow-up PR.
+// function is an async (ctx, deps, shared) -> { findings }.
+// The default implementations are real LLM calls; a test
+// can override any expert via deps.expertOverrides (a
+// {expertName: function} map) or via the EXPERT_POOL global.
 export const EXPERT_POOL = {
   "regression-hunter": defaultExpert.bind(null, "regression-hunter"),
   "test-quality": defaultExpert.bind(null, "test-quality"),
@@ -66,52 +88,303 @@ export const EXPERT_POOL = {
   "readability": defaultExpert.bind(null, "readability"),
 };
 
-// defaultExpert is the stub. Returns a single finding with
-// the expert's name + a placeholder body. The real expert
-// will run an OpenRouter SDK chat completion with a
-// tailored prompt + the PR diff + tool access (bash, file
-// reads, test runner) scoped to the cloned repo.
-async function defaultExpert(name, _ctx, _deps) {
-  return {
-    findings: [
-      {
-        id: `${name}-placeholder`,
-        expert: name,
-        severity: "info",
-        title: `${name} (stub)`,
-        body: `Stub finding from ${name}. A follow-up PR wires the real LLM call.`,
-      },
-    ],
-  };
+// EXPERT_TO_LENS is the reverse map. Used by defaultExpert
+// to find the lens file for an expert name.
+const EXPERT_TO_LENS = Object.fromEntries(
+  Object.entries(LENS_TO_EXPERT)
+    .filter(([, expert]) => expert)
+    .map(([lens, expert]) => [expert, lens]),
+);
+
+// buildExpertPrompt is the user message the expert LLM
+// sees. The system prompt is the lens file (read at call
+// time). The user message has three sections: the walkthrough
+// (the human-readable summary of the change), the diff
+// (the ground truth the expert grounds any finding in), and
+// the output spec (the JSON shape the expert returns).
+//
+// The prompt is bounded. The walkthrough is capped at
+// MAX_WALKTHROUGH_CHARS by the walkthrough stage; the diff
+// is the PR_HEAD vs the diff range, which can be large but
+// is not capped here (the operator's environment is the
+// limit). The output spec asks for terse findings, one
+// bullet per finding, no preamble.
+function buildExpertPrompt(name, ctx, deps, walkthrough) {
+  const wt = walkthrough || "(walkthrough unavailable — read the diff directly)";
+  return [
+    "# Task",
+    "",
+    `You are the **${name}** expert on a multi-lens PR review.`,
+    "Apply your lens checklist to the change below. Report what you",
+    "find; do not re-state what the PR does. The walkthrough is for",
+    "orientation; the diff is the ground truth.",
+    "",
+    "# Walkthrough (human-readable summary of the change)",
+    "",
+    wt,
+    "",
+    "# Diff range",
+    "",
+    "```",
+    `pr_owner: ${ctx.prOwner}`,
+    `pr_repo: ${ctx.prRepo}`,
+    `pr_number: ${ctx.prNumber}`,
+    `pr_head_sha: ${ctx.prHeadSha}`,
+    `pr_base_ref: ${ctx.prBaseRef}`,
+    `working_directory: ${ctx.paths?.repoDir || "/work/repo"}`,
+    "```",
+    "",
+    "Read the diff. Apply your lens checklist. Report findings as JSON.",
+    "",
+    "# Output spec",
+    "",
+    "Return a single JSON object:",
+    "",
+    "```json",
+    "{",
+    '  "findings": [',
+    "    {",
+    '      "id": "unique-id-for-this-finding",',
+    '      "severity": "blocking | follow-up | optional | info",',
+    '      "title": "one-line summary",',
+    '      "body": "1-3 sentence prose. No Observation/Impact/Suggestion formula.",',
+    '      "path": "path/to/file.ext",  // optional; omit for cross-cutting findings',
+    '      "line": 42  // optional; line in the post-diff file',
+    "    }",
+    "  ]",
+    "}",
+    "```",
+    "",
+    "Rules:",
+    "- One finding per bullet. Do not combine unrelated concerns.",
+    "- Cite exact file paths and line numbers when you have them.",
+    "- Use severity = blocking only for things that would survive",
+    "  an honest 'I disagree' from the author.",
+    "- Return an empty `findings: []` array when the lens has nothing",
+    "  to flag. An empty result is a successful review.",
+    "- Do not include a preamble. The JSON is the entire response.",
+  ].join("\n");
+}
+
+// defaultExpert calls the OpenRouter SDK with the lens file
+// as the system prompt and the expert prompt as the user
+// message. Returns { findings: Finding[] }.
+//
+// The expert is overridable for tests via deps.expertOverrides
+// (a {expertName: function} map) or via the EXPERT_POOL
+// global. The default is a real LLM call.
+//
+// The lens file is read through the rtk adapter so the
+// reads go through rtk (with raw fs fallback). The path is
+// `${paths.configSrc}/skills/boop/agents/${lensFile}`; the
+// runner knows the configSrc mount from ctx.paths.
+async function defaultExpert(name, ctx, deps, shared = {}) {
+  // 1. Resolve the lens file for this expert.
+  const lensFile = EXPERT_TO_LENS[name];
+  if (!lensFile) {
+    // Expert has no lens file (e.g. a future expert not
+    // yet mapped). Surface a structured error so the
+    // dispatch's gate + retry machinery surfaces the
+    // misconfiguration, not a silent zero-finding run.
+    throw new Error(
+      `expert "${name}" has no lens file mapped; update LENS_TO_EXPERT in lib/experts.mjs`,
+    );
+  }
+  const lensPath = `${ctx.paths?.configSrc || "/home/opencode/.config/opencode"}/skills/boop/agents/${lensFile}.md`;
+  // 2. Apply test override (deps.expertOverrides wins over
+  // EXPERT_POOL; both beat the default LLM call).
+  const override = deps.expertOverrides?.[name];
+  if (typeof override === "function") {
+    return override(ctx, deps, shared);
+  }
+  // 3. Read the lens file (system prompt). Use the rtk
+  // adapter if present (the runner attaches it via deps.rtk);
+  // fall back to raw fs.readFile when the adapter is
+  // absent (test fixtures).
+  const fs = deps.fs;
+  const lensBody = await readLensBody(lensPath, fs, deps);
+  // 4. Build the user message from the walkthrough + the
+  // PR context. The walkthrough is the shared state from
+  // the walkthrough sub-stage; shared.findings is the
+  // running set of findings from earlier experts in this
+  // dispatch (read-only — the expert can avoid duplicating
+  // what a peer already flagged).
+  const walkthrough = shared.walkthrough || ctx.walkthrough || "";
+  const userPrompt = buildExpertPrompt(name, ctx, deps, walkthrough);
+  // 5. Call OpenRouter. The expert call uses a tighter
+  // timeout than the walkthrough call (the expert returns
+  // terse JSON, not a long review). 90s is enough for the
+  // current model family.
+  const EXPERT_TIMEOUT_MS = 90_000;
+  let callResult;
+  try {
+    callResult = await deps.callOpenRouter(userPrompt, {
+      ...deps,
+      model: deps.model,
+      timeoutMs: EXPERT_TIMEOUT_MS,
+      system: lensBody, // the lens file as the system prompt
+    });
+  } catch (err) {
+    // A single expert failure rejects the dispatch; the
+    // workflow's retry machinery re-attempts. The error
+    // carries the expert name so the run log can correlate.
+    err.expert = name;
+    throw err;
+  }
+  // 6. Parse the JSON response. The LLM is told to return
+  // a single JSON object; a parse failure rejects this
+  // expert's findings and propagates so the dispatch
+  // re-tries.
+  const parsed = parseExpertResponse(callResult?.text, name);
+  // 7. Stamp the expert name on every finding (the lens
+  // file does not name the expert; the orchestrator does).
+  for (const f of parsed.findings) {
+    if (f && !f.expert) f.expert = name;
+  }
+  return parsed;
+}
+
+// readLensBody reads the lens file body (the system prompt).
+// Uses the rtk adapter when present; falls back to raw
+// fs.readFile. Frontmatter is stripped the same way the
+// single-LLM-call path strips it (the `---` block) so the
+// lens body the LLM sees is identical.
+async function readLensBody(lensPath, fs, deps) {
+  let body;
+  if (deps.rtk && typeof deps.rtk.readFile === "function") {
+    body = await deps.rtk.readFile(lensPath, "utf8");
+  } else {
+    body = await fs.readFile(lensPath, "utf8");
+  }
+  return (body || "").replace(/^---[\s\S]*?---\n*/, "");
+}
+
+// parseExpertResponse parses the LLM's JSON response. The
+// LLM is told to return a single JSON object with a
+// `findings` array; a parse failure rejects the expert's
+// findings. The parser is permissive about the response
+// shape: a missing `findings` field is treated as empty
+// (the lens found nothing to flag), and a non-JSON
+// response is logged + treated as a failure.
+function parseExpertResponse(text, name) {
+  const raw = (text || "").trim();
+  if (!raw) {
+    return { findings: [] };
+  }
+  // The LLM is asked to return a single JSON object. Strip
+  // a leading ```json fence if the LLM added one (defense
+  // against the "I'll wrap my JSON in a code block" failure
+  // mode).
+  const stripped = raw
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/```\s*$/, "")
+    .trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(stripped);
+  } catch {
+    // The LLM did not return parseable JSON. Treat the
+    // whole response as a single free-form finding so the
+    // expert's analysis is not silently dropped. The
+    // narrate stage may downgrade severity to "info".
+    return {
+      findings: [
+        {
+          id: `${name}-unparsed-${Date.now()}`,
+          expert: name,
+          severity: "info",
+          title: `${name} (unparsed response)`,
+          body: stripped.slice(0, 2000),
+        },
+      ],
+    };
+  }
+  const findings = Array.isArray(parsed.findings) ? parsed.findings : [];
+  // Normalize: every finding must have id + title + body.
+  // Missing fields get a generated default so the rest of
+  // the pipeline does not have to defensively check.
+  const out = [];
+  for (let i = 0; i < findings.length; i++) {
+    const f = findings[i] || {};
+    if (!f) continue;
+    out.push({
+      id: typeof f.id === "string" && f.id ? f.id : `${name}-${i}`,
+      expert: name,
+      severity: normalizeSeverity(f.severity),
+      title: typeof f.title === "string" ? f.title : "(no title)",
+      body: typeof f.body === "string" ? f.body : "",
+      ...(typeof f.path === "string" ? { path: f.path } : {}),
+      ...(Number.isInteger(f.line) ? { line: f.line } : {}),
+    });
+  }
+  return { findings: out };
+}
+
+function normalizeSeverity(s) {
+  switch (s) {
+    case "blocking":
+    case "follow-up":
+    case "optional":
+    case "info":
+      return s;
+    default:
+      return "info";
+  }
 }
 
 // runExperts runs a list of expert names in parallel and
 // returns the concatenated findings. Each expert runs
-// independently — a single expert failure does not block
-// the others. Promise.allSettled would be more permissive
-// (one failure doesn't fail the whole dispatch); the
-// current implementation uses Promise.all so an expert
-// failure propagates as a hard error (caught by the gate
-// + retry machinery in workflow.mjs).
+// independently — a single expert failure rejects the
+// whole dispatch, and the workflow's retry machinery
+// re-attempts (per-expert failures bubble up to the gate).
 //
-// The shared object lets the experts coordinate (e.g., an
-// expert can see findings already produced by an earlier
-// expert in the same dispatch). For the stub, shared is
-// unused. The real experts will read shared.findings to
-// avoid duplicate work.
+// The shared object lets the experts coordinate. The
+// walkthrough is on `shared.walkthrough`; the running set of
+// findings from earlier experts in this dispatch is on
+// `shared.findings`. The expert can read both to avoid
+// duplicating the walkthrough or re-flagging what a peer
+// already flagged.
+//
+// Experts run in parallel via Promise.all. The dispatch
+// stage's gate + retry machinery handles per-expert
+// failures (a single failure rejects the whole dispatch;
+// the gate re-attempts the dispatch; the LLM is
+// deterministic per call so re-attempts are safe).
 export async function runExperts(names, ctx, deps, shared = {}) {
+  if (!Array.isArray(names) || names.length === 0) {
+    return [];
+  }
   const tasks = names.map((name) => {
-    const fn = EXPERT_POOL[name];
+    const fn = deps.expertOverrides?.[name] || EXPERT_POOL[name];
     if (!fn) {
       throw new Error(`unknown expert: ${name}`);
     }
-    return fn(ctx, deps, shared);
+    return Promise.resolve()
+      .then(() => fn(ctx, deps, shared))
+      .then((result) => ({ name, ok: true, result }))
+      .catch((err) => ({ name, ok: false, err }));
   });
   const results = await Promise.all(tasks);
+  // Collect the failures. If any expert failed, reject the
+  // whole dispatch so the workflow's retry machinery
+  // re-attempts. The error message names the failed
+  // expert so the run log can correlate.
+  const failed = results.filter((r) => !r.ok);
+  if (failed.length > 0) {
+    const names = failed.map((f) => f.name).join(", ");
+    const first = failed[0].err;
+    const wrapped = new Error(
+      `expert dispatch failed for: ${names} (first: ${String(first?.message ?? first)})`,
+    );
+    wrapped.failed = failed.map((f) => ({ name: f.name, err: f.err }));
+    throw wrapped;
+  }
+  // Merge findings across experts. The orchestrator's
+  // gather step de-dupes; this is just the concat.
   const findings = [];
   for (const r of results) {
-    if (r && Array.isArray(r.findings)) {
-      findings.push(...r.findings);
+    if (r && r.ok && r.result && Array.isArray(r.result.findings)) {
+      findings.push(...r.result.findings);
     }
   }
   return findings;
@@ -160,10 +433,10 @@ export function mergeByExpert(original, replacement, droppedExperts = null) {
 // list. Two findings are "the same" if they share the same
 // id (the expert names the id; collisions indicate a
 // duplicate finding the dispatcher should not post twice).
-// Today the default experts emit one finding each with a
-// unique id, so the dedupe is a no-op. The real experts
-// will occasionally collide; the dedupe keeps the inlines
-// list clean.
+// The default experts emit one finding each with a unique
+// id, so the dedupe is a no-op for clean responses; the
+// real experts will occasionally collide, and the dedupe
+// keeps the inlines list clean.
 export function gather(findings) {
   const seen = new Set();
   const out = [];
@@ -177,9 +450,12 @@ export function gather(findings) {
 }
 
 // narrate synthesizes the cohesive summary + inlines from
-// the gathered findings. The default returns a placeholder
-// review whose body mentions the expert names; a follow-up
-// PR wires the real narrator LLM call.
+// the gathered findings. The default is the existing
+// single-LLM-call path (defaultRunOpenCodeSkill in
+// workflow.mjs) — the narrate sub-stage calls it with the
+// gathered findings as the prompt context. This function
+// exists for symmetry; the actual call lives in
+// workflow.mjs narrateSubStage.
 //
 // The shape mirrors the existing runOpenCodeSkill output
 // so the downstream summary / inlines stages are
@@ -204,3 +480,8 @@ export async function defaultNarrate(findings, _ctx, _deps) {
     telemetry: null,
   };
 }
+
+// _LENS_TO_EXPERT re-exported for tests. The mapping is
+// loaded at module init; tests can pin or override it via
+// the EXPERT_POOL or deps.expertOverrides hooks.
+export const _INTERNAL = { LENS_TO_EXPERT, EXPERT_TO_LENS };

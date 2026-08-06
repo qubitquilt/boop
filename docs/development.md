@@ -12,6 +12,11 @@ See also: [receiver.md](./receiver.md), [runner.md](./runner.md),
 - Bun (for the runner's local test loop — `bun --version`). The
   production runner image still runs Node; the local test loop runs
   under Bun for fast iteration. See [QUB-10](https://linear.app/qubit-quilt/issue/QUB-10/convert-runner-to-using-bun).
+- [`rtk`](https://github.com/rtk-ai/rtk) on `PATH` (QUB-85). The
+  runner's file reads go through the [rtk adapter](./runner.md#rtk-adapter-qub-85)
+  when the binary is present; a missing binary falls back to raw
+  `fs.readFile` automatically. `brew install rtk` on macOS, `apt
+  install rtk` (or download from the GitHub release) on Linux.
 - A kubeconfig with permissions to submit Jobs in a `dev-tools`
   namespace (for receiver end-to-end).
 - A GitHub App's `app-id`, `installation-id`, and `private-key` (for any

@@ -45,8 +45,8 @@ export const STATUS = {
   auth: "🤝 **Paw-shaken in** — authenticated with GitHub at `{sha}`.",
   clone: "🥎 **Boop fetched the repo** at `{sha}`. Checking out the PR head and starting the multi-lens review.",
   review: "👃 **Boop is sniffing** — running the multi-lens review on `{sha}`.",
-  done: "💤 **Boop napped.** See the comment below.",
-  failed: "🔄 **Boop chased his tail.** Check the Job logs for details.",
+  done: "🦴 **Boop brought you a bone.** See the comment below.",
+  failed: "❌ **Boop lost the bone.** Check the Job logs for details.",
 };
 
 // Short labels used in the timeline. The header above always shows
@@ -55,8 +55,8 @@ export const SHORT = {
   auth: "🤝 paw-shaken in",
   clone: "🥎 fetched",
   review: "👃 sniffing",
-  done: "💤 napped",
-  failed: "🔄 chased tail",
+  done: "🦴 bone delivered",
+  failed: "❌ lost the bone",
 };
 
 // Lens files inlined into the prompt. Order matches the order the
@@ -121,6 +121,20 @@ export function loadConfig(env = process.env) {
     debug: !!env.BOOP_DEBUG,
     home: env.HOME || "/home/opencode",
     cwd: env.CWD || "/app",
+    // QUB-114: when an issue_comment triggers a review, the
+    // receiver already reacts with 👀 to the trigger comment.
+    // The runner should NOT post a status comment + PATCH it
+    // for every stage — that dings the author on every update.
+    // Instead the runner adds a single terminal reaction
+    // (🦴 on done, ❌ on failed) to the trigger comment and
+    // postStatus is a no-op. The trigger is silent otherwise.
+    noStatusComment: env.BOOP_NO_STATUS_COMMENT === "1",
+    // QUB-85: operator kill switch for the rtk adapter. When `1`,
+    // the adapter skips the rtk binary and reads go through raw
+    // `fs.readFile` — the pre-QUB-85 behavior. Use this to
+    // reproduce a regression or to debug a poisoned rtk install
+    // without rebuilding the image.
+    rtkDisabled: env.BOOP_RTK_DISABLED === "1",
     // Dashboard data layer. Both must be set for the runner to
     // POST lifecycle + telemetry; if either is missing the
     // dashboard helpers are no-ops and the runner still posts the
