@@ -824,6 +824,74 @@ func TestCountRerunJobsForSHA_IncrementsOnReruns(t *testing.T) {
 	}
 }
 
+// QUB-112: audit log. Every dashboard-initiated action
+// appends a row. The actor column is the load-bearing
+// piece — a faceless action is unattributable.
+func TestRecordAuditEvent_AppendOnly(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for i, action := range []string{"rerun.create", "install.pause", "cost.zero_out"} {
+		ev, err := s.RecordAuditEvent(ctx, AuditEvent{
+			Action:   action,
+			Actor:    "tester",
+			TargetID: "boop-a-b-1-aaaaaaa",
+			Details:  `{"reason":"unit test"}`,
+		})
+		if err != nil {
+			t.Fatalf("record %d: %v", i, err)
+		}
+		if ev.ID == 0 {
+			t.Errorf("event %d got id 0", i)
+		}
+	}
+	got, err := s.ListAuditEvents(ctx, 10)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("got %d events, want 3", len(got))
+	}
+	// Newest first; the last write should be on top.
+	if got[0].Action != "cost.zero_out" {
+		t.Errorf("got[0].Action = %q, want cost.zero_out (newest first)", got[0].Action)
+	}
+}
+
+// QUB-112: audit events reject empty actor and action.
+func TestRecordAuditEvent_RejectsEmptyFields(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.RecordAuditEvent(ctx, AuditEvent{Action: "rerun.create"}); err == nil {
+		t.Error("empty actor accepted; should reject")
+	}
+	if _, err := s.RecordAuditEvent(ctx, AuditEvent{Actor: "x"}); err == nil {
+		t.Error("empty action accepted; should reject")
+	}
+}
+
+// QUB-112: retention schedule. Every run gets a
+// scheduled-deletion timestamp; the dashboard renders
+// it on the run-detail page.
+func TestListRetentionSchedule_ComputesCutoff(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	started := time.Now().UTC().Add(-30 * 24 * time.Hour)
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusSucceeded, started)); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	got, err := s.ListRetentionSchedule(ctx, 90*24*time.Hour)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d rows, want 1", len(got))
+	}
+	wantDel := started.Add(90 * 24 * time.Hour)
+	if !got[0].ScheduledDeletion.Equal(wantDel) {
+		t.Errorf("scheduled_deletion = %v, want %v", got[0].ScheduledDeletion, wantDel)
+	}
+}
+
 // QUB-108: failure_class round-trip. The reconciler writes
 // the K8s container exit reason into this column; the
 // dashboard reads it for the exception dock's filter chips.
