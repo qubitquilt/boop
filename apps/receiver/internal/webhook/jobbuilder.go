@@ -327,6 +327,21 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 							// still go through the in-process SDK; a
 							// future PR removes the flag entirely.
 							{Name: "BOOP_USE_OPENROUTER_SDK", Value: v.OpenRouterSDKEnabled},
+							// QUB-106: model id forwarded to the
+							// runner as OPENROUTER_MODEL. The
+							// runner reads it as
+							// ctx.openrouterModel and calls
+							// the OpenRouter SDK with it
+							// (openrouter.mjs:43). An empty
+							// value here triggers the
+							// "OPENROUTER_MODEL is unset or
+							// empty" throw — desired, so a
+							// misconfigured receiver
+							// Deployment surfaces a loud
+							// failure on the first review
+							// instead of silently landing a
+							// Job that always fails.
+							{Name: "OPENROUTER_MODEL", Value: v.OpenRouterModel},
 							// Tell the runner where on disk to find
 							// each mounted secret. The runner reads
 							// the file at process start and stops

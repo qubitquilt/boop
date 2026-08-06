@@ -181,6 +181,20 @@ spec:
                   name: boop-secrets
                   key: RUNNER_TOKEN
                   optional: true
+            # QUB-106: model id forwarded to every runner
+            # Job as OPENROUTER_MODEL. The receiver's
+            # main.go reads this and puts it on every
+            # review Job's container env; the runner
+            # reads it as ctx.openrouterModel and calls
+            # the OpenRouter SDK with it. Without this
+            # entry, every review Job fails at the sniff
+            # gate with "OPENROUTER_MODEL is unset or
+            # empty" and never posts a summary. Pinned
+            # to the cluster's default model — the
+            # value is informational; per-run overrides
+            # are out of scope for QUB-106.
+            - name: OPENROUTER_MODEL
+              value: minimax/minimax-m3
           volumeMounts:
             - name: data
               mountPath: /data

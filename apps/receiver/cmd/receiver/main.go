@@ -69,6 +69,15 @@ func main() {
 		// for the QUB-N rollout. Per-PR labels (boop:openrouter-sdk)
 		// override this for a single review.
 		OpenRouterSDKDefault: getenv("BOOP_USE_OPENROUTER_SDK", "0"),
+		// QUB-106: model id forwarded to every runner Job as
+		// OPENROUTER_MODEL. Sourced from the receiver's own
+		// env (typically set in the receiver Deployment
+		// manifest, see apps/k8s/base/deployment.yaml). An
+		// empty value is preserved so the runner's existing
+		// "unset or empty" throw (apps/runner/src/lib/openrouter.mjs)
+		// fires loudly on the first review instead of
+		// silently landing a Job that always fails.
+		OpenRouterModel: os.Getenv("OPENROUTER_MODEL"),
 	}
 
 	if cfg.WebhookSecret == "" {
@@ -93,6 +102,20 @@ func main() {
 	}
 	if cfg.RunnerToken == "" {
 		logger.Warn("RUNNER_TOKEN is unset: runner telemetry/status posts will be rejected with 401")
+	}
+	// QUB-106: log the OpenRouter model the receiver is
+	// forwarding so an operator can confirm the wire-up from
+	// receiver startup logs alone. An empty value is the
+	// pre-fix bug shape: every review Job's runner will throw
+	// "OPENROUTER_MODEL is unset or empty" at the sniff gate
+	// and never post a summary. Warn at startup so the
+	// misconfiguration is visible before the first webhook
+	// arrives, instead of only after a stuck run shows up in
+	// the dashboard.
+	if cfg.OpenRouterModel == "" {
+		logger.Warn("OPENROUTER_MODEL is unset: every review Job will fail with 'OPENROUTER_MODEL is unset or empty' at the sniff gate")
+	} else {
+		logger.Info("OPENROUTER_MODEL", "value", cfg.OpenRouterModel)
 	}
 
 	mux := http.NewServeMux()
