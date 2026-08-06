@@ -65,6 +65,9 @@ import {
   postInlineComments,
 } from "./github.mjs";
 import { readSecretFile } from "./security.mjs";
+import {
+  generateWalkthrough as defaultGenerateWalkthrough,
+} from "./walkthrough.mjs";
 
 // Default retry policy. The receiver passes overrides via the
 // runner's env (BOOP_STAGE_MAX_ATTEMPTS, BOOP_STAGE_BACKOFF_BASE_MS,
@@ -165,7 +168,28 @@ export const STAGES = [
 // The "review" status line is posted once at the start of the
 // macro `sniff` stage and covers the whole sub-workflow (so
 // QUB-93's user-visible surface stays the same).
+//
+// QUB-95 + multi-expert: the sub-workflow is now a 6-step
+// pipeline. Step 0 (walkthrough) is the new piece: an
+// independent LLM call that produces a human-readable
+// summary of the PR, which every expert consumes as shared
+// context. The walkthrough is the bridge between "one LLM
+// call sees everything" and "N LLM calls see only their
+// slice" — every expert reads the same walkthrough, so
+// the findings read as one voice.
 export const REVIEW_SUB_STAGES = [
+  {
+    id: "walkthrough",
+    statusStage: null,
+    description:
+      "Generate a human-readable walkthrough of the PR (what it does, in 10-20 sentences). Every expert consumes the walkthrough as shared context. Failure here is non-fatal: experts fall back to reading the diff directly.",
+    input: "ctx (diff range, paths, head SHA), state.openrouterApiKey",
+    output: "state.walkthrough = string; state.walkthroughTelemetry = telemetry",
+    idempotent: false,
+    retryable: true,
+    gate: walkthroughGate,
+    run: walkthroughSubStage,
+  },
   {
     id: "classify",
     statusStage: null,
@@ -182,8 +206,8 @@ export const REVIEW_SUB_STAGES = [
     id: "dispatch",
     statusStage: null,
     description:
-      "Pick the experts for this PR type and run them in parallel. Each expert is an independent LLM call with a tailored prompt + tool surface (bash, file reads, test runner) scoped to the cloned repo.",
-    input: "state.classification, /work/repo",
+      "Pick the experts for this PR type and run them in parallel. Each expert is an independent OpenRouter SDK call with the lens file as system prompt and the walkthrough + diff as user message. A single expert failure rejects the whole dispatch; the workflow retry machinery re-attempts.",
+    input: "state.walkthrough, state.classification",
     output: "state.findings = [Finding, ...]",
     idempotent: false,
     retryable: true,
@@ -619,6 +643,34 @@ async function cleanupStage(ctx, deps, overrides, state) {
 
 // --- sub-stage gate + function -----------------------------------------
 
+async function walkthroughGate(state, _ctx, _deps) {
+  // The walkthrough needs the openrouter key (for the LLM
+  // call). The fetch stage has populated it. A missing key
+  // is a soft fail (the walkthrough stage falls back to a
+  // placeholder) but the gate still rejects so the operator
+  // sees the misconfiguration in the run log.
+  if (!state.openrouterApiKey) {
+    return { ok: false, reason: "no openrouter api key" };
+  }
+  return { ok: true };
+}
+
+async function walkthroughSubStage(ctx, deps, overrides, state) {
+  // The walkthrough is overridable so a test can inject a
+  // canned response. The default is the OpenRouter SDK call
+  // in lib/walkthrough.mjs. A failure here is non-fatal:
+  // the stage sets a placeholder walkthrough so the
+  // dispatch's experts still have the diff to work from.
+  const gen = overrides.generateWalkthrough || defaultGenerateWalkthrough;
+  const { walkthrough, telemetry } = await gen(ctx, deps);
+  state.walkthrough = walkthrough;
+  state.walkthroughTelemetry = telemetry;
+  deps.log("walkthrough", "walkthrough generated", {
+    chars: (walkthrough || "").length,
+    isPlaceholder: walkthrough.startsWith("(walkthrough unavailable"),
+  });
+}
+
 async function classifyGate(state, _ctx, _deps) {
   // The classifier needs the openrouter key (for the real
   // LLM call when it lands) and the cloned repo (for the
@@ -653,8 +705,17 @@ async function dispatchGate(_state, _ctx, _deps) {
 
 async function dispatchSubStage(ctx, deps, overrides, state) {
   // Pick the experts for this PR type and run them in
-  // parallel. Each expert is an independent LLM call (or
-  // stub, in tests); the dispatcher does not serialize.
+  // parallel. Each expert is an independent OpenRouter SDK
+  // call. The dispatcher does not serialize; the experts
+  // run concurrently via Promise.all inside runExperts.
+  //
+  // The shared object carries the walkthrough (the human-
+  // readable summary every expert consumes) and the
+  // running set of findings from earlier experts in this
+  // dispatch (read-only; the expert can skip work a peer
+  // already did). The walkthrough is on state.walkthrough
+  // and is forwarded into shared so the expert LLM sees
+  // the same shared context every time.
   //
   // The pickExperts + runExperts pair is overridable so a
   // test can inject a deterministic expert pool (e.g.,
@@ -664,7 +725,12 @@ async function dispatchSubStage(ctx, deps, overrides, state) {
   const run = overrides.runExperts || runExperts;
   const names = pick(state.classification || { type: "unknown" });
   deps.log("dispatch", "picked experts", { names });
-  const findings = await run(names, ctx, deps, { classification: state.classification });
+  const shared = {
+    classification: state.classification,
+    walkthrough: state.walkthrough,
+    findings: [], // running set; experts append as they produce findings
+  };
+  const findings = await run(names, ctx, deps, shared);
   state.findings = findings;
   deps.log("dispatch", "experts returned", {
     count: findings.length,
@@ -764,21 +830,29 @@ async function narrateSubStage(ctx, deps, overrides, state) {
   //   2. overrides.narrate — a test or future caller
   //      that has a real narrator for the multi-expert
   //      sub-workflow injects the new shape.
-  //   3. defaultRunOpenCodeSkill — the legacy single-LLM
-  //      call. The real multi-expert narrator is a
-  //      follow-up; until it lands, production reviews
-  //      still go through the existing reviewer. Without
-  //      this fallback, the narrate stage would post a
-  //      placeholder summary in production.
+  //   3. defaultRunOpenCodeSkill — the default narrator.
+  //      In the multi-expert path it is handed the
+  //      walkthrough + the gathered findings via
+  //      ctx.walkthrough + ctx.findings. The narrator's
+  //      buildBoopPrompt detects the multi-expert mode and
+  //      synthesizes from those instead of inlining the
+  //      lens files. The legacy single-LLM path is the
+  //      fallback when ctx.walkthrough is absent.
   if (typeof overrides.runOpenCodeSkill === "function") {
     const skillFn = overrides.runOpenCodeSkill;
     state.review = await skillFn(state.openrouterApiKey, ctx, deps);
   } else if (typeof overrides.narrate === "function") {
     state.review = await overrides.narrate(state.findings || [], ctx, deps);
   } else {
+    // Multi-expert path: forward the walkthrough + findings
+    // to the narrator. The single-LLM fallback ignores them.
+    const narrateCtx =
+      state.walkthrough || (state.findings && state.findings.length > 0)
+        ? { ...ctx, walkthrough: state.walkthrough, findings: state.findings }
+        : ctx;
     state.review = await defaultRunOpenCodeSkill(
       state.openrouterApiKey,
-      ctx,
+      narrateCtx,
       deps,
     );
   }

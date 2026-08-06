@@ -64,9 +64,13 @@ test("status stage labels match the user-visible surface (QUB-93)", () => {
 
 // --- sub-workflow --------------------------------------------------------
 
-test("REVIEW_SUB_STAGES is the review sub-workflow (classify, dispatch, gather, meta-review, narrate)", () => {
-  // Pinned by QUB-96. The sub-workflow is structurally
-  // present. Today the list has the five sub-stages:
+test("REVIEW_SUB_STAGES is the review sub-workflow (walkthrough, classify, dispatch, gather, meta-review, narrate)", () => {
+  // Pinned by QUB-96 + multi-expert. The sub-workflow is
+  // structurally present. Today the list has six
+  // sub-stages:
+  //   - walkthrough: independent LLM call that produces
+  //     a human-readable summary of the PR; every expert
+  //     consumes it as shared context.
   //   - classify (QUB-94): identify the PR type
   //   - dispatch (QUB-95): pick + run experts in parallel
   //   - gather (QUB-95): de-dupe the findings
@@ -76,7 +80,14 @@ test("REVIEW_SUB_STAGES is the review sub-workflow (classify, dispatch, gather, 
   //     inline comments
   assert.deepEqual(
     REVIEW_SUB_STAGES.map((s) => s.id),
-    ["classify", "dispatch", "gather", "meta-review", "narrate"],
+    [
+      "walkthrough",
+      "classify",
+      "dispatch",
+      "gather",
+      "meta-review",
+      "narrate",
+    ],
   );
 });
 
@@ -117,6 +128,15 @@ test("sub-stages are silent on the status thread (QUB-93)", () => {
 // orchestrator in index.mjs drives).
 function recordingDeps(overrides = {}) {
   const calls = { postStatus: [], log: [], errlog: [] };
+  // Default expert + walkthrough overrides. The real
+  // multi-expert sub-workflow makes OpenRouter SDK calls;
+  // the workflow tests don't drive those — they only
+  // exercise the orchestration. Providing canned
+  // overrides here keeps the tests fast and
+  // deterministic. Tests that want to assert on the
+  // expert / walkthrough bodies pass `overrides` and
+  // these defaults are overridden.
+  const defaultExpert = async () => ({ findings: [] });
   return {
     calls,
     fs: { readFile: async () => "fake" },
@@ -131,6 +151,23 @@ function recordingDeps(overrides = {}) {
     cloneRepo: async () => {},
     setOctokit: () => {},
     getOctokit: () => null,
+    // QUB-95 + multi-expert: walkthrough + expert overrides
+    // default to no-ops so the sub-workflow runs without
+    // making real LLM calls. Tests that want a real
+    // walkthrough or real expert findings pass them in
+    // `overrides`.
+    generateWalkthrough: async () => ({
+      walkthrough: "(test fixture walkthrough)",
+      telemetry: null,
+    }),
+    expertOverrides: {
+      "regression-hunter": defaultExpert,
+      "test-quality": defaultExpert,
+      "api-design": defaultExpert,
+      "error-handling": defaultExpert,
+      "design-pattern": defaultExpert,
+      "readability": defaultExpert,
+    },
     ...overrides,
   };
 }
@@ -1031,9 +1068,24 @@ test("meta-review's reDispatch names must be in EXPERT_POOL or runExperts throws
           metaReview: async () => ({ reDispatch: ["nonexistent-expert"] }),
           runExperts: async (names) => {
             // Use the real runExperts to exercise the
-            // "unknown expert" error path.
+            // "unknown expert" error path. The real
+            // runExperts reads `deps.expertOverrides`
+            // before EXPERT_POOL; the override map below
+            // mirrors the recordingDeps default so the
+            // names resolve, then the unknown name in
+            // reDispatch trips the error.
             const realExperts = await import("./experts.mjs");
-            return realExperts.runExperts(names, {}, {});
+            const stubExpert = async () => ({ findings: [] });
+            return realExperts.runExperts(names, {}, {
+              expertOverrides: {
+                "regression-hunter": stubExpert,
+                "test-quality": stubExpert,
+                "api-design": stubExpert,
+                "error-handling": stubExpert,
+                "design-pattern": stubExpert,
+                "readability": stubExpert,
+              },
+            });
           },
           narrate: async () => fakeReview(),
         },
@@ -1471,7 +1523,14 @@ test("runSubWorkflow records passed sub-stages in state.sub[macroId] (QUB-92)", 
     state,
   );
   assert.deepEqual(state.sub, {
-    sniff: ["classify", "dispatch", "gather", "meta-review", "narrate"],
+    sniff: [
+      "walkthrough",
+      "classify",
+      "dispatch",
+      "gather",
+      "meta-review",
+      "narrate",
+    ],
   });
 });
 
@@ -1532,8 +1591,8 @@ test("every short status label includes its emoji and matches the receiver (QUB-
     auth: "🤝 paw-shaken in",
     clone: "🥎 fetched",
     review: "👃 sniffing",
-    done: "💤 napped",
-    failed: "🔄 chased tail",
+    done: "🦴 bone delivered",
+    failed: "❌ lost the bone",
   };
   for (const [stage, label] of Object.entries(expected)) {
     assert.ok(
@@ -1561,8 +1620,8 @@ test("every status header line (STATUS map) carries the same emoji (QUB-93)", as
       auth: "🤝",
       clone: "🥎",
       review: "👃",
-      done: "💤",
-      failed: "🔄",
+      done: "🦴",
+      failed: "❌",
     }[stage];
     assert.ok(
       STATUS[stage].includes(expectedEmoji),

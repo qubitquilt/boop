@@ -18,6 +18,7 @@
 import { OpenRouter } from "@openrouter/sdk";
 import { LENS_FILES, OPENCODE_TIMEOUT_MS } from "./config.mjs";
 import { assertSafeRef, shortSha } from "./security.mjs";
+import { lintReview, summarize } from "./ste-lint.mjs";
 
 // runOpenCodeSkill is the orchestrator over buildBoopPrompt + the
 // OpenRouter SDK call. Returns { summary, inlineComments, confidence }
@@ -105,6 +106,23 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
 
   const review = parseReviewOutput(callResult.text);
   const telemetry = buildTelemetry(callResult);
+
+  // QUB-115: STE lint. The narrator is told to follow
+  // the rules in SKILL.md; the linter is the guard rail
+  // for the mechanical ones (contractions, semicolons,
+  // marketing adjectives, sentence length). The linter
+  // is best-effort: it logs warnings, it does not
+  // modify the output. A failure does not block the post.
+  if (review && review.summary) {
+    const reports = lintReview(review);
+    const flat = summarize(reports);
+    if (flat.length > 0) {
+      deps.log?.("ste-lint", "drift", {
+        count: flat.length,
+        sample: flat.slice(0, 5),
+      });
+    }
+  }
 
   deps.log("opencode", "exit", {
     killed: false,
@@ -450,6 +468,15 @@ export function stripOpenRouterPrefix(model) {
 export async function buildBoopPrompt(ctx, deps) {
   const { fs, paths, log } = deps;
 
+  // QUB-85: the file reads go through the rtk adapter when the
+  // adapter is present. The adapter is a transparent layer: it
+  // either shells out to `rtk read` (compression) or falls back to
+  // raw `fs.readFile` (binary missing or BOOP_RTK_DISABLED=1).
+  // `deps.rtk` is optional so tests that don't care about the
+  // adapter path can keep using the simpler shape.
+  const rtk = deps.rtk;
+  const reader = rtk ? (p) => rtk.readFile(p, "utf8") : (p) => fs.readFile(p, "utf8");
+
   // Read from the ConfigMap mount directly. The mount uses
   // `..data -> ..2026_...` indirection that can be transiently
   // inconsistent right after pod start, so retry a couple times
@@ -458,7 +485,7 @@ export async function buildBoopPrompt(ctx, deps) {
   const skillRetries = deps.retries ?? { skill: 5, lens: 5 };
   let skillBody;
   try {
-    skillBody = await readWithRetry(skillPath, fs, {
+    skillBody = await readWithRetry(skillPath, reader, {
       attempts: skillRetries.skill,
       onRetry: (n, err) =>
         log("skill", `read attempt ${n} failed`, {
@@ -473,6 +500,43 @@ export async function buildBoopPrompt(ctx, deps) {
     skillBody = "";
   }
 
+  // Read the persona file. The narrator samples a phrase
+  // from it (TL;DR opener, "What this PR does well"
+  // opener, or closing flourish) to add light personality
+  // to the review. The file is optional; a missing
+  // persona file means the narrator runs without flavor
+  // and the reviews look identical to the pre-persona
+  // version. A read failure is logged and continues, the
+  // same as the SKILL.md read.
+  const personaPath = `${paths.configSrc}/skills/boop/resources/persona.md`;
+  let personaBody = "";
+  try {
+    personaBody = await readWithRetry(personaPath, reader, {
+      attempts: skillRetries.skill,
+      onRetry: (n, err) =>
+        log("skill", `persona read attempt ${n} failed`, {
+          err: String(err?.message ?? err),
+        }),
+    });
+    log("skill", "loaded persona", { bytes: personaBody.length });
+  } catch (err) {
+    log("skill", "persona unreadable, continuing without", {
+      err: String(err?.message ?? err),
+    });
+  }
+
+  // QUB-95 + multi-expert: the narrator consumes the
+  // walkthrough (human-readable PR summary) and the expert
+  // findings (the source material) instead of inlining the
+  // lens files. The walkthrough + findings are produced by
+  // earlier sub-stages; the narrator synthesizes them into
+  // the structured block. When neither is provided (the
+  // legacy path or an override hook), fall back to the
+  // single-LLM path that walks the lens files itself.
+  const walkthrough = ctx.walkthrough || "";
+  const findings = Array.isArray(ctx.findings) ? ctx.findings : [];
+  const multiExpertMode = walkthrough.length > 0 || findings.length > 0;
+
   // Strip the frontmatter so the model sees a clean system-prompt-ish
   // block instead of duplicate yaml keys.
   const bodyNoFrontmatter = skillBody.replace(/^---[\s\S]*?---\n*/, "");
@@ -481,29 +545,38 @@ export async function buildBoopPrompt(ctx, deps) {
   // tells the model to "walk" each lens, but it can't read files in
   // this single-call flow — we have to deliver the content. Order
   // matches LENS_FILES (deterministic from the array).
-  const lensResults = await Promise.all(
-    LENS_FILES.map(async (rel) => {
-      const filePath = `${paths.configSrc}/skills/boop/${rel}`;
-      try {
-        const body = await readWithRetry(filePath, fs, {
-          attempts: skillRetries.lens,
-          onRetry: (n, err) =>
-            log("skill", `lens ${rel} attempt ${n} failed`, {
+  //
+  // QUB-95 + multi-expert: in the multi-expert path, the lens
+  // files are the per-expert checklists (one lens per
+  // expert LLM call). The narrator does not walk the lenses
+  // itself; the experts did. The narrator consumes the
+  // walkthrough + the findings. Skip the lens inlining when
+  // we are in the multi-expert path.
+  const lensResults = multiExpertMode
+    ? []
+    : await Promise.all(
+        LENS_FILES.map(async (rel) => {
+          const filePath = `${paths.configSrc}/skills/boop/${rel}`;
+          try {
+            const body = await readWithRetry(filePath, reader, {
+              attempts: skillRetries.lens,
+              onRetry: (n, err) =>
+                log("skill", `lens ${rel} attempt ${n} failed`, {
+                  err: String(err?.message ?? err),
+                }),
+            });
+            log("skill", "loaded lens", { rel, bytes: body.length });
+            const cleaned = body.replace(/^---[\s\S]*?---\n*/, "").trim();
+            const label = rel.split("/").pop().replace(/\.md$/, "");
+            return { rel, label, cleaned };
+          } catch (err) {
+            log("skill", `failed to load lens ${rel}`, {
               err: String(err?.message ?? err),
-            }),
-        });
-        log("skill", "loaded lens", { rel, bytes: body.length });
-        const cleaned = body.replace(/^---[\s\S]*?---\n*/, "").trim();
-        const label = rel.split("/").pop().replace(/\.md$/, "");
-        return { rel, label, cleaned };
-      } catch (err) {
-        log("skill", `failed to load lens ${rel}`, {
-          err: String(err?.message ?? err),
-        });
-        return null;
-      }
-    }),
-  );
+            });
+            return null;
+          }
+        }),
+      );
 
   const lensBlocks = lensResults
     .filter((r) => r && r.cleaned)
@@ -623,11 +696,27 @@ export async function buildBoopPrompt(ctx, deps) {
     "## Skill: boop (orchestrator)",
     "",
     bodyNoFrontmatter.trim(),
-    "",
-    "## Lenses (read each, apply the checklist, capture findings)",
-    "",
-    lensBlocks.join("\n\n---\n\n"),
-    "",
+    multiExpertMode
+      ? ""
+      : [
+          "",
+          "## Lenses (read each, apply the checklist, capture findings)",
+          "",
+          lensBlocks.join("\n\n---\n\n"),
+          "",
+        ].join("\n"),
+    personaBody
+      ? [
+          "",
+          "## Boop's bark (persona, optional)",
+          "",
+          // Strip frontmatter (none in the persona file, but
+          // be defensive). The narrator reads this and
+          // samples one phrase per review.
+          personaBody.replace(/^---[\s\S]*?---\n*/, "").trim(),
+          "",
+        ].join("\n")
+      : "",
     "---",
     "",
     // PR-controlled data starts here. The "DATA" header is the
@@ -652,9 +741,40 @@ export async function buildBoopPrompt(ctx, deps) {
     `diff_hint: ${diffHint}`,
     "```",
     "",
-    "Use the orchestrator and the lenses above to do the actual review. " +
-      "When done, emit the SUMMARY / INLINE COMMENTS / CONFIDENCE / END " +
-      "block as the LAST thing in your response.",
+    multiExpertMode
+      ? [
+          // Multi-expert path: the LLM is the narrator, not
+          // the lens walker. The walkthrough is the
+          // human-readable summary of the PR; the findings
+          // are the source material the narrator
+          // synthesizes. The narrator does not need to walk
+          // the lenses — the experts did.
+          "## Walkthrough (human-readable summary of the PR)",
+          "",
+          walkthrough,
+          "",
+          "## Expert findings (source material to synthesize)",
+          "",
+          findings.length > 0
+            ? findings
+                .map(
+                  (f, i) =>
+                    `${i + 1}. **[${f.expert || "expert"} | ${f.severity || "info"}]** ${f.title || "(no title)"}\n` +
+                    `   ${f.path ? `path: ${f.path}${Number.isInteger(f.line) ? `:${f.line}` : ""}\n` : ""}` +
+                    `   ${f.body || ""}`,
+                )
+                .join("\n\n")
+            : "(no findings; the experts reported nothing to flag)",
+          "",
+          "Use the walkthrough as the orientation, the findings as the source material, " +
+            "and the orchestrator above for the synthesis rules. " +
+            "Do not re-state what the PR does — the walkthrough already says that. " +
+            "Synthesize the findings into a coherent review. " +
+            "When done, emit the SUMMARY / INLINE COMMENTS / CONFIDENCE / END block as the LAST thing in your response.",
+        ].join("\n")
+      : "Use the orchestrator and the lenses above to do the actual review. " +
+          "When done, emit the SUMMARY / INLINE COMMENTS / CONFIDENCE / END " +
+          "block as the LAST thing in your response.",
   ].join("\n");
 }
 
@@ -662,16 +782,22 @@ export async function buildBoopPrompt(ctx, deps) {
 // absorb the ConfigMap mount's `..data -> ..2026_…` symlink race
 // right after pod start.
 //
+// The `reader` argument is the read function — either `fs.readFile`
+// (raw) or the rtk adapter's `readFile`. The adapter is the
+// preferred path under QUB-85; the raw path is the fallback when
+// the adapter is absent (older test fixtures) or when the
+// adapter is in "raw" mode (binary missing, BOOP_RTK_DISABLED=1).
+//
 // Failures are surfaced to the caller via `onRetry` so it can log
 // progress (the original implementation logged per attempt); the
 // function itself stays logger-agnostic. `attempts` defaults to 5
 // but is overridable via deps.retries (tests pass 1 to skip the
 // backoff and exercise the error path immediately).
-async function readWithRetry(path, fs, { attempts = 5, onRetry } = {}) {
+async function readWithRetry(path, reader, { attempts = 5, onRetry } = {}) {
   let lastErr;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return await fs.readFile(path, "utf8");
+      return await reader(path);
     } catch (err) {
       lastErr = err;
       if (attempt < attempts) {

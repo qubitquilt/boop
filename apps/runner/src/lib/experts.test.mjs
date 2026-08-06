@@ -132,12 +132,30 @@ test("runExperts throws on an unknown expert name", async () => {
 });
 
 test("runExperts concatenates findings from every expert", async () => {
-  // The default stub experts each emit one finding. The
-  // returned findings list is the concatenation.
+  // The default experts are real LLM calls (QUB-95 +
+  // multi-expert). For this test we inject canned experts
+  // via deps.expertOverrides so the assertion is
+  // deterministic. The default-expert behavior is covered
+  // in lib/walkthrough.test.mjs and the real-expert
+  // prompt-shape tests below.
+  const deps = {
+    expertOverrides: {
+      "regression-hunter": async () => ({
+        findings: [
+          { id: "a", expert: "regression-hunter", severity: "info", title: "A", body: "a" },
+        ],
+      }),
+      "test-quality": async () => ({
+        findings: [
+          { id: "b", expert: "test-quality", severity: "info", title: "B", body: "b" },
+        ],
+      }),
+    },
+  };
   const findings = await runExperts(
     ["regression-hunter", "test-quality"],
     {},
-    {},
+    deps,
   );
   assert.equal(findings.length, 2);
   const expertNames = findings.map((f) => f.expert);

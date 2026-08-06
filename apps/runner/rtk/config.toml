@@ -1,0 +1,59 @@
+# rtk configuration for the boop runner.
+#
+# Baked into the runner image at /home/opencode/.config/rtk/config.toml.
+# The runner image's rtk invocations read this file; nothing here is
+# PR-controlled.
+#
+# The values below match the QUB-85 acceptance: telemetry is off, tee
+# lands in a known path under the workdir, and the `failures` mode keeps
+# the tee directory small (rtk only writes when a command exits non-zero).
+[tracking]
+enabled = true
+history_days = 7
+
+[display]
+colors = false
+emoji = false
+max_width = 120
+
+[filters]
+ignore_dirs = [
+  ".git",
+  "node_modules",
+  "target",
+  "__pycache__",
+  ".venv",
+  "vendor",
+  "dist",
+  "build",
+  ".next",
+  ".turbo",
+]
+ignore_files = [
+  "*.lock",
+  "*.min.js",
+  "*.min.css",
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+]
+
+[tee]
+enabled = true
+mode = "failures"
+max_files = 5
+max_file_size = 524288
+
+[telemetry]
+enabled = false
+
+[hooks]
+exclude_commands = []
+transparent_prefixes = []
+
+[limits]
+grep_max_results = 100
+grep_max_per_file = 15
+status_max_files = 10
+status_max_untracked = 5
+passthrough_max_chars = 2000

@@ -40,10 +40,12 @@ import { runStages } from "./lib/workflow.mjs";
 import {
   postStatus,
   ensureStatusComment,
+  postFinalReaction,
   readWorkflowState,
   writeWorkflowState,
 } from "./lib/github.mjs";
 import { postStatus as postDashboardStatus, postTelemetry } from "./lib/dashboard.mjs";
+import { createRtkAdapter } from "./lib/rtk.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -160,10 +162,36 @@ export async function run(env = process.env, overrides = {}) {
   // of this function and rely on the netrc + gitconfig cleanup
   // hooks (see writeNetrc / writeGitconfig in lib/git.mjs) to make
   // any persistent copy unreachable.
+  //
+  // QUB-85: the rtk adapter wraps every file read the lenses do.
+  // Constructed here (after `fs` and `execFile` are known) and
+  // attached to `deps.rtk` so `buildBoopPrompt` and any future
+  // lens can route reads through it. The adapter is the single
+  // place rtk is invoked; the `BOOP_RTK_DISABLED=1` env var is
+  // the operator kill switch.
+  const rtkAdapter = createRtkAdapter({
+    execFile: overrides.execFile ?? execFileAsync,
+    env,
+    fs: overrides.fs ?? fs,
+    log: log.log,
+    disabled: ctx.rtkDisabled,
+  });
   const deps = {
     ...makeDeps(ctx, log, cleanup),
     ...overrides, // overrides.spawnFn, .execFile, .fetchImpl, .jwt, .fs
+    rtk: rtkAdapter,
   };
+
+  // Log the resolved adapter mode on startup so an operator can
+  // confirm rtk is in the expected path without waiting for the
+  // first file read.
+  const rtkState = await rtkAdapter.init();
+  log.log("rtk", "adapter initialised", {
+    source: rtkState.source,
+    binary: rtkState.binary,
+    reason: rtkState.reason,
+    disabled: ctx.rtkDisabled,
+  });
 
   // Validate every PR-controlled refname BEFORE it touches `git` or
   // any subprocess argv. validateBaseRef in the receiver is the
@@ -304,11 +332,31 @@ export async function run(env = process.env, overrides = {}) {
     // Dashboard data layer: POST final telemetry (token usage
     // + cost) once the review is fully posted. Best-effort —
     // failures are logged inside postTelemetry.
+    //
+    // QUB-95 + multi-expert: the multi-expert sub-workflow
+    // makes N+1 LLM calls (1 walkthrough + N experts). The
+    // final review's `state.review.telemetry` is the
+    // narrator's call (the last one). The walkthrough's
+    // and experts' telemetry lives on `state.walkthroughTelemetry`
+    // and inside each expert's response. The dashboard
+    // sums them on display; we POST the narrator's telemetry
+    // as the primary row here. A future PR can roll the
+    // per-stage telemetry into a single shape before posting.
     if (state.review && state.review.telemetry) {
       await postTelemetry(state.review.telemetry, ctx, { log: log.log, fetchImpl: deps.fetchImpl });
     }
     await postDashboardStatus("done", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
     await deps.postStatus("done");
+    // QUB-114: in reaction mode (issue_comment-triggered
+    // re-review), the runner does not post or PATCH a status
+    // comment. The author already saw the 👀 reaction the
+    // receiver added; the runner adds a single terminal
+    // reaction (🦴 on done, ❌ on failed) on the trigger
+    // comment. The final-reaction call is best-effort; a
+    // failure is logged and does not affect the run.
+    if (ctx.noStatusComment) {
+      await postFinalReaction("done", ctx, deps);
+    }
   } catch (err) {
     log.errlog("review", "staged workflow failed", { error: String(err?.message ?? err) });
     // Best-effort dashboard status so the dashboard's live
@@ -323,6 +371,9 @@ export async function run(env = process.env, overrides = {}) {
       reason,
     });
     await deps.postStatus("failed", reason);
+    if (ctx.noStatusComment) {
+      await postFinalReaction("failed", ctx, deps);
+    }
     throw err;
   } finally {
     // Always scrub credentials and tmp artefacts, even on failure.

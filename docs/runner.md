@@ -39,10 +39,14 @@ apps/runner/
 │       ├── dashboard.mjs          # postTelemetry, postDashboardStatus — data-layer hooks
 │       ├── classify.mjs           # PR classifier stub (QUB-94 sub-workflow)
 │       ├── experts.mjs            # multi-expert review (QUB-95), meta-review (QUB-96)
+│       ├── rtk.mjs                # rtk adapter (QUB-85) — readFile with rtk + raw fallback
 │       ├── workflow.mjs           # macro + sub-workflow executor
 │       └── github.mjs             # mintInstallationToken, postStatus, postReview, postInlineComments, cleanupPriorReview
+├── rtk/
+│   ├── config.toml                # rtk runtime config (baked into the image)
+│   └── filters.toml               # boop custom filter (trusted at build time)
 ├── package.json                   # @octokit/rest, @openrouter/sdk, jsonwebtoken
-├── Dockerfile                     # ubuntu 24.04, node 22, npm ci
+├── Dockerfile                     # ubuntu 24.04, node 22, rtk 0.44.2, npm ci
 └── Makefile                       # install / build / docker
 ```
 
@@ -85,6 +89,8 @@ Required env vars (provided by the Job template, see [receiver.md](./receiver.md
 | `BOOP_REVIEW_NUMBER` | Job template | 1-based index of this review; used for the `re-review #N` header |
 | `BOOP_BOT_LOGIN` | `BOT_LOGIN` on receiver | GitHub login of the bot App (e.g. `booppr[bot]`). When set on a re-review, the runner resolves outdated Boop review threads and minimizes prior Boop issue comments. |
 | `BOOP_SKIP_SKILL` | Job template | `1` for a minimal-prompt smoke test (debug only) |
+| `BOOP_RTK_DISABLED` | Job template | `1` to bypass the [rtk adapter](#rtk-adapter-qub-85) — the runner's file reads go straight to `fs.readFile`, the pre-QUB-85 behavior. Use to reproduce a regression or to debug a poisoned rtk install without rebuilding the image. |
+| `BOOP_NO_STATUS_COMMENT` | Job template | `1` to skip the status comment surface and use reactions on the trigger comment instead (QUB-114). The receiver sets this on issue_comment triggers; the runner does NOT post or PATCH a status comment, and adds a single terminal reaction (💤 on done, 🔄 on failed) on the trigger comment. |
 
 The runner exits 1 if any required env var is missing. The Job template
 sets all of them; if a value is missing the Job fails to start.
@@ -113,6 +119,23 @@ Each `postStatus(stage, detail)` PATCHes the existing status comment
 additively: a `<!-- boop-timeline -->` separator splits the receiver's
 header from the runner's timeline. Earlier entries are trimmed if the
 combined body exceeds 60 KB.
+
+**QUB-114 — reaction mode on issue_comment triggers.** When the
+review is triggered by an issue comment (the user wrote
+`@BoopPr review` on a PR), the receiver sets
+`BOOP_NO_STATUS_COMMENT=1` and the runner skips the entire
+status-comment path. The author already saw the 👀 reaction
+the receiver added; the runner does NOT create or PATCH a
+status comment, and no interim PATCHes happen. The runner
+adds a single terminal reaction to the trigger comment
+via `postFinalReaction`:
+
+- Done → 💤 (zzz) reaction
+- Failed → 🔄 (recycle) reaction
+
+The author's view on a comment-triggered re-review is
+`👀` → `💤` (or `🔄`). One reaction change, one
+notification, no PATCH loop.
 
 On any error, `postStatus("failed", err.message)` runs and the runner
 exits 1. The Job's `activeDeadlineSeconds=1800` is the wall-clock
@@ -170,28 +193,56 @@ to be in the call regardless).
 
 ## Prompt construction (`buildBoopPrompt`)
 
-The orchestrator (`skills/boop/SKILL.md`) and each of the seven lenses
-(`skills/boop/agents/review-*.md`) are read from the ConfigMap mount at
-`/home/opencode/.config/opencode` and inlined into the prompt. The
-runner reads **directly from the source mount**; no writable copy.
-The `..data -> ..2026_…` symlink can be transiently inconsistent right
-after pod start, so each read retries with a 1s linear backoff (5
-attempts).
+The runner uses a six-stage pipeline (QUB-95 + multi-expert):
+walkthrough → pick experts → dispatch → gather → meta-review
+→ narrate. Three LLM prompt templates are in play:
 
-Frontmatter (`---\n…\n---\n`) is stripped from each file before inlining
-so the model sees clean prompt content.
+1. **Walkthrough** — `lib/walkthrough.mjs:buildWalkthroughPrompt`.
+   One LLM call reads the diff and produces a 10–20 sentence
+   human-readable summary. The expert sub-agents consume it
+   as shared context.
+2. **Expert dispatch** — `lib/experts.mjs:buildExpertPrompt`.
+   Each expert is one LLM call. The system prompt is the
+   expert's lens file (`agents/review-<expert>.md`). The user
+   message is the walkthrough + the diff + the PR context.
+   The expert returns JSON: `{ findings: Finding[] }`.
+3. **Narrator** — `lib/openrouter.mjs:buildBoopPrompt`. The
+   final LLM call synthesizes the walkthrough + the gathered
+   expert findings into the structured block. The
+   narrator does not walk the lenses (the experts did).
 
-The final prompt has the structure:
+The orchestrator (`skills/boop/SKILL.md`) is read from the
+ConfigMap mount at `/home/opencode/.config/opencode` and
+inlined into the narrator's prompt. The lens files are
+read into the per-expert prompts (one per call) — they
+are not inlined into the narrator's prompt. The
+`..data -> ..2026_…` symlink can be transiently
+inconsistent right after pod start, so each read retries
+with a 1s linear backoff (5 attempts).
 
-1. Role: "You are a code reviewer for the BoopPr GitHub App. ..."
+Frontmatter (`---\n…\n---\n`) is stripped from each file
+before inlining so the model sees clean prompt content.
+
+The reads go through the [rtk adapter](#rtk-adapter-qub-85) (QUB-85).
+The adapter shells out to `rtk read` for compression; when rtk is
+disabled or the binary is missing the reads fall back to raw
+`fs.readFile`. The adapter is transparent to the rest of the runner.
+
+The narrator's prompt (the only one the orchestrator
+runner module builds) has the structure:
+
+1. Role: "You are the narrator for the BoopPr GitHub App's
+   multi-expert review. ..."
 2. Output format spec (the `=== SUMMARY ===` / `=== INLINE COMMENTS ===`
    / `=== END ===` block — see
    [output format](./webhook-contract.md#output-format)).
 3. Output rules: 3-8 inline comments, line numbers refer to file *after*
    diff, only on added/modified lines, no empty sections.
-4. Orchestrator (boop skill body, frontmatter stripped).
-5. Each lens as a labeled `### Lens: <name>` block.
-6. PR context (owner/repo, PR number, head SHA, base ref, working dir).
+4. Orchestrator (boop skill body, frontmatter stripped). Describes
+   the narrator's role: synthesize, do not re-walk.
+5. Walkthrough (human-readable summary of the PR — see below).
+6. Expert findings (the source material to synthesize).
+7. PR context (owner/repo, PR number, head SHA, base ref, working dir).
 
 ## Output parsing (`parseReviewOutput`)
 
@@ -295,13 +346,50 @@ Tests are granular — one file per module under `src/lib/`:
 - `src/lib/log.test.mjs` — `makeLogger` shape and JSON stamping.
 - `src/lib/security.test.mjs` — `assertSafeRef`, `assertSafeSha`, `shortSha`, `readSecretFile`.
 - `src/lib/git.test.mjs` — `createCleanupRegistry` (parallel + idempotent) and `cloneRepo` (with mock fs + execFile; verifies each git argv, env, and the netrc/gitconfig content).
-- `src/lib/openrouter.test.mjs` — `callOpenRouter` (fake client, success / 4xx / abort / no text / token mapping), `buildTelemetry` (success / failure stamp), `parseReviewOutput` (structure sanity check + the five 2026-08-03 failure shapes), `buildBoopPrompt` (mock fs; verifies H5 markers, lens ordering, frontmatter stripping, re-review vs first-review diff range, `stripOpenRouterPrefix`), and `runOpenCodeSkill` (SDK branch happy path, SDK failure, AbortError).
+- `src/lib/openrouter.test.mjs` — `callOpenRouter` (fake client, success / 4xx / abort / no text / token mapping), `buildTelemetry` (success / failure stamp), `parseReviewOutput` (structure sanity check + the five 2026-08-03 failure shapes), `buildBoopPrompt` (mock fs; verifies H5 markers, lens ordering, frontmatter stripping, re-review vs first-review diff range, `stripOpenRouterPrefix`, and the QUB-85 rtk-adapter path), and `runOpenCodeSkill` (SDK branch happy path, SDK failure, AbortError).
+- `src/lib/rtk.test.mjs` — `createRtkAdapter` (QUB-85: BOOP_RTK_DISABLED bypass, missing-binary fallback, rtk CLI shape, per-call overrides, rtk-failure raw fallback, init memoisation, source getter, single-fallback-log, custom binary name).
 - `src/lib/github.test.mjs` — `mintInstallationToken`, `postStatus`, `postReview`, `postInlineComments` (parallel + partial failures), `cleanupPriorReview` (parallel fetches + pagination + error counting).
 
 `src/index.test.mjs` is the integration test: it drives `run(env, overrides)` end-to-end with every side effect stubbed — fetch returns canned responses, Octokit is a recording fake, `spawn` and `execFile` are stubs, `runOpenCodeSkill` returns a canned review — and asserts the orchestration order (auth → review → done), failure paths, re-review cleanup gating, and defense-in-depth gates.
 
 The `review-header.test.mjs` mirrors
 `apps/receiver/internal/github/review_header_test.go` — change one, change both.
+
+## rtk adapter (QUB-85)
+
+The runner's file reads (today: the SKILL.md and the seven lens files
+from the ConfigMap mount) go through the rtk adapter in
+`src/lib/rtk.mjs`. The adapter is the single place the runner shells
+out to `rtk read`; it routes reads through rtk when the binary is
+present and falls back to raw `fs.readFile` when rtk is missing or
+disabled. The runner-side kill switch is `BOOP_RTK_DISABLED=1`; the
+rtk-side kill switch is `RTK_DISABLED=1` on the per-call execFile
+env (also wired). Both are belt-and-suspenders: a future config edit
+that re-enables rtk on one side does not bypass the other.
+
+The image ships the rtk binary at `/usr/local/bin/rtk`, the
+`config.toml` at `/home/opencode/.config/rtk/config.toml`, and the
+custom `filters.toml` at `/home/opencode/.config/rtk/filters.toml`.
+The custom filter (`boop-review-read`) caps the lens file reads at
+400 lines and 500 chars/line so a runaway file cannot blow up the
+prompt context. The trust store at
+`/home/opencode/.local/share/rtk/trusted_filters.json` is populated
+at image build (`rtk trust --yes`) so the filter is on the trust
+list the moment the pod starts — no interactive prompt, no first-run
+gap.
+
+Telemetry is killed at three layers: the config's
+`[telemetry] enabled = false`, the baked env
+`RTK_TELEMETRY_DISABLED=1`, and the per-call
+`RTK_TELEMETRY_DISABLED=1` the adapter forwards. Tee lands at
+`/work/rtk-tee` (an `RTK_TEE_DIR` env var) in `failures` mode so a
+crashed rtk call's recovery hint stays in the same namespace the pod
+owns.
+
+The adapter's resolved mode (`rtk` or `raw`, plus the resolved
+binary path or fallback reason) is logged on startup so an
+operator tailing the pod can confirm rtk is in the expected path
+without waiting for the first file read.
 
 ## Build
 
@@ -310,9 +398,15 @@ make docker-build IMAGE=ghcr.io/qubitquilt/boop-runner:dev
 make docker-push
 ```
 
-The Dockerfile is `linux/arm64` only (the `boop-runner-set` Actions
-runner is arm64; the cluster nodes are arm64). Multi-arch would require
-a QEMU buildx setup; not currently configured.
+The Dockerfile supports `linux/amd64` and `linux/arm64` (QUB-85
+acceptance). The current `boop-runner-set` Actions runner is arm64
+and the cluster nodes are arm64, so the workflow pins
+`platforms: linux/arm64`. The Dockerfile's rtk install RUN
+selects the right prebuilt tarball from the GitHub release per
+`TARGETARCH` and verifies a pinned SHA-256. To flip the workflow
+to multi-arch, set `platforms: linux/amd64,linux/arm64` and the
+existing per-arch buildx invocation will exercise the second
+branch.
 
 `npm install` runs `os=linux --cpu=arm64` so npm pulls the right native
 binaries for the platform (the `@openrouter/sdk` postinstall has a
