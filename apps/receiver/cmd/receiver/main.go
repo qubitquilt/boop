@@ -16,6 +16,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	boopgithub "github.com/michaelruelas/boop-receiver/internal/github"
 	"github.com/michaelruelas/boop-receiver/internal/webhook"
+	"github.com/michaelruelas/boop-receiver/internal/dashboard"
 )
 
 func main() {
@@ -136,6 +137,23 @@ func main() {
 	// Per-lens telemetry (Phase 4's "lens is the row grain"
 	// rule). Batch replace — re-runs land on the same shape.
 	mux.HandleFunc("POST /api/runs/{id}/lens_telemetry", h.RecordLensTelemetry)
+
+	// QUB-111: dashboard. The BOOP_DASHBOARD_TOKEN env
+	// var gates the /dashboard/* routes; an empty value
+	// keeps the dashboard disabled (every request 401)
+	// so a fresh install does not accidentally expose
+	// the operator UI.
+	dashboardToken := os.Getenv("BOOP_DASHBOARD_TOKEN")
+	if dashboardToken == "" {
+		logger.Warn("BOOP_DASHBOARD_TOKEN is unset: /dashboard/* will return 401 (operator UI is opt-in)")
+	}
+	dash, err := dashboard.NewHandler(h.Store(), logger, dashboardToken)
+	if err != nil {
+		logger.Error("init dashboard", "err", err)
+		os.Exit(1)
+	}
+	dash.RegisterRoutes(mux)
+	mux.HandleFunc("GET /dashboard/health", dash.Health)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

@@ -1,0 +1,46 @@
+{{define "title"}}Live ops — Boop Dashboard{{end}}
+{{define "content"}}
+<h2>Live ops</h2>
+<p>Currently running jobs and the stuck-runs panel. Stuck = status=running with no heartbeat in the last 2 minutes.</p>
+
+<h3>Running</h3>
+{{if .Running}}
+<table>
+  <thead><tr><th>Run</th><th>Owner/Repo</th><th>PR</th><th>Started</th><th>Last heartbeat</th></tr></thead>
+  <tbody>
+    {{range .Running}}
+    <tr>
+      <td><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a></td>
+      <td>{{.Owner}}/{{.Repo}}</td>
+      <td>#{{.PRNumber}}</td>
+      <td>{{.StartedAt}}</td>
+      <td>{{.LastHeartbeatAt}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No jobs are running.</div>
+{{end}}
+
+<h3>Stuck</h3>
+{{if .Stuck}}
+<table>
+  <thead><tr><th>Run</th><th>Owner/Repo</th><th>PR</th><th>Last heartbeat</th><th>Silent for</th></tr></thead>
+  <tbody>
+    {{range .Stuck}}
+    <tr class="stuck">
+      <td><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a></td>
+      <td>{{.Owner}}/{{.Repo}}</td>
+      <td>#{{.PRNumber}}</td>
+      <td>{{.LastHeartbeatAt}}</td>
+      <td>{{.SilentFor}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No stuck runs.</div>
+{{end}}
+{{end}}
+{{template "layout" .}}
