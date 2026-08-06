@@ -127,6 +127,15 @@ func main() {
 	mux.HandleFunc("GET /api/stats", h.Stats)
 	mux.HandleFunc("POST /api/runs/{id}/telemetry", h.RecordTelemetry)
 	mux.HandleFunc("POST /api/runs/{id}/status", h.RecordStatus)
+	// QUB-109: runner instrumentation. Stage POSTs (the
+	// waterfall) and 30s heartbeats (the stuck-runs panel)
+	// are receiver-stamped; the runner's clock is never the
+	// source of truth.
+	mux.HandleFunc("POST /api/runs/{id}/stages", h.RecordStage)
+	mux.HandleFunc("POST /api/runs/{id}/heartbeat", h.RecordHeartbeat)
+	// Per-lens telemetry (Phase 4's "lens is the row grain"
+	// rule). Batch replace — re-runs land on the same shape.
+	mux.HandleFunc("POST /api/runs/{id}/lens_telemetry", h.RecordLensTelemetry)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

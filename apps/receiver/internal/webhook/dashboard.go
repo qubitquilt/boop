@@ -453,6 +453,208 @@ func (h *Handler) checkRunnerToken(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(h.cfg.RunnerToken)) == 1
 }
 
+// stageRequest is the body of POST /api/runs/:id/stages.
+// The runner POSTs at each stage transition; the receiver
+// stamps the row with the server's clock so the waterfall
+// is on one clock across all stages (Phase 2's load-bearing
+// correctness rule).
+//
+// The runner MAY send client_started_at; it is intentionally
+// ignored. The only thing the runner contributes is the stage
+// name, the meta blob, and the "this is the end of the stage"
+// signal (ended=true). The receiver's clock is authoritative
+// for both started_at and ended_at.
+type stageRequest struct {
+	Stage  string `json:"stage"`
+	Ended  bool   `json:"ended,omitempty"`
+	Meta   string `json:"meta,omitempty"`
+}
+
+// RecordStage handles POST /api/runs/:id/stages. The runner
+// fires this at every stage transition; the receiver
+// stamps the row with its own clock so the dashboard's
+// waterfall is consistent across stages that span pods
+// (hmac_verify runs in the receiver, pod_schedule runs in
+// the K8s API, comment_post runs in the runner — they all
+// need to be on the same wall clock for the bars to line
+// up).
+//
+// Auth is the same X-BOOP-Runner-Token shared with the
+// other runner endpoints.
+func (h *Handler) RecordStage(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		http.Error(w, "data layer disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if !h.checkRunnerToken(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "missing run id", http.StatusBadRequest)
+		return
+	}
+	var body stageRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	if body.Stage == "" {
+		http.Error(w, "stage is required", http.StatusBadRequest)
+		return
+	}
+	now := time.Now().UTC()
+	stage := store.RunStage{
+		RunID:     id,
+		Stage:     body.Stage,
+		StartedAt: now,
+	}
+	if body.Ended {
+		// Duration is 0 on the first "ended" POST because
+		// the start was just stamped in the same second.
+		// The waterfall renders "<1s" for sub-second bars
+		// rather than "0s", which is what an operator
+		// would see as "instant" rather than "missing".
+		dur := int64(0)
+		stage.EndedAt = &now
+		stage.DurationMS = &dur
+	}
+	if _, err := h.store.UpsertRunStage(r.Context(), stage); err != nil {
+		h.logger.Warn("record stage", "run", id, "stage", body.Stage, "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// RecordHeartbeat handles POST /api/runs/:id/heartbeat.
+// The runner posts every 30s while a review is in flight;
+// the receiver updates runs.last_heartbeat_at to now (its
+// own clock) and the stuck-runs panel reads the gap. A
+// 2-minute gap with status=running = "stuck".
+//
+// Auth is the same X-BOOP-Runner-Token.
+//
+// 202 (run not yet persisted) is returned for a run the
+// receiver hasn't seen yet — the runner will retry on the
+// next tick. 204 on success.
+func (h *Handler) RecordHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		http.Error(w, "data layer disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if !h.checkRunnerToken(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "missing run id", http.StatusBadRequest)
+		return
+	}
+	if err := h.store.TouchRunHeartbeat(r.Context(), id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		h.logger.Warn("record heartbeat", "run", id, "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// lensTelemetryRequest is the body of POST
+// /api/runs/:id/lens_telemetry. The runner posts an array
+// of per-lens rollups at the end of a run; the receiver
+// records each row with the server's clock for started_at
+// consistency.
+//
+// The Lens field is the lens name (security, deep, style,
+// etc.); Model/Provider mirror the aggregate telemetry's
+// shape so the dashboard can render one row per lens
+// without joining. Tokens and CostUSD are this lens's
+// contribution; the aggregate telemetry row stores the
+// total.
+type lensTelemetryRequest struct {
+	Lens       string  `json:"lens"`
+	Model      string  `json:"model,omitempty"`
+	Provider   string  `json:"provider,omitempty"`
+	InputTokens      int64   `json:"input_tokens"`
+	OutputTokens     int64   `json:"output_tokens"`
+	ReasoningTokens  int64   `json:"reasoning_tokens"`
+	CacheReadTokens  int64   `json:"cache_read_tokens"`
+	CacheWriteTokens int64   `json:"cache_write_tokens"`
+	CostUSD          float64 `json:"cost_usd"`
+	StepCount        int     `json:"step_count"`
+}
+
+// lensTelemetryBatchRequest is the body of POST
+// /api/runs/:id/lens_telemetry. The runner accumulates per-
+// lens rollups across the run and posts them as a single
+// batch at end-of-run. The array is replaced atomically
+// (DELETE + INSERT) so a re-run lands on the same shape
+// the dashboard expects.
+type lensTelemetryBatchRequest struct {
+	Lenses []lensTelemetryRequest `json:"lenses"`
+}
+
+// RecordLensTelemetry handles POST /api/runs/:id/lens_telemetry.
+// The runner parses `lens: <name>` markers from the
+// orchestrator's output and POSTs one row per lens. The
+// receiver REPLACES the per-lens rows for the run so a
+// re-run / re-delivery lands on the same shape the
+// dashboard expects.
+//
+// Auth is the same X-BOOP-Runner-Token.
+func (h *Handler) RecordLensTelemetry(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		http.Error(w, "data layer disabled", http.StatusServiceUnavailable)
+		return
+	}
+	if !h.checkRunnerToken(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "missing run id", http.StatusBadRequest)
+		return
+	}
+	var body lensTelemetryBatchRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
+		http.Error(w, "bad json", http.StatusBadRequest)
+		return
+	}
+	rows := make([]store.LensTelemetry, 0, len(body.Lenses))
+	for _, l := range body.Lenses {
+		if l.Lens == "" {
+			http.Error(w, "lens is required", http.StatusBadRequest)
+			return
+		}
+		rows = append(rows, store.LensTelemetry{
+			RunID:            id,
+			Lens:             l.Lens,
+			Model:            l.Model,
+			Provider:         l.Provider,
+			InputTokens:      l.InputTokens,
+			OutputTokens:     l.OutputTokens,
+			ReasoningTokens:  l.ReasoningTokens,
+			CacheReadTokens:  l.CacheReadTokens,
+			CacheWriteTokens: l.CacheWriteTokens,
+			CostUSD:          l.CostUSD,
+			StepCount:        l.StepCount,
+		})
+	}
+	if err := h.store.ReplaceLensTelemetry(r.Context(), id, rows); err != nil {
+		h.logger.Warn("record lens telemetry", "run", id, "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // startInstallationsPoller kicks off a background goroutine that
 // refreshes the installations table from GitHub on a fixed
 // interval. The poller is best-effort: a transient GitHub API

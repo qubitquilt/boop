@@ -729,6 +729,13 @@ func TestRunRetention_PrunesAndCheckpoints(t *testing.T) {
 }
 
 func ptrInt64(v int64) *int64 { return &v }
+func ptr(t time.Time) *time.Time { return &t }
+func diff(a, b float64) float64 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
 
 // QUB-108: failure_class round-trip. The reconciler writes
 // the K8s container exit reason into this column; the
@@ -899,5 +906,134 @@ func TestRecordRefund_AppendOnly(t *testing.T) {
 	// Newest first.
 	if got[0].Tokens != 50 || got[2].Tokens != 100 {
 		t.Errorf("ordering broken: got[0]=%d got[2]=%d", got[0].Tokens, got[2].Tokens)
+	}
+}
+
+// QUB-109: lens telemetry is replaced atomically. The
+// runner's at-least-once delivery is safe — a re-run
+// lands on the same shape the dashboard expects.
+func TestReplaceLensTelemetry_AtomicReplace(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := "boop-a-b-1-aaaaaaa"
+	if _, err := s.UpsertRun(ctx, sampleRun(id, "a", "b", 1, "aaaaaaa", StatusSucceeded, time.Now())); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	first := []LensTelemetry{
+		{RunID: id, Lens: "security", CostUSD: 0.05, InputTokens: 100, OutputTokens: 50},
+		{RunID: id, Lens: "deep", CostUSD: 0.20, InputTokens: 400, OutputTokens: 200},
+	}
+	if err := s.ReplaceLensTelemetry(ctx, id, first); err != nil {
+		t.Fatalf("first replace: %v", err)
+	}
+	// Re-run with a different cost profile.
+	second := []LensTelemetry{
+		{RunID: id, Lens: "security", CostUSD: 0.04, InputTokens: 80, OutputTokens: 40},
+	}
+	if err := s.ReplaceLensTelemetry(ctx, id, second); err != nil {
+		t.Fatalf("second replace: %v", err)
+	}
+	got, err := s.ListLensTelemetry(ctx, id)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("got %d rows, want 1 (replace must be atomic, not additive)", len(got))
+	}
+	if got[0].Lens != "security" || got[0].CostUSD != 0.04 {
+		t.Errorf("row = %+v, want security/$0.04", got[0])
+	}
+}
+
+// QUB-109: lens cost rollup groups by lens across the time
+// window. The dashboard's "lens is the row grain" rule.
+func TestLensCostSummary_GroupsByLens(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	runs := []struct {
+		id     string
+		status RunStatus
+		offset time.Duration
+	}{
+		{"boop-a-b-1-aaaaaaa", StatusSucceeded, -2 * time.Hour},
+		{"boop-a-b-2-bbbbbbb", StatusSucceeded, -1 * time.Hour},
+		{"boop-c-d-3-ccccccc", StatusFailed, -30 * time.Minute},
+	}
+	for _, r := range runs {
+		if _, err := s.UpsertRun(ctx, sampleRun(r.id, "a", "b", 1, "aaaaaaa", r.status, now.Add(r.offset))); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+	}
+	if err := s.ReplaceLensTelemetry(ctx, "boop-a-b-1-aaaaaaa", []LensTelemetry{
+		{RunID: "boop-a-b-1-aaaaaaa", Lens: "security", CostUSD: 0.05},
+		{RunID: "boop-a-b-1-aaaaaaa", Lens: "deep", CostUSD: 0.20},
+	}); err != nil {
+		t.Fatalf("lens tel 1: %v", err)
+	}
+	if err := s.ReplaceLensTelemetry(ctx, "boop-a-b-2-bbbbbbb", []LensTelemetry{
+		{RunID: "boop-a-b-2-bbbbbbb", Lens: "deep", CostUSD: 0.10},
+		{RunID: "boop-a-b-2-bbbbbbb", Lens: "security", CostUSD: 0.02},
+	}); err != nil {
+		t.Fatalf("lens tel 2: %v", err)
+	}
+	got, err := s.LensCostSummary(ctx, now.Add(-24*time.Hour), now)
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want 2 (deep, security)", len(got))
+	}
+	// Ordered by cost desc: deep (0.30) > security (0.07).
+	// Use a small tolerance — float addition is not
+	// associative so 0.20 + 0.10 lands on
+	// 0.30000000000000004 in IEEE 754.
+	if got[0].Lens != "deep" || diff(got[0].CostUSD, 0.30) > 1e-6 {
+		t.Errorf("row[0] = %+v, want deep/$0.30", got[0])
+	}
+	if got[1].Lens != "security" || diff(got[1].CostUSD, 0.07) > 1e-6 {
+		t.Errorf("row[1] = %+v, want security/$0.07", got[1])
+	}
+}
+
+// QUB-109: stuck-runs query selects running runs whose
+// last_heartbeat_at is older than the threshold (or null).
+// A succeeded/failed run is never "stuck" even if it has
+// no heartbeat.
+func TestListStuckRuns_FiltersByHeartbeat(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	runs := []struct {
+		id     string
+		status RunStatus
+		hb     *time.Time // nil = never heartbeat'd; set = write directly
+	}{
+		{"boop-a-b-1-aaaaaaa", StatusRunning, nil},                              // stuck (no heartbeat)
+		{"boop-a-b-2-bbbbbbb", StatusRunning, ptr(now.Add(-3 * time.Minute))},   // stuck (old)
+		{"boop-a-b-3-ccccccc", StatusRunning, ptr(now.Add(-10 * time.Second))}, // healthy
+		{"boop-a-b-4-ddddddd", StatusSucceeded, nil},                            // not stuck (terminal)
+	}
+	for _, r := range runs {
+		if _, err := s.UpsertRun(ctx, sampleRun(r.id, "a", "b", 1, "aaaaaaa", r.status, now)); err != nil {
+			t.Fatalf("upsert: %v", err)
+		}
+		if r.hb != nil {
+			// Write the heartbeat directly so the test
+			// controls the timestamp (TouchRunHeartbeat
+			// always stamps now, which would defeat the
+			// "stale heartbeat" half of the assertion).
+			if _, err := s.db.ExecContext(ctx, `UPDATE runs SET last_heartbeat_at = ? WHERE id = ?`,
+				r.hb.UTC().Format(time.RFC3339Nano), r.id); err != nil {
+				t.Fatalf("set hb: %v", err)
+			}
+		}
+	}
+	got, err := s.ListStuckRuns(ctx, 2*time.Minute, 50)
+	if err != nil {
+		t.Fatalf("list stuck: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("got %d stuck, want 2 (the two running-without-recent-hb rows)", len(got))
 	}
 }
