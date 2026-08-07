@@ -4,7 +4,9 @@
 <div class="toolbar">
   <a href="/dashboard/runs">&larr; back to runs</a>
   {{if or (eq .Run.Status "succeeded") (eq .Run.Status "failed")}}
-  <form method="get" action="/api/runs/{{.Run.ID}}/rerun-preview" target="_blank" style="margin-left:auto">
+  <form method="post" action="/dashboard/runs/{{.Run.ID}}/rerun" style="margin-left:auto">
+    <input type="hidden" name="confirm" value="true">
+    <input type="hidden" name="reason" value="run detail re-run">
     <button type="submit" class="primary">Re-run</button>
   </form>
   {{end}}
@@ -52,19 +54,19 @@
 {{end}}
 
 <h3>Lineage</h3>
-{{if .Lineage.Up}}
-<p>Walked {{len .Lineage.Up}} ancestor(s):</p>
+{{if .Lineage.WalkUp}}
+<p>Walked {{len .Lineage.WalkUp}} ancestor(s):</p>
 <ul>
-  {{range .Lineage.Up}}<li><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a> — {{.Status}}</li>{{end}}
+  {{range .Lineage.WalkUp}}<li><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a> — {{.Status}}</li>{{end}}
 </ul>
 {{else}}
 <div class="empty">No parent (this is the root of a chain).</div>
 {{end}}
-{{if .Lineage.Down}}
+{{if .Lineage.WalkDown}}
 <h4>Superseded by</h4>
 <ul>
-  {{range .Lineage.Down}}<li><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a> — {{.Status}}</li>{{end}}
+  {{range .Lineage.WalkDown}}<li><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a> — {{.Status}}</li>{{end}}
 </ul>
 {{end}}
 {{end}}
-{{template "layout" .}}
+{{template "layout.html" .}}

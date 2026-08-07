@@ -335,7 +335,19 @@ export async function runStages(ctx, deps, overrides, state, options = {}) {
     // intentionally ignored. Failures in the post are
     // absorbed by the helper so a dashboard blip never
     // aborts a review.
-    await postStage(stage.id, ctx, deps);
+    //
+    // EH-004: the start POST is fire-and-forget — the
+    // helper's contract says "failures are logged but never
+    // raised", and awaiting it on the orchestrator path
+    // makes the start POST's 5s timeout * N stages a real
+    // drag on a degraded receiver. The finally block still
+    // awaits the end POST because that one is the
+    // "bar finally closed" signal the dashboard reads;
+    // if it lands, the dashboard renders the bar; if it
+    // times out, the start POST is the visible record and
+    // the operator can correlate "bar didn't close" with
+    // the runner's logged timeout.
+    postStage(stage.id, ctx, deps);
     const wasPassed = state.parseFailed;
     try {
       await withRetry(stage, ctx, deps, overrides, state);

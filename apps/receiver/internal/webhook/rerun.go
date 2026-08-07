@@ -26,6 +26,7 @@ package webhook
 // exists but is not yet callable from the dashboard).
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -33,6 +34,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/michaelruelas/boop-receiver/internal/store"
 )
@@ -140,13 +143,11 @@ type rerunRequest struct {
 }
 
 // Rerun handles POST /api/runs/{id}/rerun. Mints a new
-// run row with parent_run_id set; the actual K8s Job
-// creation is the responsibility of a follow-up PR that
-// threads BOOP_PARENT_RUN_ID through the jobbuilder.
-// Today's implementation persists the row, sets
-// superseded_by_id on the prior, and returns the new id
-// — Phase 3 ships the lineage half, Phase 4 wires the
-// K8s jobbuilder half.
+// run row with parent_run_id set and creates the K8s
+// Job in one transaction. The Job name follows the
+// {original}-r{N} convention; the runner is told the
+// prior run's id via BOOP_PARENT_RUN_ID so it can reuse
+// the prior review's findings (Phase 4 follow-up).
 func (h *Handler) Rerun(w http.ResponseWriter, r *http.Request) {
 	if h.store == nil {
 		http.Error(w, "data layer disabled", http.StatusServiceUnavailable)
@@ -184,15 +185,71 @@ func (h *Handler) Rerun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "can only re-run a terminal run", http.StatusConflict)
 		return
 	}
-	sha7 := shortSHARerun(prior.CommitSHA)
-	count, err := h.store.CountRerunJobsForSHA(r.Context(), prior.Owner, prior.Repo, prior.PRNumber, sha7)
+	newID, err := h.CreateRerunJob(r.Context(), prior, body.Reason)
 	if err != nil {
-		h.logger.Warn("rerun count", "run", id, "err", err)
-		http.Error(w, "store error", http.StatusInternalServerError)
+		h.logger.Warn("rerun create", "run", id, "err", err)
+		http.Error(w, "rerun create", http.StatusInternalServerError)
 		return
 	}
+	h.logger.Info("rerun created",
+		"prior", prior.ID,
+		"new", newID,
+		"reason", body.Reason,
+	)
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"new_run_id":    newID,
+		"prior_run_id":  prior.ID,
+		"parent_run_id": prior.ID,
+	})
+}
+
+// CreateRerunJob is the cross-package helper the
+// dashboard calls from its form-based /dashboard/runs/
+// {id}/rerun handler. Persists the new run row with
+// parent_run_id set, backfills superseded_by_id on the
+// prior, and creates the K8s Job in the configured
+// namespace. Returns the new run id.
+//
+// The K8s Job's name is the {original}-r{N} convention;
+// the new row's id matches the Job name so the
+// runner's BOOP_JOB_NAME environment variable lines up
+// with the store row without a translation. BOOP_PARENT_RUN_ID
+// is set so a future runner change can read the prior
+// row's findings (Phase 4 follow-up — today the runner
+// ignores the env var).
+//
+// The new run row is persisted BEFORE the K8s Job is
+// created, matching the QUB-101 order in submitJob: the
+// runner's first POST can find the parent row by the
+// time the Job starts. If UpsertRun fails, no K8s side
+// effect is attempted. If createJob fails, the new row
+// stays in pending state; the receiver's retention loop
+// will eventually prune it. A re-run is operator-
+// initiated so the "stuck pending" surface is small
+// (one row, one log line).
+func (h *Handler) CreateRerunJob(ctx context.Context, prior store.Run, reason string) (string, error) {
+	if h.store == nil {
+		return "", fmt.Errorf("webhook: rerun: data layer disabled")
+	}
+	if h.kube == nil {
+		return "", fmt.Errorf("webhook: rerun: kube client not configured")
+	}
+	// A re-run only makes sense for terminal prior
+	// rows. Re-running a still-running prior would
+	// either duplicate the live Job (same
+	// owner/repo/pr/sha, no -r{N} yet) or race the
+	// inflight pod's first POST. Both shapes are
+	// worse than a 409, so we reject at the boundary.
+	if prior.Status != store.StatusSucceeded && prior.Status != store.StatusFailed {
+		return "", fmt.Errorf("webhook: rerun: prior status %q is not terminal", prior.Status)
+	}
+	sha7 := shortSHARerun(prior.CommitSHA)
+	count, err := h.store.CountRerunJobsForSHA(ctx, prior.Owner, prior.Repo, prior.PRNumber, sha7)
+	if err != nil {
+		return "", fmt.Errorf("count reruns: %w", err)
+	}
 	newName := buildRerunJobName(prior.Owner, prior.Repo, prior.PRNumber, sha7, count+1)
-	if _, err := h.store.UpsertRun(r.Context(), store.Run{
+	if _, err := h.store.UpsertRun(ctx, store.Run{
 		ID:             newName,
 		Owner:          prior.Owner,
 		Repo:           prior.Repo,
@@ -200,33 +257,96 @@ func (h *Handler) Rerun(w http.ResponseWriter, r *http.Request) {
 		CommitSHA:      prior.CommitSHA,
 		BaseRef:        prior.BaseRef,
 		ReviewNumber:   prior.ReviewNumber + 1,
-		Reason:         "rerun: " + body.Reason,
+		Reason:         "rerun: " + reason,
 		InstallationID: prior.InstallationID,
 		Status:         store.StatusPending,
 		StartedAt:      time.Now().UTC(),
 		ParentRunID:    prior.ID,
 	}); err != nil {
-		h.logger.Warn("rerun upsert", "run", newName, "err", err)
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
+		return "", fmt.Errorf("upsert rerun: %w", err)
 	}
-	if err := h.store.SetSupersededBy(r.Context(), prior.ID, newName); err != nil {
-		h.logger.Warn("rerun supersede", "prior", prior.ID, "new", newName, "err", err)
+	if err := h.store.SetSupersededBy(ctx, prior.ID, newName); err != nil {
 		// Non-fatal — the new run row already exists;
 		// the lineage view will still work via
 		// parent_run_id. Log and continue.
+		h.logger.Warn("rerun supersede", "prior", prior.ID, "new", newName, "err", err)
 	}
-	h.logger.Info("rerun created",
-		"prior", prior.ID,
-		"new", newName,
-		"reason", body.Reason,
-	)
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"new_run_id":    newName,
-		"prior_run_id":  prior.ID,
-		"parent_run_id": prior.ID,
-		"note":          "Phase 3 ships the lineage half; K8s Job creation is wired in Phase 4",
+	// Resolve the image fresh from the boop-config
+	// ConfigMap so the rerun picks up the same
+	// digest-sync updates the original submit path
+	// already does. A failure here falls back to the
+	// env-var snapshot (same as submitJob).
+	image, _ := h.resolveJobImageForSubmit(ctx)
+	job, err := buildJob(templateVars{
+		Owner:             prior.Owner,
+		Repo:              prior.Repo,
+		Number:            fmt.Sprintf("%d", prior.PRNumber),
+		SHA:               prior.CommitSHA,
+		SHA7:              shortSHARerun(prior.CommitSHA),
+		BaseRef:           prior.BaseRef,
+		PreviousHeadSHA:   "", // reruns do not chain; the prior's previous head SHA is irrelevant
+		Image:             image,
+		StatusCommentID:   "", // reruns do not get the original's status comment
+		ReactionCommentID: "",
+		ReviewNumber:      fmt.Sprintf("%d", prior.ReviewNumber+1),
+		InstallationID:    fmt.Sprintf("%d", prior.InstallationID),
+		BotLogin:          h.cfg.BotLogin,
+		JobName:           newName,
+		// QUB-94: re-runs reuse the cluster-wide SDK
+		// default. Per-PR label overrides (boop:openrouter-sdk)
+		// are not honored on a re-run because the
+		// webhook handler is no longer in the loop; a
+		// future "rerun with override" endpoint can
+		// add a per-rerun flag.
+		OpenRouterSDKEnabled: h.cfg.OpenRouterSDKDefault,
+		// Dashboard URL/Token: same as the original
+		// Job so the rerun's telemetry lands in the
+		// same data layer.
+		DashboardURL:   "http://boop-receiver.dev-tools.svc.cluster.local:8080",
+		DashboardToken: h.cfg.RunnerToken,
+		// QUB-110: parent-run id threaded into the
+		// Job. The runner reads BOOP_PARENT_RUN_ID
+		// when populating the prompt's PRIOR_RUN_CONTEXT
+		// block; today's runner ignores the env var
+		// (the prompt-block PR is a follow-up).
+		TriggeredBy: "",
 	})
+	if err != nil {
+		return newName, fmt.Errorf("build rerun job: %w", err)
+	}
+	// Add the parent run id as a Job annotation
+	// (visible to `kubectl describe`) and an env
+	// var (visible to the runner). Both copies
+	// make it easy to debug a "why is this Job
+	// different?" question from either side.
+	//
+	// Also override the Job name to the rerun
+	// convention ({original}-r{N}). buildJob derives
+	// the name from owner/repo/pr/sha, which is the
+	// same shape for the original and every re-run
+	// — the -r{N} suffix has to land here in
+	// CreateRerunJob, not in buildJob, because the
+	// jobbuilder is shared with the webhook path
+	// that always wants the original name.
+	if job.Spec.Template.ObjectMeta.Annotations == nil {
+		job.Spec.Template.ObjectMeta.Annotations = map[string]string{}
+	}
+	job.Spec.Template.ObjectMeta.Annotations["boop/parent-run-id"] = prior.ID
+	job.ObjectMeta.Name = newName
+	for i, env := range job.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == "BOOP_JOB_NAME" {
+			job.Spec.Template.Spec.Containers[0].Env[i].Value = newName
+		}
+	}
+	job.Spec.Template.Spec.Containers[0].Env = append(
+		job.Spec.Template.Spec.Containers[0].Env,
+		corev1.EnvVar{Name: "BOOP_PARENT_RUN_ID", Value: prior.ID},
+	)
+	if err := h.createJob(ctx, job); err != nil {
+		return newName, fmt.Errorf("create rerun job: %w", err)
+	}
+	h.logger.Info("rerun job created", "prior", prior.ID, "new", newName, "reason", reason)
+	return newName, nil
 }
 
 // buildRerunJobName constructs the Job name for the

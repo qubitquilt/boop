@@ -27,12 +27,13 @@
       <td>{{.StartedAt}}</td>
       <td><code>{{.Error}}</code></td>
       <td>
-        <form method="post" action="/api/runs/{{.ID}}/rerun" style="display:inline">
+        <form method="post" action="/dashboard/runs/{{.ID}}/rerun" style="display:inline">
           <input type="hidden" name="confirm" value="true">
           <input type="hidden" name="reason" value="exception dock requeue">
           <button class="primary" type="submit">Requeue</button>
         </form>
         <form method="post" action="/dashboard/runs/{{.ID}}/zero-cost" style="display:inline">
+          <input type="hidden" name="reason" value="exception dock zero-out">
           <button class="danger" type="submit">Zero out cost</button>
         </form>
       </td>
@@ -44,4 +45,4 @@
 <div class="empty">No exceptions match the filter.</div>
 {{end}}
 {{end}}
-{{template "layout" .}}
+{{template "layout.html" .}}

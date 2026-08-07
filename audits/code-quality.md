@@ -1,27 +1,35 @@
 # Code Quality Audit
-**Date:** 2026-08-04
-**Scope:** QUB-94 PR `feature/qub-94-migrate-boop-runner-from-opencode-cli-to-openrouter-sdk`
+**Date:** 2026-08-06
+**Scope:** Stacked PR `feature/qub-112-dashboard-cross-cutting` (5 commits, QUB-108/109/110/111/112 from main)
 **Files reviewed (changed code only):**
 
-- `apps/receiver/cmd/receiver/main.go` (+7)
-- `apps/receiver/internal/webhook/handler.go` (+56/-3)
-- `apps/receiver/internal/webhook/handler_test.go` (+59)
-- `apps/receiver/internal/webhook/jobbuilder.go` (+16/-7)
-- `apps/runner/package.json`, `apps/runner/package-lock.json` (new dep `@openrouter/sdk@1.2.8`)
-- `apps/runner/src/lib/config.mjs` (+13)
-- `apps/runner/src/lib/opencode.mjs` (+138/-4)
-- `apps/runner/src/lib/opencode.test.mjs` (+83)
-- `apps/runner/src/lib/openrouter.mjs` (+296, NEW FILE)
-- `apps/runner/src/lib/openrouter.test.mjs` (+306, NEW FILE)
-- `docs/development.md` (+94)
+- `apps/receiver/cmd/receiver/main.go` (+36)
+- `apps/receiver/internal/dashboard/dashboard.go` (NEW, 497 lines)
+- `apps/receiver/internal/dashboard/templates/*.html` (8 NEW, ~340 lines)
+- `apps/receiver/internal/store/audit.go` (NEW, 200)
+- `apps/receiver/internal/store/installations.go` (+224)
+- `apps/receiver/internal/store/lens_telemetry.go` (NEW, 204)
+- `apps/receiver/internal/store/migrations.go` (+329)
+- `apps/receiver/internal/store/rerun.go` (NEW, 161)
+- `apps/receiver/internal/store/runs.go` (+148/-37)
+- `apps/receiver/internal/store/stages.go` (NEW, 301)
+- `apps/receiver/internal/store/store_test.go` (+464)
+- `apps/receiver/internal/webhook/dashboard.go` (+202 appended to existing 633)
+- `apps/receiver/internal/webhook/handler.go` (+37 — `isPaused` + 2 call sites)
+- `apps/receiver/internal/webhook/k8s_reconcile.go` (NEW, 257)
+- `apps/receiver/internal/webhook/rerun.go` (NEW, 258)
+- `apps/runner/src/index.mjs` (+27 — heartbeat, lens telemetry, dashboard-failure path)
+- `apps/runner/src/lib/dashboard.mjs` (NEW, 225)
+- `apps/runner/src/lib/dashboard.test.mjs` (NEW, 191)
+- `apps/runner/src/lib/workflow.mjs` (+21 — stage POSTs)
 
 ---
 
 ## Summary
 
-The SDK path is well-scoped and the new `openrouter.mjs` is a textbook seam: pure I/O at the boundary, telemetry mapped in one place, a single dependency-injection knob (`deps.client`) for tests. The complexity lives in the orchestrator — `runOpenRouterSkill` in `opencode.mjs` mixes model resolution, SDK plumbing, error classification, telemetry stamping, and review-shape construction in one 105-line function. The error path is dense enough that the next change to "what an SDK failure looks like" will need to touch three concerns in one block. Test coverage is solid on the happy path, the failure path, the abort path, and the legacy fallback, but the new `readOpencodeModel` helper is exported without a direct test and the orchestrator's "no model configured" throw is uncovered. Receiver-side additions are clean: small, focused, well-tested.
+The store layer is the cleanest part of the PR — five new files (stages, lens_telemetry, rerun, audit, lens_telemetry) are well-shaped, well-commented, and covered by ~12 new `TestX` cases in `store_test.go`. The dashboard surface in `apps/receiver/internal/dashboard/` is the weakest part: the route table, the templates, and the Go view functions are mostly in sync, but a lineage-template field-name mismatch, a JSON-vs-form contract bug on the "Requeue" button, a form action that targets an unwired route, and a non-functional `failure_class` filter make the dashboard's "Requeue" and "Zero out cost" controls silently broken. Test coverage for the new dashboard code is thin: there are no tests for `RecordStage` / `RecordHeartbeat` / `RecordLensTelemetry` handlers, the entire `k8s_reconcile.go` module (including the `failureClassFromContainerState` taxonomy that the exception dock's filter chips depend on), or either `Rerun` / `RerunPreview` handler. The new code is honest about the gaps it doesn't ship (the `Rerun` response's "Phase 3 ships the lineage half" note, the unmigrated `webhook.hmac.*` audit action types) — that comment discipline is the single most useful pattern in the PR and is worth keeping in the next change.
 
-**Highest-risk area:** `runOpenRouterSkill` in `opencode.mjs:716` — the catch block at `:766-794` interleaves error logging, telemetry construction, and review-shape mutation in a way that will obscure the next failure-mode change.
+**Highest-risk area:** the dashboard view layer (`apps/receiver/internal/dashboard/`) — the route table is missing three endpoints the templates reference, so two of the three exception-dock action buttons will return errors (or 404) the first time an operator clicks them. The next dashboard-touching change will land in a tangle of broken HTML contracts.
 
 ---
 
@@ -30,68 +38,49 @@ The SDK path is well-scoped and the new `openrouter.mjs` is a textbook seam: pur
 ### CQ-001
 | Field    | Value |
 |----------|-------|
-| Tier     | 🟡 Follow-up |
-| Decide   | Defer |
-| Location | `apps/runner/src/lib/opencode.mjs:716` — `runOpenRouterSkill()` (105 lines) |
+| Tier     | 🔴 Blocking |
+| Decide   | Change now |
+| Location | `apps/receiver/internal/dashboard/templates/run_detail.html:55-67` references `.Lineage.Up` / `.Lineage.Down`, but `store.Lineage` (`apps/receiver/internal/store/rerun.go:99-102`) has fields `WalkUp` and `WalkDown` |
 
-**Observation:** `runOpenRouterSkill` performs five distinct jobs in one linear flow: (1) prompt construction with a `skipSkill` ternary, (2) three-step model resolution (`ctx.openrouterModel` → `readOpencodeModel` → throw), (3) status / start-log, (4) the SDK call wrapped in a 30-line try/catch that classifies `AbortError` vs. generic failure, logs to errlog, and on generic failure calls `parseReviewOutput("")` then mutates `parseError` then returns `{ ...review, telemetry: buildTelemetry(null, err) }`, (5) parse output + exit log + parse-error log + final return. The catch block alone is the densest patch of new code in the PR.
+**Observation:** `serveRunDetail` calls `h.store.WalkLineage(...)` and binds the result as `data.Lineage`. The template iterates `.Lineage.Up` and `.Lineage.Down`, but the store struct's fields are `WalkUp` and `WalkDown`. Go's `html/template` is silent on missing fields (it renders the zero value), so the `<h3>Lineage</h3>` section will always render "No parent (this is the root of a chain)." even on a chain with three re-runs. The lineage data is being computed and stored, then thrown away by the template.
 
-**Impact:** Cyclomatic complexity is 7-8 (under 10) so the function is not flag-worthy by that metric alone, but the cognitive load is real. The next change to "what an SDK failure looks like" will land in a 30-line block that holds error classification + breadcrumb logging + review-shape construction + telemetry stamping. The `parseReviewOutput("")` + `parseError` mutation is the most surprising pattern — it relies on the parser's failure shape being a mutable plain object, which is an undocumented coupling to `opencode.mjs:169` and would break if `parseReviewOutput` ever returns a frozen object or a class instance. None of this is blocking, but the function will become the second-largest in `opencode.mjs` and the next reader has to keep five concerns in their head.
+**Impact:** The re-run lineage feature is invisible from the dashboard. The QUB-110 schema (parent_run_id, superseded_by_id), the `WalkLineage` walk, the line-by-line audit test (`TestUpsertRun_LineageRoundTrip` at `store_test.go:744`), and the QUB-110 PR's note about "show me the lineage" all land correctly — but the operator-facing render is dead. The next click on the "Re-run" path will look broken even though the backend works.
 
-**Suggestion:** Split the orchestrator. The "telemetry on failure" return shape and the `parseReviewOutput("")` trick are easy to extract:
-
-```javascript
-// In opencode.mjs — a small helper next to parseReviewOutput
-function emptyReview(parseError) {
-  const r = parseReviewOutput("");
-  r.parseError = r.parseError || parseError;
-  return r;
-}
-
-// Then runOpenRouterSkill shrinks to:
-async function runOpenRouterSkill(openrouterApiKey, ctx, deps) {
-  const prompt = ctx.skipSkill
-    ? `Reply with one sentence: confirm you can see the repo at ${deps.paths.repoDir} on head ${shortSha(ctx.prHeadSha)}.`
-    : await buildBoopPrompt(ctx, deps);
-  const model = await resolveSdkModel(ctx, deps);     // throws if absent
-  await deps.postStatus("review");
-  deps.log("opencode", "starting", { dir: deps.paths.repoDir, model, mode: ctx.skipSkill ? "minimal" : "full", path: "openrouter-sdk" });
-  const result = await invokeSdkCall(openrouterApiKey, prompt, model, deps); // throws on timeout, returns review+telemetry otherwise
-  // ...parse + return unchanged
-}
-```
-
-The PR's own comment at `opencode.mjs:712-715` already names the cross-module surface as "one call to `callOpenRouter` and one call to `buildTelemetry`" — the function's body doesn't yet match that stated surface.
+**Suggestion:** Pick one name and stick to it. The store's `WalkUp` / `WalkDown` are clearer; change the template to `{{if .Lineage.WalkUp}}` and `{{range .Lineage.WalkUp}}` (4 sites in `run_detail.html`). A single one-line rename and the feature works.
 
 ---
 
 ### CQ-002
 | Field    | Value |
 |----------|-------|
-| Tier     | 🟡 Follow-up |
-| Decide   | Defer |
-| Location | `apps/runner/src/lib/opencode.mjs:716` — `runOpenRouterSkill()`; `apps/runner/src/lib/openrouter.mjs` is a NEW FILE |
+| Tier     | 🔴 Blocking |
+| Decide   | Change now |
+| Location | `apps/receiver/internal/dashboard/templates/exceptions.html:30-37` — `Requeue` form posts to `/api/runs/{id}/rerun` with form-encoded body; `webhook/rerun.go:150-230` `Rerun` handler expects JSON |
 
-**Observation:** `opencode.mjs` already hosts the `opencode` CLI pipeline (`materializeConfig`, `runOpencode`, `runOpencodeJSON` glue), the boop prompt builder, and the parser. After this PR it also hosts `runOpenRouterSkill` — a function whose body touches none of the opencode subprocess machinery and instead reads from the opencode.json ConfigMap only as a fallback model source. The file-level docstring at `opencode.mjs:1-8` describes "the opencode CLI pipeline" and reads as a historical artifact. The PR's own comment at `opencode.mjs:712-715` acknowledges the awkwardness: "The function lives in opencode.mjs (not openrouter.mjs) so it can reuse `buildBoopPrompt` + `parseReviewOutput` without a circular import."
+**Observation:** The "Requeue" button is rendered as `<form method="post" action="/api/runs/{{.ID}}/rerun">` with `<input type="hidden" name="confirm" value="true">` and `<input type="hidden" name="reason" value="...">`. The form's Content-Type is `application/x-www-form-urlencoded`, but the `Rerun` handler does `json.NewDecoder(...).Decode(&body)` against the raw body — which fails on form-encoded data, returning 400 "bad json". The next click in the operator's browser surfaces a 400 to the dashboard with no useful error to the user.
 
-**Impact:** The circular-import justification is real, but it leaves `opencode.mjs` with two unrelated pipelines under one name. After QUB-98 deletes the opencode subprocess, the file will contain only the SDK path, the prompt builder, and the parser — at which point "opencode.mjs" is a wrong name and the rename becomes a bigger refactor. The longer the dual-purpose file sits, the more code (and tests) anchor to the misleading name. Note that the function placement also means `runOpencodeJSON` (`opencode_json.mjs`) is still imported from `opencode.mjs` via `importRunOpencodeJSON` — a third "pipeline" lives in the same file by lazy import.
+**Impact:** The exception dock's primary re-queue action is broken in the most visible way — it returns an HTTP error the operator can read. The store's `Rerun` path is unreachable from the UI. This is exactly the kind of wiring bug that survives code review because each side is internally consistent (the form's spec is form-data; the handler's spec is JSON) and the inconsistency only shows on the first end-to-end click.
 
-**Suggestion:** Defer the rename to QUB-98 when the opencode branch is removed. Add a TODO comment at the top of `opencode.mjs` flagging the rename target (`boop_review.mjs` is the candidate) so the next reader doesn't have to rediscover this. Not blocking because the dual-purpose state is acknowledged in the PR's own comments and is on the cutover path.
+**Suggestion:** Pick one. Two options:
+1. Change the handler to accept either `application/x-www-form-urlencoded` or JSON, parse conditionally, and return 400 only when neither matches. This is the smaller change and matches the pattern the operator is using (the dashboard's "Pause" form on `installations.html:18-22` is also form-encoded and goes through `serveInstallationControl`, so making the rerun endpoint accept form data is consistent with the existing dashboard pattern).
+2. Change the form to a `<button>` that fires an `htmx` POST with a JSON body. This is the larger change and would require HTMX configuration in `layout.html`.
+
+Option 1 is one helper in the rerun handler and a 3-line switch; option 2 is a refactor of the dashboard's form pattern. Recommend option 1.
 
 ---
 
 ### CQ-003
 | Field    | Value |
 |----------|-------|
-| Tier     | 🟡 Follow-up |
-| Decide   | Defer |
-| Location | `apps/runner/src/lib/opencode.mjs:766-794` — error path inside `runOpenRouterSkill()` |
+| Tier     | 🔴 Blocking |
+| Decide   | Change now |
+| Location | `apps/receiver/internal/dashboard/templates/exceptions.html:35-37` — `Zero out cost` form posts to `/dashboard/runs/{id}/zero-cost`, but no such route exists in `dashboard.go:101-130` `route()` or in `main.go` |
 
-**Observation:** The `catch (err)` block at `opencode.mjs:766-794` has three separate concerns interleaved: (a) `isAbort` classification and the `killed`/`timeoutMs` flag, (b) errlog breadcrumb with `errorName` and `elapsedMs`, (c) a review-shape construction that calls `parseReviewOutput("")`, mutates `parseError` if absent, and wraps with `buildTelemetry(null, err)`. The mutation of `review.parseError` is the most surprising line: `parseReviewOutput("")` already returns `parseError: "no structured block"` (see `opencode.mjs:178`), so `review.parseError = review.parseError || "sdk call failed"` only changes the string when the parser's own error is absent — but `parseReviewOutput("")` always sets it, so the `||` branch is dead in the SDK-failure case. The intent (override "no structured block" with "sdk call failed") is correct but the code expresses "preserve any existing parseError" instead.
+**Observation:** The "Zero out cost" button is rendered as `<form method="post" action="/dashboard/runs/{{.ID}}/zero-cost">`. The dashboard's `route()` switch in `dashboard.go:101-130` handles `runs` and `runs/{id}` for GETs only (the middleware is mounted for both GET and POST at `dashboard.go:97-98`, but no `case` matches `runs/{id}/zero-cost`). The path falls through to `http.NotFound`. There is no `webhook/rerun.go` or `webhook/dashboard.go` handler that performs a zero-out either; the closest is the `refunds` table in `stages.go:197-234` and a `RecordRefund` method, but no HTTP handler wires a UI to it. The `audit_events.action` column's docstring (`audit.go:30-31`) and the migrations.go:439 comment both list `"cost.zero_out"` as a real audit action, but no caller emits it yet.
 
-**Impact:** This is the place a future debugging pass will land when an SDK call starts failing in a new way. The interleaving makes it hard to see the order of operations, and the dead `||` branch hides a behavior the next reader has to re-derive. The `elapsed` variable is computed once but only used in the errlog; the `killed` / `timeoutMs` pair is set inside the `if (isAbort)` and consumed only by the immediate throw, so it could be inlined. None of this is a bug, but the next change here will be in a block where each line does two things.
+**Impact:** The button is wired in the UI but the backend isn't. The "no-op or 404" outcome is the lesser problem — the larger problem is that the operator clicks "Zero out cost" expecting the cost row to disappear from the dashboard, and instead the page returns 404. The "load-bearing first deliverable" claim in the migrations.go comment for QUB-108 ("OOMKilled runs light up on day one") is met, but the "zero out cost" follow-up is half-shipped.
 
-**Suggestion:** Defer the split (it overlaps with CQ-001). At minimum, fix the dead-branch surprise so the intent is obvious: `review.parseError = "sdk call failed"` — but that drops the parser's "no structured block" signal, which is the wrong tradeoff. The honest fix is to either accept the parser's error string verbatim (delete the `|| "sdk call failed"`) or to assert it: `if (!review.parseError) review.parseError = "sdk call failed";`. The latter is what the code intends but only the former is what it does. Change the line to make the intent literal and the dead branch is gone.
+**Suggestion:** Either remove the button (with a TODO comment that the action ships in a follow-up) or wire the route. Removing the button is a 3-line template change and matches the "Phase 3 ships the lineage half; K8s Job creation is wired in Phase 4" comment in `webhook/rerun.go:228`. Wiring the route is a follow-up that should add a `case` to `dashboard.go:route()` and a `zeroOutCost` handler that calls `h.store.RecordRefund(...)` and appends an `audit_events` row with `action: "cost.zero_out"`. Recommend removal for this PR — QUB-112 is the audit-log PR, and the audit log can be exercised end-to-end via the install pause/resume paths that *are* wired.
 
 ---
 
@@ -100,28 +89,13 @@ The PR's own comment at `opencode.mjs:712-715` already names the cross-module su
 |----------|-------|
 | Tier     | 🟡 Follow-up |
 | Decide   | Change now |
-| Location | `apps/runner/src/lib/openrouter.mjs:285` — `readOpencodeModel()` (exported, not directly tested) |
+| Location | `apps/receiver/internal/dashboard/dashboard.go:133-174` `serveRuns` reads `failure_class` from the query string but does not pass it to the store filter; `runs.html:14-20` shows a `failure_class` dropdown |
 
-**Observation:** `readOpencodeModel` is exported from `openrouter.mjs` and called from `runOpenRouterSkill` at `opencode.mjs:730`, but it has no direct unit test in `openrouter.test.mjs` (the import block at line 4-8 lists only `buildTelemetry`, `callOpenRouter`, `emptyTelemetry`). The function swallows `JSON.parse` errors and `fs.readFile` errors and returns `""`, so the contract has at least four code paths (missing `configSrc`, read failure, parse failure, `model` field missing or non-string). It is exercised today only by the orchestrator's happy-path test which sets `openrouterModel` directly and never enters the `readOpencodeModel` branch.
+**Observation:** `serveRuns` parses `q.Get("failure_class")` (line 169) and passes it to the template as `Filter.FailureClass`, so the dropdown stays pre-selected on re-render. But the actual `store.ListRunsFilter` (line 135) doesn't include a `FailureClass` field, and the call at line 147 doesn't filter by it. The result: the operator selects `oom_killed` in the filter, the URL becomes `?failure_class=oom_killed`, the page reloads, and every run shows up — only the dropdown is preselected. The exception dock view (`serveExceptions` at line 356) does the filter correctly in Go (it pulls StatusFailed, then iterates in-memory to filter on `run.FailureClass`), so the operator can get the same data via a different route, but the "any class" path in `runs.html` is broken.
 
-**Impact:** The next time the opencode.json shape changes (e.g., a `models` array is introduced, or the file moves to a different mount path), the failure surface of this function will be tested for the first time in production. Because the function is the fallback for the post-QUB-98 cutover (the PR comment at `openrouter.mjs:267-280` calls this out), it is on the upgrade path — a missing test now means the cutover is the test.
+**Impact:** A filter the UI offers doesn't filter. This is the kind of bug operators learn to work around (they navigate to the exception dock instead), and the workaround erodes the trust in the runs view. The fix is also the dashboard's first step toward a real filter bar.
 
-**Suggestion:** Add three direct tests in `openrouter.test.mjs`:
-
-```javascript
-test("readOpencodeModel returns the model field when present", async () => {
-  const deps = { fs: { readFile: async () => '{"model":"minimax/minimax-m3"}' }, paths: { configSrc: "/etc/oc" } };
-  assert.equal(await readOpencodeModel(deps), "minimax/minimax-m3");
-});
-test("readOpencodeModel returns \"\" when the file is missing", async () => {
-  const deps = { fs: { readFile: async () => { throw new Error("ENOENT"); } }, paths: { configSrc: "/etc/oc" } };
-  assert.equal(await readOpencodeModel(deps), "");
-});
-test("readOpencodeModel returns \"\" when the model field is missing", async () => {
-  const deps = { fs: { readFile: async () => '{"provider":{}}' }, paths: { configSrc: "/etc/oc" } };
-  assert.equal(await readOpencodeModel(deps), "");
-});
-```
+**Suggestion:** Add `FailureClass string` to `ListRunsFilter` and a `failure_class = ?` clause in `ListRuns`. Three changes: the struct, the SQL builder, and the dashboard handler. The store already indexes `failure_class` (`migrations.go:298`), so the query stays a single B-tree descent.
 
 ---
 
@@ -130,72 +104,90 @@ test("readOpencodeModel returns \"\" when the model field is missing", async () 
 |----------|-------|
 | Tier     | 🟡 Follow-up |
 | Decide   | Change now |
-| Location | `apps/runner/src/lib/opencode.mjs:732-736` — `if (!model) { throw new Error(...) }` |
+| Location | `apps/receiver/internal/webhook/dashboard.go:484-529` `RecordStage`; `apps/receiver/internal/webhook/k8s_reconcile.go` entire file (257 lines); `apps/receiver/internal/webhook/rerun.go:150-230` `Rerun` and `:68-130` `RerunPreview` — no test coverage |
 
-**Observation:** The orchestrator's "no model configured" throw is uncovered by `opencode.test.mjs`. The five new SDK-branch tests all set `openrouterModel: "minimax/minimax-m3"` on the base ctx (`opencode.test.mjs:734`) and never enter the resolution path that calls `readOpencodeModel` or triggers the throw. The error message is the operator's only signal that the cluster is missing both `OPENROUTER_MODEL` and the opencode.json ConfigMap — a misconfiguration during the QUB-98 cutover.
+**Observation:** A search for `TestRecordStage | TestRecordHeartbeat | TestRecordLensTelemetry | TestRerun | TestRerunPreview | TestStartJobReconciler | TestClassifyJobExit` in `apps/receiver/` returns zero matches. The new HTTP handlers and the entire K8s reconciler module (including the `failureClassFromContainerState` taxonomy that the exception dock's filter chips depend on) ship without direct tests. The existing `dashboard_test.go` covers the older `RecordTelemetry` / `RecordStatus` / `ListRuns` / `Stats` paths and was extended to 14 cases for the new dashboard, but stops at the boundary of the new code.
 
-**Impact:** The cutover (QUB-98) deletes the opencode.json ConfigMap. From that point on, this throw is the gate between a successful SDK run and a "no model configured" failure. The first time the throw fires in production will be the first time it is tested.
+**Impact:** The exception dock's promise — "OOMKilled runs light up on day one" — is enforced by `failureClassFromContainerState` at `k8s_reconcile.go:47-62`, which maps K8s container states to dashboard filter-chip strings. Every string the function returns (`oom_killed`, `container_error`, `crash_loop`, `image_pull`, `stuck_*`, `container_*`) is a dashboard filter chip in `exceptions.html:9-13` and `runs.html:16-19`. The function has six `case` branches across `mapExitReason` and `mapWaitingReason` and the only tests are the developer's mental model. A future change to the K8s API (a new container exit reason, a renamed `Waiting` cause) is the first thing the dashboard's exception dock will break on, and the test for it is the cutover. The same risk applies to `Rerun` / `RerunPreview` (the operator's "Re-run" path, gated by the same X-BOOP-Dashboard-Token as the rest of the dashboard — misconfiguring the JSON-body contract will surface in production the first time someone re-runs a run).
 
-**Suggestion:** Add one orchestrator test in `opencode.test.mjs`:
+**Suggestion:** Add the missing tests. Sketches:
+```go
+// k8s_reconcile_test.go
+func TestFailureClassFromContainerState_OOMKilled(t *testing.T) {
+  cs := corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Reason: "OOMKilled", ExitCode: 137}}
+  if got := failureClassFromContainerState(cs); got != "oom_killed" { t.Errorf("got %q", got) }
+}
+// One per case in mapExitReason + mapWaitingReason.
 
-```javascript
-test("runOpenCodeSkill throws when no model is configured on the SDK path", async () => {
-  const deps = makeSdkDeps({ text: "x", usage: { prompt_tokens: 1, completion_tokens: 1, cost: 0 }, model: "x" });
-  // openrouterModel is unset on ctx; readOpencodeModel returns "" by design.
-  // The orchestrator should throw before the SDK is called.
-  await assert.rejects(
-    () => runOpenCodeSkill("api-key", { ...SDK_BASE_CTX, openrouterModel: null }, deps),
-    /no model configured/,
-  );
-});
+func TestClassifyJobExit_PicksLastTerminated(t *testing.T) {
+  // Drive classifyJobExit with a stub h.kube that returns a Pod
+  // whose LastTerminationState.Terminated.Reason = "OOMKilled".
+  // Assert the returned class is "oom_killed".
+}
+
+func TestRerunPreview_HappyPath(t *testing.T) {
+  h := newTestHandlerWithStore(t)
+  // seed a run, GET /api/runs/{id}/rerun-preview, assert 200 + body shape.
+}
+
+func TestRerun_RequiresConfirm(t *testing.T) {
+  h := newTestHandlerWithStore(t)
+  rr := doJSON(t, h, "POST", "/api/runs/x/rerun", `{"reason":"x"}`, nil) // no confirm
+  if rr.Code != 400 { t.Errorf("got %d, want 400", rr.Code) }
+}
+
+func TestRecordStage_HappyPath(t *testing.T) {
+  h := newTestHandlerWithStore(t)
+  rr := doRequest(t, h, "POST", "/api/runs/{id}/stages", `{"stage":"clone","ended":true}`, ...)
+  if rr.Code != 204 { t.Errorf("got %d", rr.Code) }
+}
 ```
-
-The test doubles as documentation of the cutover's failure mode.
+The store already has the in-memory machinery (a real `Store` from `newTestHandlerWithStore` is used by the existing tests), so the test surface is small — the missing piece is just the table of inputs.
 
 ---
 
 ### CQ-006
 | Field    | Value |
 |----------|-------|
-| Tier     | 🟢 Optional |
+| Tier     | 🟡 Follow-up |
 | Decide   | Defer |
-| Location | `apps/runner/src/lib/opencode.mjs:811-817` — `if (review.parseError) { deps.log("review", "summary_parse_failed", ...) }` |
+| Location | `apps/receiver/internal/store/installations.go:55-151` `UpsertInstallations` (96 lines, CC ~12) — three concerns in one transaction |
 
-**Observation:** The "summary_parse_failed" log path on the SDK branch is not tested in `opencode.test.mjs`. The legacy subprocess path covers this case (a `parseError`-bearing review from `parseReviewOutput` triggers the log) and the SDK-branch test at `opencode.test.mjs:739` always passes a well-formed `SDK_REVIEW_BODY`, so the log line is unexercised.
+**Observation:** `UpsertInstallations` performs three distinct jobs in one transaction: (1) read prior operator-controlled fields for the incoming ids (`:78-102`, the read-before-DELETE preservation dance the comment at `:48-54` calls out), (2) DELETE then INSERT in the same transaction (`:104-146`), (3) write the row using the resolved prior values (`:117-146`). The function is 96 lines, has 12+ branches, and the body is hard to scan because the prior-fields map's anonymous struct type is defined twice (`:68-71` and `:93-96`) and the loop body has a five-line `if` block for "do we have prior values for this id, or use defaults?". The logic is correct — `TestSetInstallationControls_AndPauseCheck` (`store_test.go:992-1033`) proves the operator's pause survives a GitHub poll — but the function is on the edge of the 50-line / 10-branch thresholds and the read-before-DELETE preservation is the kind of subtle code that a future "simplify this" refactor will break.
 
-**Impact:** Low — the log path is identical to the legacy path's behavior, and the parser already has dedicated tests. The only SDK-specific concern is that `callResult.text` (the SDK response) might be longer than the legacy stdout in unusual ways, but the log slices the first 200 bytes either way. Not blocking; flag for completeness.
+**Impact:** A future contributor lands on `UpsertInstallations` to fix a small bug (e.g. add a column to the INSERT) and the test suite passes, but the operator's pause toggle silently regresses because the read-before-DELETE was clobbered. The "fail-open" pattern is invisible without a comment — the comment is here, but the structural separation is not. The function is on the path of every GitHub poll (5-min cadence), so the cost of a refactor is low and the cost of a silent regression is operator mute.
 
-**Suggestion:** Add a parse-failure test in the next change that touches the SDK branch. Skip for this PR.
+**Suggestion:** Extract the read-before-DELETE block into a `readPriorControls(ctx, tx, ids) (map[int64]controls, error)` helper. The `controls` struct can be a named type (the current anonymous-struct-defined-twice pattern is a smell). The function then becomes `readPriorControls → DELETE → INSERT with prior-or-defaults` in three clear blocks. Defer to a follow-up PR because the code is correct and tested today.
 
 ---
 
 ### CQ-007
 | Field    | Value |
 |----------|-------|
-| Tier     | 🟢 Optional |
-| Decide   | Leave as-is |
-| Location | `apps/runner/src/lib/opencode.mjs:752` — `const callFn = deps.callOpenRouter || callOpenRouter;` |
+| Tier     | 🟡 Follow-up |
+| Decide   | Change now |
+| Location | `apps/receiver/internal/dashboard/dashboard.go:474-478` `renderJSON` is unused; `:496-497` `var _ = context.Background` is an import-stabilization hack |
 
-**Observation:** `runOpenRouterSkill` accepts a `deps.callOpenRouter` override but `runOpenCodeSkill` itself does not — the SDK function comes from the module-level import. This is the opposite of the rest of the runner's pattern (`deps.runOpencodeJSON` with `importRunOpencodeJSON` fallback, `deps.spawnFn` for `runOpencode`, `deps.setTimeoutFn` for the timer). The seam is clear and the comment at `opencode.mjs:750-751` is honest about it ("Test injection point: `deps.callOpenRouter` overrides the real SDK call. Production code calls the SDK directly."), but the pattern inconsistency is a small smell.
+**Observation:** `renderJSON` is defined as a "debug helper used during development; not wired to a route but kept around" but no caller in the dashboard package or anywhere else in the repo references it. `var _ = context.Background` at the bottom of the file is a comment-tracked "ensure context import survives goimports" — the `context` import is required only because of that single line, which exists only because of the import. Two pieces of dead code, each other's reason to exist.
 
-**Impact:** The seam works — tests inject `deps.callOpenRouter` and the function honors it. But a future reader will wonder why one orchestrator uses `deps.fn || moduleFn` and the other uses `moduleFn` (with the test plumbing an in-process override a different way). This is a stylistic call; either pattern is fine if it's consistent. Not blocking.
+**Impact:** Small. The `renderJSON` function will be discovered by the next reader who greps for `JSON` and waste 5 minutes looking for a route that doesn't exist. The `var _` line is a comment-flagged footgun: a `goimports` run on a future file that uses `context` will silently drop the `_` and break nothing, but a future refactor that drops the `context` import will re-add the `_` to keep the import. The PR's "no new code without a route" norm is the right one to follow here.
 
-**Suggestion:** Leave as-is. The `deps.callOpenRouter` override is genuinely needed (the tests use it) and the fallback is documented. If CQ-001's split happens, consider routing both through `deps` for uniformity — but it's a stylistic refactor, not a quality issue.
+**Suggestion:** Delete both. The `context` import is no longer needed after deletion (`grep "context\." dashboard.go` shows zero uses besides the dead `_` line); `goimports` will remove the import on the next save. If a JSON debug helper is ever wanted, the API surface already has `webhook.writeJSON` and the dashboard can wrap it.
 
 ---
 
 ### CQ-008
 | Field    | Value |
 |----------|-------|
-| Tier     | 🟢 Optional |
-| Decide   | Leave as-is |
-| Location | `apps/runner/src/lib/openrouter.mjs:137-150` — `extractAssistantText` |
+| Tier     | 🟡 Follow-up |
+| Decide   | Defer |
+| Location | `apps/receiver/internal/dashboard/dashboard.go:101-130` `route` (CC ~9) + `dashboard.go:443-468` `serveInstallationControl` (CC ~5) — every new view adds another `case` to the same switch |
 
-**Observation:** `extractAssistantText` handles two content shapes (string vs. array of `ChatContentItems`) and falls back to `""` for everything else. The array path joins parts with `out.join("")` and assumes every part with a `.text` field is a string — it does not distinguish `type: "text"` parts from other types (e.g., `type: "image_url"` would be silently dropped if it lacked a `.text` field, and parts that are neither string nor object would also be silently dropped).
+**Observation:** `route()` is a 30-line switch on `path` with nine cases; six are pure GETs that map to `h.serveX` methods, one is the redirect-to-runs landing, and two are the parameterized `runs/{id}` and `installations/{id}` patterns. The 9-case switch is on the edge of "a new view requires touching two places" (the switch and a new `serveY` method), and the `serveInstallationControl` POST handler at `:443-468` does the form parsing + lens-list parsing + store call + redirect inline. A new view ("retention schedule", "audit log") will require (a) adding a `case` to the switch, (b) adding a new `serveY` method, (c) writing a new template. The wiring is honest, but the surface area scales linearly with each view, and the file is already 497 lines.
 
-**Impact:** Forward-compatibility is good for the common case. The boop review is always a single text block, so the array path is for SDK evolution only. If a future model returns a `tool_call` part, it is dropped silently — which is the right behavior for this runner, but the test at `openrouter.test.mjs:100-120` only covers the `type: "text"` array case. Not flag-worthy as a bug, just a note that the array path's behavior on non-text parts is implicit.
+**Impact:** Low for the next view (it's three mechanical additions), but the per-view cost will add up. The cleanest signal of this is `serveInstallationControl`: it has its own lens-CSV parsing logic inline (`:454-461`) that doesn't belong in a route handler — a future "lens editor" view (e.g., a per-lens enable toggle) will land in a third handler with a third copy of the same parsing.
 
-**Suggestion:** Leave as-is. The forward-compat test covers the common shape. If tool-call support is added later, the array path needs explicit handling.
+**Suggestion:** Defer. The "small, ordered most-specific first" comment at `dashboard.go:108` is honest about the trade-off. When the next view is added, consider whether the route table is the right place for the parsing (it isn't) and whether a small `formParseLensOptOut(s string) []string` helper extracted from `serveInstallationControl` makes sense (it does). Not blocking; flag for the next dashboard PR.
 
 ---
 
@@ -204,13 +196,43 @@ The test doubles as documentation of the cutover's failure mode.
 |----------|-------|
 | Tier     | 🟢 Optional |
 | Decide   | Leave as-is |
-| Location | `apps/receiver/internal/webhook/handler.go:827-835` — `resolveSDKEnabled` |
+| Location | `apps/receiver/internal/webhook/rerun.go:74-89` and `webhook/dashboard.go` already-existing handlers — `buildJobName` is duplicated three times across the repo as `buildJobName` / `buildJobNameRerun` / `buildJobNamePrefix` |
 
-**Observation:** `resolveSDKEnabled` is 9 lines, 2 branches, and well-tested with a 9-case table at `handler_test.go:179-207`. The function is small enough that any further refactor (e.g., a lookup table) would be cosmetic. The case-insensitive `hasLabel` lookup is a deliberate choice covered by the `Boop:OpenRouter-SDK` test row.
+**Observation:** Three "build a K8s Job name from (owner, repo, pr, sha7)" functions now exist: `handler.go`'s `buildJobName` (existing), `webhook/rerun.go:255-258` `buildJobNameRerun`, and `store/rerun.go:78-83` `buildJobNamePrefix`. The `shortSHARerun` helper at `webhook/rerun.go:246-251` is also a near-duplicate of the same helper in `handler.go`. The PR's own comments at `webhook/rerun.go:242-245` and `store/rerun.go:85-89` acknowledge the duplication: "Duplicated here because handler.go's are unexported and the re-run flow needs them. The implementations match exactly." The three regex sanitizers (`jobNameSanitizer` in `handler.go`, `rerunJobNameSanitizer` in `webhook/rerun.go:253`, `jobNameSanitizerRerun` in `store/rerun.go:89`) are three literals of the same `[^a-z0-9-]` pattern.
 
-**Impact:** None — this is the cleanest new code in the PR. The test table even exercises the cluster-default-unset case (`""`) which is easy to miss.
+**Impact:** Three copies of the same string formatter. The comment is honest about the "can't import because unexported" reason, but a Job-name format change (e.g., adding a build-attempt suffix, switching to a longer short-SHA) now requires three coordinated changes with a silent failure mode if one is missed. The store copy is the most concerning because it lives behind a SQLite LIKE prefix match — a Job-name drift between the handler and the store would make `CountRerunJobsForSHA` return the wrong count without any error.
 
-**Suggestion:** Leave as-is. Positive note: the test at `handler_test.go:209-234` (`TestBuildJobForwardsOpenRouterSDKEnabled`) confirms the env var is actually injected into the Job spec — that's the kind of test that often gets forgotten in feature-flag PRs.
+**Suggestion:** Leave as-is for this PR. A clean fix is a `internal/jobname` package with one function and one regex, but that's a refactor that touches `handler.go` and is outside QUB-110's scope. The PR comments name the exact split the next refactor should target.
+
+---
+
+### CQ-010
+| Field    | Value |
+|----------|-------|
+| Tier     | 🟢 Optional |
+| Decide   | Leave as-is |
+| Location | `apps/receiver/internal/dashboard/dashboard.go:142-146` — `q.Get("limit")` is read but explicitly dropped with `_ = s` |
+
+**Observation:** The `serveRuns` handler reads `q.Get("limit")` then discards it with `_ = s` and a comment: "The default (50) is fine for a dashboard page; no override needed." This is honest dead code: the handler reads the parameter, doesn't pass it to `ListRunsFilter.Limit`, and the value falls on the floor. The `limit` parameter is not surfaced in the `runs.html` template's filter form (`:5-23`), so no user can actually set it. The `Limit` field on `ListRunsFilter` (store-side) is used by the JSON API (`webhook/dashboard.go:154-158` does pass it through).
+
+**Impact:** Zero — the code is honest about what it does, the `_` is intentional, and the comment names the trade-off. The only cost is the future reader who greps for `limit` and wonders why it's there. A 30-second investigation resolves it.
+
+**Suggestion:** Leave as-is. If a future dashboard view ever wants to pass a custom limit, the parameter is already wired. If not, deleting the block is a one-line cleanup. The honest comment is the right thing.
+
+---
+
+### CQ-011
+| Field    | Value |
+|----------|-------|
+| Tier     | 🟢 Optional |
+| Decide   | Leave as-is |
+| Location | `apps/runner/src/lib/dashboard.mjs:21-22` — `POST_TIMEOUT_MS = 5000` and `POST_RETRIES = 1` are module-level constants with no env override; `apps/receiver/internal/webhook/dashboard.go` `RecordStage` etc. have no timeout/Retry-After handling |
+
+**Observation:** The runner's `postWithRetry` uses fixed 5s timeout and 1 retry with 200ms×attempt backoff. The receiver's `RecordStage` and `RecordHeartbeat` handlers do not set a `WriteTimeout` per-route — they share `WriteTimeout: 30 * time.Second` from `main.go:140`, which is the per-connection default. A receiver under load (multiple runners POSTing heartbeats and stages simultaneously) will hold connections open for up to 30s before the dashboard-side receiver closes them. The runner's 5s timeout will fire first, but the runner will retry once and the receiver will continue processing the original request — no correctness bug, just an asymmetry that will surface as "mysterious 5xx" if the receiver ever slows down.
+
+**Impact:** Low — this is the kind of asymmetry that doesn't show up in tests but shows up in the first incident. The "best-effort, drop on failure" contract (per the file-level comment at `dashboard.mjs:1-17`) is the right one for the runner side, so the constants don't need to change. The receiver's per-route WriteTimeout is a separate, larger question (the existing telemetry/status handlers have the same property and the load tests presumably cover it).
+
+**Suggestion:** Leave as-is. If a future PR adds a load test that hammers the receiver with concurrent heartbeats, the per-route WriteTimeout is a follow-up to consider, but it's not in this PR's scope.
 
 ---
 
@@ -218,21 +240,47 @@ The test doubles as documentation of the cutover's failure mode.
 
 | File | Function | CC | LOC | Notable coupling |
 |------|----------|----|-----|------------------|
-| `apps/runner/src/lib/opencode.mjs` | `runOpenRouterSkill` (NEW) | 7-8 | 105 | imports `callOpenRouter`/`buildTelemetry`/`readOpencodeModel` from `openrouter.mjs`; accepts `deps.callOpenRouter` override; reuses local `buildBoopPrompt` + `parseReviewOutput` to avoid circular import |
-| `apps/runner/src/lib/opencode.mjs` | `runOpenCodeSkill` (CHANGED) | unchanged from baseline (~9) | unchanged | adds one early-return branch at top for SDK fast-path |
-| `apps/runner/src/lib/openrouter.mjs` | `callOpenRouter` (NEW) | 4 | 84 | `deps.client` injection, `deps.AbortControllerCtor`, `deps.timeoutMs`; no module-level state |
-| `apps/runner/src/lib/openrouter.mjs` | `buildTelemetry` (NEW) | 3 | 25 | pure mapping; handles `error` stamp on failure |
-| `apps/runner/src/lib/openrouter.mjs` | `readOpencodeModel` (NEW) | 2 | 12 | `fs.readFile` + `JSON.parse`; silent failure → `""` |
-| `apps/runner/src/lib/openrouter.mjs` | `extractAssistantText` (NEW) | 3 | 13 | pure; no deps |
-| `apps/runner/src/lib/openrouter.mjs` | `extractUsage` (NEW) | 4 | 28 | pure; no deps |
-| `apps/receiver/internal/webhook/handler.go` | `resolveSDKEnabled` (NEW) | 3 | 9 | pure given `h.cfg.OpenRouterSDKDefault` + `labels` |
-| `apps/receiver/internal/webhook/handler.go` | `submitJob` (CHANGED) | unchanged | +9 | adds one new arg (`labels []string`) and one helper call; signature change rippled to `handlePullRequest` / `handleIssueComment` callers (the issue_comment path passes `nil` for labels) |
-| `apps/runner/src/lib/opencode.test.mjs` | SDK-branch tests (NEW) | n/a | 83 (5 tests) | `deps.callOpenRouter` injection; `SDK_REVIEW_BODY` fixture shared across cases |
+| `dashboard/dashboard.go` | `serveRuns` | 5 | 41 | reads `failure_class` from query but doesn't filter on it (CQ-004) |
+| `dashboard/dashboard.go` | `serveRunDetail` | 5 | 29 | calls `WalkLineage`; template references `.Lineage.Up` but struct has `.Lineage.WalkUp` (CQ-001) |
+| `dashboard/dashboard.go` | `renderWaterfall` | 5 | 42 | pure (no I/O); the densest piece of dashboard logic |
+| `dashboard/dashboard.go` | `route` | 9 | 30 | linear switch on path; every new view adds a case (CQ-008) |
+| `dashboard/dashboard.go` | `serveInstallationControl` | 5 | 25 | inline form parsing of `lens_opt_out` CSV |
+| `dashboard/dashboard.go` | `renderJSON` | n/a | 5 | **dead code** (CQ-007) |
+| `dashboard/dashboard.go` | `var _ = context.Background` | n/a | 1 | **dead code** (CQ-007) |
+| `store/stages.go` | `UpsertRunStage` | 4 | 30 | clean ON CONFLICT shape |
+| `store/stages.go` | `ListStuckRuns` | 4 | 36 | LIMIT-clamp pattern repeats across the file (CQ-011 has related note) |
+| `store/lens_telemetry.go` | `ReplaceLensTelemetry` | 5 | 41 | atomic DELETE+INSERT in transaction; tested at `store_test.go:1070` |
+| `store/lens_telemetry.go` | `LensCostSummary` | 3 | 34 | clean GROUP BY query |
+| `store/audit.go` | `RecordAuditEvent` | 4 | 26 | rejects empty actor/action; tested at `store_test.go:861` |
+| `store/audit.go` | `ListRetentionSchedule` | 5 | 36 | computes scheduled_deletion in Go, not SQL |
+| `store/rerun.go` | `WalkLineage` | 5 | 45 | bounded walk with cycle defense |
+| `store/installations.go` | `UpsertInstallations` | 12 | 96 | read-prior → DELETE → INSERT in one tx (CQ-006) |
+| `webhook/dashboard.go` | `RecordStage` | 7 | 45 | **no test** (CQ-005) |
+| `webhook/dashboard.go` | `RecordHeartbeat` | 5 | 25 | **no test** (CQ-005) |
+| `webhook/dashboard.go` | `RecordLensTelemetry` | 6 | 45 | **no test** (CQ-005) |
+| `webhook/dashboard.go` | `ListRuns` | 9 | 58 | seven optional query params; tested indirectly via the dashboard view |
+| `webhook/dashboard.go` | `Stats` | 9 | 69 | four sub-queries; tested at `dashboard_test.go:129` |
+| `webhook/rerun.go` | `RerunPreview` | 9 | 62 | **no test** (CQ-005) |
+| `webhook/rerun.go` | `Rerun` | 11 | 80 | **no test**; CC crosses 10 (CQ-005) |
+| `webhook/k8s_reconcile.go` | `StartJobReconciler` | 5 | 28 | goroutine + cancel + interval clamp |
+| `webhook/k8s_reconcile.go` | `reconcileJobsOnce` | 3 | 25 | K8s API + store backfill |
+| `webhook/k8s_reconcile.go` | `classifyJobExit` | 4 | 44 | **no test** (CQ-005) |
+| `webhook/k8s_reconcile.go` | `failureClassFromContainerState` | 3 | 16 | **no test** (CQ-005) |
+| `webhook/k8s_reconcile.go` | `mapExitReason` + `mapWaitingReason` | 5+5 | 24+15 | **no test** (CQ-005) |
+| `runner/src/lib/dashboard.mjs` | `postWithRetry` | 5 | 30 | single retry on 5xx/timeout; 4xx/202 dropped |
+| `runner/src/lib/dashboard.mjs` | `startHeartbeat` | 4 | 29 | unref'd setInterval; returns idempotent stop |
+| `runner/src/lib/workflow.mjs` | `runStages` | 8 | 56 | post-start + try/finally post-end wrapping |
+| `runner/src/lib/workflow.mjs` | `withRetry` | 8 | 68 | exponential backoff inside stage loop |
+| `runner/src/index.mjs` | `onStagePassed` | 7 | 42 | QUB-92 resume merge + writeWorkflowState |
+| `apps/runner/src/lib/dashboard.mjs` | test surface | n/a | 191 | 14 tests, all happy-path + retry/reject |
 
 ---
 
 ## Unable to Verify
 
-- **Pre-existing line `// temporary verify mark 1785624554` at `opencode.mjs:821`.** This line is in the file at HEAD but not in the diff (`git diff HEAD~1 HEAD` does not show it being added), so it is pre-existing. Out of scope per the task constraints, but worth flagging to the author as a leftover editorial mark that should be removed.
-- **Net `opencode.mjs` file growth to 821 lines.** The file was already a kitchen sink (parser, prompt builder, two orchestrators, ANSI stripper, shell quoter). The new function adds 105 lines to an 800-line file. Whether the file warrants splitting into `review/` and `orchestration/` submodules is a judgment call outside this PR's scope.
-- **Test coverage of the env-shaped injection at `opencode.mjs:764`** (`env: { OPENROUTER_API_KEY: openrouterApiKey }`). The production code path looks correct (matches the contract `callOpenRouter` reads from `deps.env.OPENROUTER_API_KEY`), but no test in `opencode.test.mjs` asserts that the key actually reaches `callOpenRouter`. The `makeFakeClient` / `makeSdkDeps` fixture in `openrouter.test.mjs:15` is used by the SDK tests but `opencode.test.mjs` rolls its own simpler mock that captures the call args (`callOpenRouter: async (_prompt, opts) => { ...; return { ..., _args: opts }; }` at `opencode.test.mjs:710-719`) but the existing tests do not assert on `_args` — so the API-key plumbing is not pinned. A one-line `assert.equal(opts.env.OPENROUTER_API_KEY, "api-key")` would close this gap.
+- **`RecordStage`'s `DurationMS = 0` placeholder on the end POST (`webhook/dashboard.go:519-521`).** The code sets `DurationMS = 0` for the end POST because the runner's own clock isn't authoritative, and the comment claims the waterfall will compute the duration at render time via `durMS(s)`. The render path at `dashboard.go:297-305` confirms the fallback: `if s.EndedAt != nil { return s.EndedAt.Sub(s.StartedAt).Milliseconds() }` computes the duration from the server-stamped timestamps. So the `0` is harmless. But a future change that treats `DurationMS = 0` as "missing" would break the end-POST contract; worth a one-line comment that says "always 0; the render computes the real value" rather than the current comment about "<1s" rendering.
+- **The 11 `cc` on `Rerun` (`webhook/rerun.go:150-230`).** I counted 11 manually; the function has 80 lines and a linear flow with one if-chain (confirm, reason, status check, count, name, upsert, supersede, log, writeJSON). The single retryable error path is the upsert failure. The function is correct and readable but on the edge of the 10-branch threshold. A future change that adds a second error-mapping branch (e.g., translating the store's `ErrDuplicateKey` into a 409) will push it over. Worth a small refactor when the K8s Job creation (the "Phase 4 wires the K8s jobbuilder half" follow-up) lands, because the Job-creation path will add its own error-mapping branch.
+- **The `var _ = context.Background` line (`dashboard.go:496-497`).** Confirmed unused in the rest of the file via grep; deletion is safe.
+- **The new test at `store_test.go:1070` `TestReplaceLensTelemetry_AtomicReplace`.** The "atomic" claim is enforced by the test's setup (one Replace, then another), but the test does not exercise a partial-failure path (e.g., a network drop in the middle of the transaction). SQLite's BEGIN/COMMIT is ACID at the SQL level; the test confirms the application behavior. Not a gap to fix — the SQL-level atomicity is the store's contract.
+- **The `webhook.hmac.fail` and `webhook.hmac.pass` audit action types** listed in `migrations.go:441-442` as "cross-cutting ledger" but not referenced in any handler. The docstring at `audit.go:5-17` calls the audit log "QUB-112" and lists the actions the dashboard emits — neither `webhook.hmac.*` action is in the dashboard's vocabulary. This is a forward-reference to a different PR (the HMAC ledger the audit log was originally scoped alongside) that hasn't landed. Not blocking; flag for the next audit-touching change.
+- **The `_ = s` discard on `q.Get("limit")` in `dashboard.go:142-146`.** Confirmed via grep; the parameter is read but not used. CQ-010.

@@ -1,12 +1,12 @@
 # Structural & Dependency Audit
-**Date:** 2026-08-04
-**Scope:** QUB-94 — OpenRouter SDK migration. Files: `apps/receiver/cmd/receiver/main.go`, `apps/receiver/internal/webhook/handler.go`, `apps/receiver/internal/webhook/handler_test.go`, `apps/receiver/internal/webhook/jobbuilder.go`, `apps/runner/src/lib/config.mjs`, `apps/runner/src/lib/opencode.mjs`, `apps/runner/src/lib/opencode.test.mjs`, `apps/runner/src/lib/openrouter.mjs` (new), `apps/runner/src/lib/openrouter.test.mjs` (new).
+**Date:** 2026-08-06
+**Scope:** QUB-108 → QUB-112 dashboard cross-cutting. Branch `feature/qub-112-dashboard-cross-cutting`, 5 stacked commits. Files: `apps/receiver/internal/dashboard/dashboard.go` (new, 497 lines), `apps/receiver/internal/dashboard/templates/*.html` (7 new), `apps/receiver/internal/webhook/dashboard.go` (new, 833 lines), `apps/receiver/internal/webhook/rerun.go` (new, 258 lines), `apps/receiver/internal/webhook/k8s_reconcile.go` (new, 257 lines), `apps/receiver/internal/webhook/handler.go` (+37 lines: `isPaused` and call sites), `apps/receiver/internal/store/audit.go` (new, 200 lines), `apps/receiver/internal/store/rerun.go` (new, 161 lines), `apps/receiver/internal/store/migrations.go` (now v1–v5), `apps/runner/src/lib/dashboard.mjs` (new, 225 lines), `apps/runner/src/lib/workflow.mjs` (+21 lines), `apps/runner/src/index.mjs` (+28 lines for dashboard hooks).
 
 ---
 
 ## Summary
 
-The migration is shaped well for the rollback: the SDK fast-path is a single early `if` in `runOpenCodeSkill`, the rest of the file is the unchanged subprocess branch, and the QUB-98 delete is mostly a one-file edit. Flag layering (cluster env → per-PR label → `BOOP_USE_OPENROUTER_SDK` env → boolean `ctx.openrouterSdkEnabled`) is clean and the receiver does not leak flag logic into the runner. The new file `openrouter.mjs` is a clean leaf: nothing in the repo imports it, and it does not import from `opencode.mjs`, so the cross-file surface is genuinely one-directional. The main coupling risk is that `runOpenRouterSkill` (~100 lines) plays three roles (prompt orchestrator, SDK transport, error→review translator) and would balloon if a future change adds streaming, tool use, or retries.
+The cross-cutting is shaped well for the rollback: each QUB-N commit introduces one new file or one narrow edit, and the data-layer changes in `store/` are additive migrations. The dashboard's own coupling risk is that the operator UI is built directly on `*store.Store` with no seam, and the receiver's `*Handler` is now the de-facto app container for webhook + dashboard API + K8s reconciler + retention + backup + installation poller, with one struct and one `cfg`. The audit log and retention schedule (QUB-112) are the most worrying: the store-side API exists, the tests exist, and no caller writes a row or renders a view. Two other structural issues are real bugs today: the runs page's `failure_class` filter dropdown is wired to a field the store never reads, and the dashboard renders an N+1 telemetry fan-out that `webhook/dashboard.go:188` already solved differently for the JSON API.
 
 ---
 
@@ -15,71 +15,71 @@ The migration is shaped well for the rollback: the SDK fast-path is a single ear
 ### SP-001
 | Field    | Value                                              |
 |----------|----------------------------------------------------|
-| Tier     | 🟡 Follow-up |
-| Decide   | Defer |
-| Location | `apps/runner/src/lib/opencode.mjs:716-820` — `runOpenRouterSkill` |
+| Tier     | 🔴 Blocking |
+| Decide   | Change now |
+| Location | `apps/receiver/internal/dashboard/dashboard.go:182-185` and `apps/receiver/internal/dashboard/templates/runs.html:14-22` — `runsFilter.FailureClass` + filter `<select>` |
 
-**Observation:** `runOpenRouterSkill` is one function that builds the prompt, resolves the model, posts status, calls the SDK, translates `AbortError` into a timeout throw, translates other errors into a degraded `parseError` review, parses the response, builds telemetry, and logs both the start and exit. Describing the function requires three different verbs ("orchestrate," "call," "translate"). It is not currently causing a bug, and the function is short enough to read in one pass.
+**Observation:** `dashboard.go:184` adds `FailureClass` to the local `runsFilter` view-model and `runs.html:14-22` exposes a `<select name="failure_class">` with OOMKilled / Container error / Crash loop / Image pull / llm_timeout / rate_limit_429 options. The handler passes the URL value through to `runsFilter.FailureClass` (line 169) but never forwards it to the store: `serveRuns` calls `h.store.ListRuns(r.Context(), f)` where `f` is the bare `store.ListRunsFilter{Owner, Repo, Status}` (lines 134-141), and `store.ListRunsFilter` (`store/runs.go:255-264`) has no `FailureClass` field. The exceptions view does the class filter in Go (`serveExceptions:357-365`), but the runs page's filter chip is wired to a dead control.
 
-**Impact:** QUB-98 keeps this function intact, so the cost is only future work. If a follow-up adds streaming responses, tool use, or a retry loop, the function will exceed 200 lines and the error-translation branch (lines 766-794) will become the thing that nobody wants to touch. The model-resolution block (lines 728-736) is also the part that will change for QUB-98: the `readOpencodeModel` branch dies when the ConfigMap goes away, and the operator message ("set OPENROUTER_MODEL or mount opencode.json") becomes wrong. Splitting that block out now makes the QUB-98 edit a one-line delete.
+**Impact:** An operator who picks "OOMKilled" on `/dashboard/runs` and clicks apply sees the unfiltered list, with no error and no indication anything is wrong. The exceptions view's chips look like the same control; they behave correctly because they go through `serveExceptions`. This is a UI/data contract mismatch that ships to the operator. The dropdown's `<option value="llm_timeout">` and `rate_limit_429` are also values that the K8s reconciler never writes — the only failure_class values actually produced are in `failureClassFromContainerState` (`webhook/k8s_reconcile.go:47`), which yields `oom_killed`, `container_error`, `crash_loop`, `image_pull`, `config_error`, and `container_<reason>` / `stuck_<reason>`. The dropdown is offering choices that can never match a row.
 
 **Suggestion:**
-```js
-// Move model resolution to a dedicated function next to readOpencodeModel.
-export function resolveOpenRouterModel(ctx, deps) {
-  const fromCtx = ctx.openrouterModel;
-  if (fromCtx) return fromCtx;
-  return readOpencodeModel(deps);
-}
-
-// runOpenRouterSkill then drops lines 728-736 and calls
-// const model = await resolveOpenRouterModel(ctx, deps);
-```
+- Add `FailureClass string` to `store.ListRunsFilter` and a `failure_class = ?` clause in `ListRuns`.
+- Drop the two values from the dropdown that the reconciler never produces (or add a follow-up PR that maps runner-reported classes — `llm_timeout`, `rate_limit_429` — to the column too, then add a `runner` mapper in `k8s_reconcile.go`'s sibling file).
+- Forward `q.Get("failure_class")` from `serveRuns` into `f.FailureClass` so the chip is the chip the operator sees.
 
 ---
 
 ### SP-002
 | Field    | Value                                              |
 |----------|----------------------------------------------------|
-| Tier     | 🟡 Follow-up |
-| Decide   | Defer (until QUB-98) |
-| Location | `apps/runner/src/lib/opencode.mjs:595-603` — `runOpenCodeSkill` dispatch |
+| Tier     | 🔴 Blocking |
+| Decide   | Change now |
+| Location | `apps/receiver/internal/store/audit.go:50,82` and `apps/receiver/cmd/receiver/main.go` — `RecordAuditEvent` / `ListAuditEvents` |
 
-**Observation:** The dispatch is a single early `if (ctx.openrouterSdkEnabled) return await runOpenRouterSkill(...)`. After QUB-98 deletes the subprocess branch, the function still has the name `runOpenCodeSkill` even though it does not run opencode. The orchestrator caller (`workflow.mjs:729`) is also named `defaultRunOpenCodeSkill`.
+**Observation:** `RecordAuditEvent` and `ListAuditEvents` are defined, fully tested (`store_test.go:830-867`), and the audit_events table is created in migrations. The dashboard's nav (`templates/layout.html:53-58`) links Runs / Live / Exceptions / Costs / Installations — no audit link. The mutation paths that the audit log is meant to record — `Rerun` (`webhook/rerun.go:150`), `serveInstallationControl` (`webhook/dashboard.go:443`), and the K8s reconciler (`webhook/k8s_reconcile.go:161`) — all skip `RecordAuditEvent`. The "Actor" column is documented as "the BOOP_DASHBOARD_TOKEN bearer" but the dashboard middleware (`dashboard/dashboard.go:76-92`) does not stamp an actor into the request context. `RecordAuditEvent` rejects empty `Actor` (audit.go:51-53), so even if a handler tried to write, the writer has no source of identity.
 
-**Impact:** This is a naming-only concern and does not block QUB-94. The function body, the export name, and the caller all keep the opencode-anchored wording through the cutover. A maintainer reading the post-cutover file has to read the body to discover the function no longer shells out to opencode. Renaming is a search-and-replace in `opencode.mjs` + `workflow.mjs` + ~15 test files; that is the kind of refactor that's best done as part of the QUB-98 commit so the rename is a single PR.
+**Impact:** QUB-112 ships a schema and a Go API surface, but the operator-visible feature is empty: no view, no mutation emits an event, no identity to attribute. The next operator incident ("who paused this install last week?") has no answer. The two follow-up PRs that wire this up — actor extraction from the middleware and audit writes in 3 handlers + a new `/dashboard/audit` route + a nav link — are now a single multi-file PR instead of landing naturally with the audit table commit.
 
-**Suggestion:** Open a QUB-98 todo: rename `runOpenCodeSkill` → `runReviewSkill` (or `runNarrateStep`), and `defaultRunOpenCodeSkill` in `workflow.mjs` accordingly. Do not do it in QUB-94 — the rename would touch files QUB-94 has no reason to touch.
+**Suggestion:**
+- Add the actor extraction now: have `dashboard.Handler.Middleware` set `ctx = context.WithValue(r.Context(), actorKey, h.token)` (or the first 8 chars for a real-identity future), and pass that context to `serveInstallationControl` and `Rerun`.
+- Wrap the three mutating handlers with `h.store.RecordAuditEvent(ctx, store.AuditEvent{Action: "rerun.create", Actor: actorFromCtx(ctx), TargetID: id, Details: ...})`. Today's empty state is recoverable because no real data has been written; the next commit can land as audit-wiring, not audit-table.
+- Add `serveAudit` and a nav link in a follow-up; the store-side `ListAuditEvents` is ready.
 
 ---
 
 ### SP-003
 | Field    | Value                                              |
 |----------|----------------------------------------------------|
-| Tier     | 🟢 Optional |
-| Decide   | Leave as-is |
-| Location | `apps/runner/src/lib/opencode.mjs:752` — `deps.callOpenRouter || callOpenRouter` |
+| Tier     | 🟡 Follow-up |
+| Decide   | Defer (one cleanup PR) |
+| Location | `apps/receiver/internal/webhook/handler.go:1143-1150`, `apps/receiver/internal/webhook/rerun.go:242-257`, `apps/receiver/internal/store/rerun.go:78-89` — `buildJobName` / `buildJobNameRerun` / `buildJobNamePrefix` |
 
-**Observation:** `runOpenRouterSkill` reads `deps.callOpenRouter` as a test injection point. The production `deps` bundle built in `index.mjs:127-130` does not set it, so the real `callOpenRouter` is used. The test seam mirrors the existing pattern (`deps.runOpencodeJSON`, `deps.spawnFn`, `deps.fetchImpl`).
+**Observation:** Three copies of essentially the same function. `handler.go:1145` is `buildJobName(owner, repo, number, sha)`; `rerun.go:255` is `buildJobNameRerun(owner, repo, pr, sha)`; `store/rerun.go:78` is `buildJobNamePrefix(owner, repo, pr, sha7)`. All three lowercase, sanitize with the same regex, prepend `boop-`, and join with `-`. `rerunJobNameSanitizer` (`rerun.go:253`) and `jobNameSanitizerRerun` (`store/rerun.go:89`) are literally the same regex. The rerun comment on `rerun.go:242-245` admits this explicitly: "shortSHARerun / buildJobNameRerun mirror handler.go's helpers. Duplicated here because handler.go's are unexported".
 
-**Impact:** The override accidentally widens `deps` into something that *can* carry a stub for the SDK call, even though no production caller wires one up. If a future operator wires `deps` from config, they could pass a `callOpenRouter` field and route around the real SDK. Low risk — the field is not in the public dep surface documented anywhere, and `index.mjs` does not accept it from overrides for this path. The pattern matches the rest of the lib.
+**Impact:** Adding a new Job-name component (e.g. QUB-110's reviewers asked for a `-r{n}` suffix — already done — or a future "include the run-id suffix" change) requires editing three files. The store copy is the load-bearing one for the count query, but the string is computed in the handler anyway; the store's only use is the SQL `LIKE` prefix, and that can take the `owner-repo-pr-sha7` raw string instead of a re-sanitized copy. The risk is silent divergence: a future change to the sanitization rules in handler.go (e.g. allow uppercase repo names) won't propagate to the rerun flow's `CountRerunJobsForSHA`, and the count goes off-by-one.
 
-**Suggestion:** Add a one-line comment at the top of `opencode.mjs` near the import block noting that `deps.callOpenRouter` is a test seam and `index.mjs` never sets it. No code change.
+**Suggestion:**
+- Move `buildJobName` and `shortSHA` into a tiny shared package, e.g. `internal/jobname`, with two exported functions. Have `handler.go`, `jobbuilder.go`, `rerun.go` (handler) and `store/rerun.go` (store) all import it.
+- The store's `CountRerunJobsForSHA` keeps the regex check on the SQL row because the LIKE is approximate, but the prefix string it builds comes from the shared helper.
 
 ---
 
 ### SP-004
 | Field    | Value                                              |
 |----------|----------------------------------------------------|
-| Tier     | 🟢 Optional |
-| Decide   | Leave as-is |
-| Location | `apps/runner/src/lib/openrouter.mjs:44-67` — `callOpenRouter` env-shaped key |
+| Tier     | 🟡 Follow-up |
+| Decide   | Change now (small) |
+| Location | `apps/receiver/internal/webhook/dashboard.go:428-438` — `parseRunStage` |
 
-**Observation:** The API key reaches `callOpenRouter` via `deps.env.OPENROUTER_API_KEY`, not as a direct argument. The production call site (`opencode.mjs:754-765`) builds a single-key env object `{ OPENROUTER_API_KEY: openrouterApiKey }` to forward the key. The SDK constructor at `openrouter.mjs:67` reads `env.OPENROUTER_API_KEY` and passes it to `new OpenRouter({ apiKey })`.
+**Observation:** `parseRunStage` is a hardcoded switch mapping the runner's stage vocabulary to the receiver's `RunStatus`. The mapping is partial: it covers `running` / `succeeded` / `done` / `failed` and rejects anything else with 400. The runner's actual stage vocabulary lives in `workflow.mjs:82-233` (`STAGES`) where the status label for each macro stage is `auth`, `clone`, `review`, or `null` (silent). The dashboard's `live` view (`dashboard.go:308`) calls `ListRuns(..., Status: store.StatusRunning, ...)` to populate the "running" panel — a row that is `auth` or `clone` is not `running` in the store, so it doesn't show up. The receiver's `RecordStatus` accepts a stage string and stores it as-is on the run row (via `UpdateRunStatus`), so the row knows it was on `auth` — but the live view filters to `StatusRunning` only.
 
-**Impact:** This is mildly indirect (two indirections to pass one string) but it matches the SDK's own env-shaped contract: `new OpenRouter({ apiKey })` is the only documented constructor, and the SDK reads the same env var internally. Forcing a direct `apiKey` argument would require a new constructor call site but would not simplify anything. The shape also keeps `callOpenRouter` symmetric with how tests inject keys (via `env`). No change recommended.
+**Impact:** A run that is mid-`auth` or mid-`clone` does not show up on `/dashboard/live`. The waterfall (`renderWaterfall` at `dashboard.go:254`) shows the per-stage bars correctly because it reads `run_stages` rows, but the "live" KPI panel is empty. The runner's actual stage vocabulary (auth, clone, review) is in a separate file the receiver doesn't import. Adding a new macro stage means editing `workflow.mjs` (add the stage), the dashboard's `parseRunStage` (accept the new label), and the dashboard's `serveLive` (decide which statuses count as "live").
 
-**Suggestion:** No change. If a future SDK release adds a `client` constructor that takes the key directly, fold the env round-trip at that point.
+**Suggestion:**
+- Expose the runner's stage vocabulary as a constant in `dashboard.mjs` (or a shared `lib/stages.mjs`): `export const RUNNER_STAGES = { auth: "running", clone: "running", review: "running", done: "succeeded", failed: "failed" }`. The receiver mirrors this in a Go constant.
+- In `serveLive`, query the store with `Status IN (running, auth, clone, review)` (or a dedicated `ListLiveRuns` that returns "any non-terminal status"). Avoids the implicit two-source-of-truth.
+- Alternative: the runner could POST to `/status` with a single canonical `status` value (running/succeeded/failed) and the per-stage waterfall comes from `/stages`. That eliminates the stage-vocabulary mirror entirely. The receiver comment in dashboard.go:374-378 explicitly considers the receiver's clock authoritative — extending that rule to status is the same idea.
 
 ---
 
@@ -88,47 +88,32 @@ export function resolveOpenRouterModel(ctx, deps) {
 |----------|----------------------------------------------------|
 | Tier     | 🟡 Follow-up |
 | Decide   | Defer |
-| Location | `apps/runner/src/lib/opencode.mjs:766-794` — error handling in `runOpenRouterSkill` |
+| Location | `apps/receiver/internal/webhook/handler.go:135-173` — single `*Handler` struct with webhook + dashboard API + K8s reconciler + retention + backup + installation poller |
 
-**Observation:** The `try` block in `runOpenRouterSkill` has two distinct error contracts on a single call site:
-1. `AbortError` (timeout) → `throw new Error("openrouter run exceeded …-min timeout")` — propagates up to the runner's outer catch.
-2. Any other error (4xx, 5xx, network, JSON parse of response) → `return { ...review, telemetry: buildTelemetry(null, err) }` where `review.parseError = "sdk call failed"`.
+**Observation:** `*Handler` is now the receiver's app container. The struct holds `cfg`, `logger`, `kube`, `ghClient`, `store`, `dedup`, `limiter`, and the `consecutiveConfigMapFallbacks` counter. Its methods include webhook handling, deep health, dashboard data-layer GETs (8), runner POSTs (5), re-run API (2), installation control (1), installation poller start, retention loop start, backup loop start, and K8s reconciler start. Each of these reaches into a different subset of the struct fields. `cfg` alone is touched by the webhook path, the K8s reconciler (`TargetNamespace`), the dashboard API (`RunnerToken` for 4 endpoints), the retention loop (3 fields), the backup loop (3 fields), and the installations poller (1 field).
 
-The caller (`narrateSubStage` in `workflow.mjs:708-734`) reads `state.review.summary` to decide whether to post, and reads `state.review.telemetry` to decide whether to POST telemetry. The split means a 4xx looks like a parse failure downstream (no throw) while a timeout looks like a system error (throw). Both are reasonable, but the dual contract is easy to miss.
+**Impact:** The next time someone needs to add a new background loop or a new POST endpoint, the diff is "add a field to `*Handler`, add a method, possibly add a config field to the `Config` struct in the same file". The struct does not enforce that "the dashboard API has no business reading `cfg.WebhookSecret`" or "the K8s reconciler does not need `RunnerToken`". There is no test seam — the integration tests construct one real `*Handler` and exercise it. The `ghClientAPI` interface at handler.go:118 is the one good seam in the file; the store has no equivalent.
 
-**Impact:** The runner's existing parse-failure path already handles the "return a degraded review" shape, so contract #2 reuses an existing flow. The test `runOpenCodeSkill returns empty telemetry on SDK call failure` covers #2; the test `runOpenCodeSkill throws when the SDK call is aborted` covers #1. Coverage is fine. The concern is purely readability — a future maintainer who adds a new error type to the SDK has to know which of the two contracts applies. Today that decision is correct (`AbortError` is the only one tied to a runtime deadline), but the comment at line 768-771 only explains the AbortError case.
-
-**Suggestion:** Add a one-line comment above the `catch (err) {` line describing the dual contract:
-
-```js
-// Two error contracts on one call site:
-//   AbortError (timeout) — throw; the runner's outer catch handles it.
-//   Anything else — return a degraded review; the parse-failure path
-//   downstream swallows the summary and skips the post.
-```
+**Suggestion:**
+- For this PR: leave the struct alone (refactor would be a separate ticket; the cross-cutting is real but the next loop / endpoint is not on the immediate roadmap).
+- For the store layer: define `type ReadStore interface { ListRuns(...); GetRun(...); GetTelemetry(...); ... }` and a `type WriteStore interface { UpsertRun(...); RecordTelemetry(...); ... }`. The dashboard depends on `ReadStore`; the runner POSTs and the webhook depend on `WriteStore`. The reconciler / K8s reconcile code depends on a third narrow interface (`SetRunFailureClass`). Tests then construct fakes per concern.
 
 ---
 
 ### SP-006
 | Field    | Value                                              |
 |----------|----------------------------------------------------|
-| Tier     | 🟢 Optional |
-| Decide   | Leave as-is |
-| Location | `apps/runner/src/lib/opencode.mjs:712-715` — circular-import comment |
+| Tier     | 🟡 Follow-up |
+| Decide   | Defer |
+| Location | `apps/receiver/internal/dashboard/dashboard.go:147-174` (`serveRuns`) and `195-224` (`serveRunDetail`) — N+1 telemetry fan-out |
 
-**Observation:** The comment claims `runOpenRouterSkill` lives in `opencode.mjs` (not `openrouter.mjs`) "to avoid a circular import." Reading `openrouter.mjs` confirms it does NOT import from `opencode.mjs` — its only imports are `@openrouter/sdk` and `./config.mjs`. There is no cycle to avoid today. The real reason is that `runOpenRouterSkill` uses `buildBoopPrompt` and `parseReviewOutput`, which live in `opencode.mjs`. If `runOpenRouterSkill` lived in `openrouter.mjs`, `openrouter.mjs` would need to import those two helpers, and `opencode.mjs` already imports from `openrouter.mjs` (for `callOpenRouter`, `buildTelemetry`, `readOpencodeModel`). That would create the cycle.
+**Observation:** `serveRuns` calls `h.store.ListRuns` and then loops over each returned run calling `h.store.GetTelemetry` (line 161). For the default 50-row page that's 51 SELECTs. `webhook/dashboard.go:167-177` (the JSON API version of the same view) has the same loop. `RunWithTelemetry` (`webhook/dashboard.go:188-191`) exists to avoid this — it pairs the run with its telemetry in the JSON response — but the dashboard HTML view does not use it; it has its own `runsRow` (`dashboard.go:186-192`) and its own per-row `GetTelemetry` call. `serveRunDetail` does 4 separate calls (GetRun, ListRunStages, ListLensTelemetry, WalkLineage) on the same id; the first three are independent but the lens/stage queries could be one store method.
 
-**Impact:** Misleading comment. A reader who skims the file may waste time looking for an existing cycle or assume the cross-file surface is more tangled than it is. The actual layering (`openrouter.mjs` is a leaf; `opencode.mjs` calls into it) is the right shape, and the comment as written does not describe it.
+**Impact:** 50-row render = 51 queries. The store has an index on `telemetry(run_id)` and the call is cheap, but the dashboard refresh is "every few seconds during an incident" (dashboard.go:11). 51 queries × the dashboard's poll cadence × the operator's open tabs adds up. The pure HTML render path has not caught up to the JSON API's pattern.
 
-**Suggestion:** Tweak the comment to describe the actual constraint:
-```js
-// runOpenRouterSkill lives in opencode.mjs (not openrouter.mjs)
-// because it reuses buildBoopPrompt + parseReviewOutput, and
-// openrouter.mjs is meant to stay a leaf (only @openrouter/sdk
-// and config.mjs). Putting this function in openrouter.mjs would
-// force openrouter.mjs to import from opencode.mjs, completing
-// a cycle (opencode.mjs already imports from openrouter.mjs).
-```
+**Suggestion:**
+- Add a `ListRunsWithTelemetry` to the store (or have `ListRuns` accept a `WithTelemetry bool` flag) that joins telemetry in a single query. `serveRuns` uses it; the JSON API in `webhook/dashboard.go:167` also simplifies to one call.
+- For the per-detail view, add a `GetRunFull` that returns `{Run, Stages, Lenses, Lineage}` in one transaction (or one round-trip). The waterfall math (`renderWaterfall`) stays in the dashboard package.
 
 ---
 
@@ -137,13 +122,14 @@ The caller (`narrateSubStage` in `workflow.mjs:708-734`) reads `state.review.sum
 |----------|----------------------------------------------------|
 | Tier     | 🟢 Optional |
 | Decide   | Leave as-is |
-| Location | `apps/runner/src/lib/openrouter.mjs:67` — `new OpenRouter({ apiKey })` per call |
+| Location | `apps/runner/src/lib/workflow.mjs:279` — `const postStage = deps.postStage || defaultPostStage;` |
 
-**Observation:** `callOpenRouter` constructs the SDK client per invocation: `const client = injectedClient ?? new OpenRouter({ apiKey })`. In this codebase the runner is a one-shot K8s Job (`index.mjs:115-281` runs one review then `process.exit(1)` on failure or returns on success — no retry loop), so the SDK is constructed at most once per Job.
+**Observation:** The override path is dead. The runner's `deps` bundle (constructed in `index.mjs:80-135`) does not have a `postStage` field; it has `postStatus` (the GitHub comment PATCH) and `postDashboardStatus` (the dashboard `/status` POST). The `deps.postStage || defaultPostStage` line always falls through to `defaultPostStage` from `dashboard.mjs`. The comment at workflow.mjs:68-71 says "a test that wants to drive stages without a dashboard can pass `overrides.postStage = noop`", but `overrides` is the third argument to `runStages` and is never merged into `deps` before the `deps.postStage` read. A test that wants no-op stage POSTs has to construct a `deps` with a `postStage` field itself; the `overrides` channel doesn't reach this line.
 
-**Impact:** Per-call construction is fine today. If a future change calls the SDK multiple times per Job (e.g. multi-expert narrate, re-review delta, classifier call), the construction cost compounds and an injected client becomes more useful. The `injectedClient` seam is already in place for that day. No change now.
+**Impact:** Minor. The default path works (every test gets the real postStage, which is harmless because `postWithRetry` swallows errors). But the override pattern is misadvertised. The `overrides.runOpenCodeSkill` / `overrides.gather` etc. hooks at workflow.mjs:705, 734, 751, 793 work because they are read directly off `overrides`, not off `deps`. A future test that follows the documented `overrides.postStage = noop` recipe will silently not override anything.
 
-**Suggestion:** No change. If a follow-up starts making multiple SDK calls per Job, move the client construction to `index.mjs` (in the `makeDeps` bundle) and pass it through `deps.client`.
+**Suggestion:**
+- Either move the `postStage` resolution to read `overrides.postStage` (matching the other override reads) or fix the documentation. The smallest change: change the read to `overrides.postStage || defaultPostStage` to match the other override consumers in the file.
 
 ---
 
@@ -151,89 +137,129 @@ The caller (`narrateSubStage` in `workflow.mjs:708-734`) reads `state.review.sum
 | Field    | Value                                              |
 |----------|----------------------------------------------------|
 | Tier     | 🟡 Follow-up |
-| Decide   | Defer |
-| Location | `apps/receiver/internal/webhook/handler.go:557` — `submitJob` parameter list |
+| Decide   | Change now (small) |
+| Location | `apps/receiver/internal/store/audit.go:145-181` and `apps/receiver/internal/dashboard/templates/` — `ListRetentionSchedule` and missing UI |
 
-**Observation:** `submitJob` now has 15 positional parameters (the diff added `labels []string` as the 15th). The signature was already long before QUB-94; the new label is a per-PR signal that will likely be followed by more (e.g. `boop:skip-classify`, `boop:dry-run`). Each future label will append another parameter to a function that is already hard to read at a glance.
+**Observation:** `ListRetentionSchedule` is defined (store/audit.go:145) and tested (store_test.go:875) but has no dashboard route. The operator's "how long until this run is pruned?" question — which the docstring at audit.go:120-125 explicitly calls out — has no answer surface. The `retention` table mentioned in the docstring does not exist; the function returns rows computed on the fly from `runs.started_at + retention`. The dashboard's run-detail template (`templates/run_detail.html`) does not render the scheduled-deletion date. There is no nav link, no template, no handler. The store-side function is correct but is reading state that the operator cannot act on.
 
-**Impact:** This is the receiver-side analogue of the runner's "narrate stage" pulling more decisions. The labels are not the only per-PR data — `pr.Labels` is read fresh from the webhook payload, and the `prMeta` struct at line 782-790 already carries `Labels []string`. The function could take `prMeta` (or a smaller struct that wraps the PR data) instead of unpacking each field. Not blocking, but the next per-PR signal will make the change more expensive.
+**Impact:** Like SP-002, this is "the API exists; the feature doesn't." The retention job is running (the receiver starts `StartRetentionLoop` at main.go:150), so rows are actually being deleted; the operator just cannot predict which rows are about to disappear. A `cmd/receiver/main.go` log line at startup emits the effective retention; that's the only operator-visible signal today.
 
-**Suggestion:** Not a QUB-94 change. Open a follow-up to migrate `submitJob` to a struct-shaped input:
-```go
-type submitJobInput struct {
-    Delivery         string
-    Owner, Repo      string
-    Number           int
-    HeadSHA, BaseRef, PreviousHeadSHA string
-    Reason           string
-    ReactionCommentID, StatusCommentID, InstallationID int64
-    ReviewNumber     int
-    Labels           []string
-}
-```
+**Suggestion:**
+- Add a `/dashboard/retention` route and a `retention.html` template that renders a "Days until scheduled delete" column for every run, with the "imminent" flag (under 7 days) as a row class. Use the existing `ListRetentionSchedule` method.
+- For the run-detail page, add a single KPI on `templates/run_detail.html` showing "scheduled delete" with the timestamp.
+
+---
+
+### SP-009
+| Field    | Value                                              |
+|----------|----------------------------------------------------|
+| Tier     | 🟢 Optional |
+| Decide   | Leave as-is |
+| Location | `apps/runner/src/index.mjs:46-52, 280-360` — runner lifecycle wires GitHub status + dashboard status in two parallel paths |
+
+**Observation:** The success and catch paths in `index.mjs` post to both the GitHub status comment and the dashboard. The two functions have identical signatures, but the import line shadows the names: `postStatus` (line 41) is from `github.mjs`; `postStatus as postDashboardStatus` (line 47) is from `dashboard.mjs`. The two are kept in lockstep manually: line 333-334 and 343-348 each call both. The status vocabulary is the runner's `STAGES` IDs (`done`, `failed`, `auth`, `clone`, `review`) — the dashboard's `parseRunStage` only accepts four of those (see SP-004). The runner's STAGES list has `null` for silent sub-stages (gather / meta-review / narrate) but those never get a `/status` POST, so the asymmetry is silent.
+
+**Impact:** The shadowed name is fragile. A future contributor who searches for "postStatus" in `index.mjs` will see the dashboard version (because it's imported last in the block) and the GitHub version in `github.mjs`. The two functions have the same signature, but they POST to different URLs and take different context fields. The `Q`-filter on the imports means a re-ordering (alphabetical, for instance) would silently swap which one is bound to the bare name. The lockstep dual-posting is also duplication — if a third channel ever lands (Slack, PagerDuty), each call site grows by one line.
+
+**Suggestion:**
+- Rename the dashboard import to `postDashboardStatus` at the use site too (not just the import alias), so the symbol name in the body matches the source. The current code already does this; the issue is the `postStatus` import name (line 41) is the one most people will pattern-match on. Renaming the GitHub one to `patchGitHubStatus` (or the runner's internal wrapper) eliminates the shadow.
+- For the dual-posting: extract a `notifyLifecycle(stage, reason, ctx, deps)` helper that fans out to GitHub + dashboard + (future) other channels. The success and catch blocks each call one function.
+
+---
+
+### SP-010
+| Field    | Value                                              |
+|----------|----------------------------------------------------|
+| Tier     | 🟢 Optional |
+| Decide   | Leave as-is |
+| Location | `apps/receiver/internal/webhook/dashboard.go:667-780` and `124-182` — `StartInstallationsPoller`, `StartRetentionLoop`, `StartBackupLoop` live in the webhook package |
+
+**Observation:** Three background loops (installation poller, retention, backup) are started by methods on the `*Handler` struct in the `webhook` package, even though none of them touch the webhook path. The K8s reconciler in `k8s_reconcile.go` is a fourth. The `webhook` package's job is "verify the X-Hub-Signature-256, dispatch the event." It now also owns four long-running goroutines. The pattern is the same in all four: `if h.store == nil { return noop }`; `interval` floors; a 15-second start delay; a `ticker.Reset(interval)` loop with a per-tick context.WithTimeout.
+
+**Impact:** None today. The next background loop (metrics emission? rate-limit tracking?) will land in the same file and the boilerplate will be the fifth copy. The `webhook` package's surface area is now ~6x what its name suggests, and `cmd/receiver/main.go:147-163` calls 4 `Start*` methods on `*Handler` in sequence with `defer stopFunc()` lines that are easy to forget when adding the 5th.
+
+**Suggestion:**
+- Extract a `BackgroundLoops` type in the `webhook` package (or a new `internal/loops` package) that owns the start/stop and the boilerplate. `*Handler` exposes a `StartBackgroundLoops(ctx, cfg)` that fans out to each loop. Today this is optional; when the next loop lands, do it then.
 
 ---
 
 ## Structural Snapshot
 
 ```
-                ┌──────────────────────┐
-                │  receiver (Go)       │
-                │  Config.OpenRouter-  │
-                │  SDKDefault (env)    │
-                │  +                  │
-                │  resolveSDKEnabled()│
-                │  (label + default)  │
-                └──────────┬───────────┘
-                           │ templateVars.OpenRouterSDKEnabled ("0"|"1")
-                           ▼
-                ┌──────────────────────┐
-                │  buildJob (Go)       │
-                │  → BOOP_USE_OPEN-   │
-                │    ROUTER_SDK env    │
-                └──────────┬───────────┘
-                           │ K8s Job env
-                           ▼
-                ┌──────────────────────┐
-                │  runner (Node)       │
-                │  loadConfig()        │
-                │  ctx.openrouter-     │
-                │  SdkEnabled (bool)   │
-                │  ctx.openrouterModel │
-                └──────────┬───────────┘
-                           │
-                           ▼
-       ┌─────────────────────────────────────┐
-       │  runOpenCodeSkill (opencode.mjs)    │
-       │                                     │
-       │  if (ctx.openrouterSdkEnabled)      │
-       │    → runOpenRouterSkill (here)      │
-       │  else                               │
-       │    → materializeConfig              │
-       │    → runOpencode / JSON             │
-       │                                     │
-       │  runOpenRouterSkill uses:           │
-       │    buildBoopPrompt (this file)      │
-       │    parseReviewOutput (this file)    │
-       │    callOpenRouter (openrouter.mjs)  │
-       │    buildTelemetry (openrouter.mjs)  │
-       │    readOpencodeModel(openrouter.mjs)│
-       └─────────────────────────────────────┘
-                           │
-                           ▼
-       ┌─────────────────────────────────────┐
-       │  openrouter.mjs (leaf)              │
-       │  - callOpenRouter                   │
-       │    new OpenRouter({ apiKey })       │
-       │    per call (one Job = one call)    │
-       │  - buildTelemetry                   │
-       │  - emptyTelemetry                   │
-       │  - readOpencodeModel                │
-       │  imports: @openrouter/sdk, config   │
-       │  (no cycle today)                   │
-       └─────────────────────────────────────┘
+                         ┌────────────────────────────────────────────┐
+                         │     apps/receiver (Go binary)              │
+                         └────────────────────────────────────────────┘
+
+        ┌──────────────────┐    ┌────────────────────┐    ┌─────────────────────┐
+        │ cmd/receiver/    │───▶│  internal/webhook/ │───▶│  internal/store/    │
+        │ main.go          │    │  handler.go (47K)  │    │  store.go (Open)    │
+        │                  │    │  dashboard.go (NEW)│    │  runs.go            │
+        │  - 4 Start*()    │    │  rerun.go (NEW)    │    │  stages.go          │
+        │  - 1 mux + 7     │    │  k8s_reconcile.go  │    │  audit.go (NEW)     │
+        │    POST routes   │    │  reviews.go        │    │  rerun.go (NEW)     │
+        │                  │    │  jobbuilder.go     │    │  installations.go   │
+        │                  │    │  handler.go (NEW   │    │  lens_telemetry.go  │
+        │                  │    │   +37 lines:       │    │  retention.go       │
+        │                  │    │   isPaused)        │    │  backup.go          │
+        └──────────────────┘    │                    │    │  migrations.go      │
+                                │  One *Handler with │    │  (v1-v5)            │
+                                │  12+ methods and   │    │  stats.go           │
+                                │  4 background      │    └─────────────────────┘
+                                │  loops.            │              │
+                                └────────┬───────────┘              │
+                                         │  *store.Store (concrete, no interface)
+                                         ▼                              ┌─────────────┐
+                                ┌────────────────────┐                   │  K8s API    │
+                                │  internal/dashboard│                   │  (jobs,     │
+                                │  dashboard.go      │◀── embed.FS ─────│  pods)      │
+                                │  templates/*.html  │                   └─────────────┘
+                                │  (server-rendered  │
+                                │   html/template)   │                   ┌─────────────┐
+                                └────────┬───────────┘                   │  GitHub API │
+                                         │                               │  (Octokit)  │
+                                         ▼                               └─────────────┘
+                              [ operator browser ]
+
+        ┌────────────────────────────────────────────┐
+        │     apps/runner (Node.js, in-pod)          │
+        └────────────────────────────────────────────┘
+
+        ┌──────────────────┐    ┌────────────────────┐    ┌─────────────────────┐
+        │ src/index.mjs    │───▶│ src/lib/workflow   │───▶│ src/lib/dashboard   │
+        │ (orchestrator)   │    │  .mjs (STAGES,     │    │  .mjs (NEW: best-   │
+        │  - 2xx            │    │   runStages,       │    │   effort POSTs to   │
+        │  - try/catch/    │    │   withRetry)       │    │   /api/runs/.../stages│
+        │    finally       │    │                    │    │   .../heartbeat,    │
+        │  - dual post to  │    │  postStage         │    │   .../telemetry,    │
+        │    GitHub +      │    │  injected via      │    │   .../lens_telemetry│
+        │    dashboard     │    │  deps.postStage || │    │   .../status)       │
+        └──────────────────┘    │  defaultPostStage  │    └──────────┬──────────┘
+                                └────────────────────┘               │
+                                         │  deps bundle             │
+                                         │  (fetch, log, etc.)      │
+                                         ▼                          │  HTTP POSTs
+                                                                  ───┘
+                                                                  (in-cluster,
+                                                                   best-effort)
+
+   ╔══════════════════════════════════════════════════════════════════════╗
+   ║ Cross-binary dependency: runner → receiver                          ║
+   ║   URL hardcoded in dashboard.mjs:                                   ║
+   ║     ${ctx.dashboardUrl}/api/runs/{jobName}/stages                   ║
+   ║   Header hardcoded:                                                 ║
+   ║     X-BOOP-Runner-Token: ${ctx.dashboardToken}                      ║
+   ║   Stage vocabulary shared by convention only                        ║
+   ║   (see SP-004). No shared types / schema between the two binaries.  ║
+   ╚══════════════════════════════════════════════════════════════════════╝
 ```
 
-**Test seams:** `deps.callOpenRouter` (SDK stub), `deps.runOpencodeJSON` (subprocess JSON), `deps.spawnFn` (subprocess TUI), `deps.fetchImpl` (HTTP), `deps.fs` / `deps.execFile` (FS). `index.mjs` only wires the production ones; tests override per-case.
+**Summary of seams:**
+- **Receiver internal:** `ghClientAPI` (handler.go:118) is the only interface; the store is a concrete `*store.Store` everywhere. The dashboard handler has `*store.Store` directly; the runner-POST handlers have it directly. There is no `ReadStore` / `WriteStore` interface split.
+- **Receiver → K8s:** `h.kube kubernetes.Interface` (handler.go:138) — well-typed, swappable in tests.
+- **Runner internal:** clean `deps`-bundle pattern. `index.mjs:80-135` constructs the bundle; each lib module reads only what it needs. Tests inject fetch / spawn / log / etc. The `postStage` override is the one inconsistency (SP-007).
+- **Runner → receiver:** URL + header by string. No shared schema. Stage vocabulary is duplicated by convention (SP-004).
+- **Operator → receiver:** `BOOP_DASHBOARD_TOKEN` gates `/dashboard/*`; an empty value 401s everything (dashboard.go:78-80). The GET API endpoints (`/api/runs`, `/api/stats`, etc.) are NOT token-gated — the comment at webhook/dashboard.go:10-13 says the auth layer "sits in front of the dashboard, not in the receiver" if it ever moves behind an Ingress. Today there is no such fronting, so a misconfigured cluster exposes the data layer to anything that can hit the service.
 
-**What is easy to test:** the SDK path (fake `callOpenRouter` returns canned response), telemetry shape (`buildTelemetry` is pure), the receiver-side flag resolution (table-driven, no K8s). **What is hard to test:** the `injectedClient` seam in `callOpenRouter` (tested in `openrouter.test.mjs` only) and the dual error contract in `runOpenRouterSkill` (covered but easy to break silently). The runner lifecycle is one Job = one review, so no concurrency seams to worry about.
+**What is easy to test today:** `*Handler` with fakes for `ghClientAPI` and `kube`. The store via `store_test.go`. The runner lib via `dashboard.test.mjs` (overrides `fetchImpl`).
+
+**What is hard to test today:** The dashboard's HTML render path (templates are real, no test invokes `serveRuns` against a fake store). The N+1 telemetry fan-out is not asserted anywhere. The K8s reconciler's per-tick behavior (`k8s_reconcile.go:161`) is not directly tested; only the store round-trip is. The retention and backup loops are not unit-tested.

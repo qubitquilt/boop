@@ -1,0 +1,28 @@
+{{define "title"}}Retention — Boop Dashboard{{end}}
+{{define "content"}}
+<h2>Retention schedule</h2>
+<p>Every run row, sorted by scheduled deletion. The retention loop runs on a 5-min tick; the actual prune can lag the schedule by up to one tick. Rows under <strong>7 days out</strong> are flagged imminent so an operator can confirm a wanted row before it goes.</p>
+<p>Default retention is {{.RetentionDays}} days from the run's <code>started_at</code>.</p>
+
+{{if .Schedule}}
+<table>
+  <thead><tr>
+    <th>Run</th><th>Started</th><th>Scheduled deletion</th><th>Days out</th><th>Imminent?</th>
+  </tr></thead>
+  <tbody>
+    {{range .Schedule}}
+    <tr {{if .Imminent}}class="stuck"{{end}}>
+      <td><a href="/dashboard/runs/{{.RunID}}">{{.RunID}}</a></td>
+      <td>{{.StartedAt}}</td>
+      <td>{{.ScheduledDeletion}}</td>
+      <td>{{.DaysOut}}</td>
+      <td>{{if .Imminent}}<span class="chip chip-fail">yes</span>{{else}}<span class="chip chip-ok">no</span>{{end}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No runs are scheduled for retention. Either the data layer is empty or the retention tick has caught up.</div>
+{{end}}
+{{end}}
+{{template "layout.html" .}}

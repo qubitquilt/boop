@@ -253,14 +253,15 @@ func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
 // cursor is the (started_at, id) of the last item in the previous
 // page, or empty for the first page. Limit is clamped to 1..200.
 type ListRunsFilter struct {
-	Owner     string
-	Repo      string
-	Status    RunStatus
-	From      time.Time
-	To        time.Time
+	Owner          string
+	Repo           string
+	Status         RunStatus
+	FailureClass   string
+	From           time.Time
+	To             time.Time
 	InstallationID int64
-	Cursor    string
-	Limit     int
+	Cursor         string
+	Limit          int
 }
 
 // ListRunsResult is the page returned by ListRuns.
@@ -302,6 +303,10 @@ func (s *Store) ListRuns(ctx context.Context, f ListRunsFilter) (ListRunsResult,
 	if f.Status != "" {
 		conds = append(conds, "status = ?")
 		args = append(args, string(f.Status))
+	}
+	if f.FailureClass != "" {
+		conds = append(conds, "failure_class = ?")
+		args = append(args, f.FailureClass)
 	}
 	if f.InstallationID != 0 {
 		conds = append(conds, "installation_id = ?")
@@ -406,21 +411,21 @@ type rowScanner interface {
 
 func scanRun(r rowScanner) (Run, error) {
 	var (
-		rr             Run
-		status         string
-		startedStr     string
-		endedPtr       sql.NullString
-		durPtr         sql.NullInt64
-		errPtr         sql.NullString
-		baseRef        sql.NullString
-		reason         sql.NullString
-		installID      sql.NullInt64
-		failureClass   sql.NullString
-		heartbeatPtr   sql.NullString
-		parentID       string
-		supersededBy   string
-		createdStr     string
-		updatedStr     string
+		rr           Run
+		status       string
+		startedStr   string
+		endedPtr     sql.NullString
+		durPtr       sql.NullInt64
+		errPtr       sql.NullString
+		baseRef      sql.NullString
+		reason       sql.NullString
+		installID    sql.NullInt64
+		failureClass sql.NullString
+		heartbeatPtr sql.NullString
+		parentID     string
+		supersededBy string
+		createdStr   string
+		updatedStr   string
 	)
 	if err := r.Scan(
 		&rr.ID, &rr.Owner, &rr.Repo, &rr.PRNumber, &rr.CommitSHA, &baseRef,

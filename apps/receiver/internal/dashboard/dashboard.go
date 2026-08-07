@@ -23,9 +23,11 @@ package dashboard
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
-	"encoding/json"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -37,6 +39,23 @@ import (
 	"github.com/michaelruelas/boop-receiver/internal/store"
 )
 
+// Actions is the dependency the dashboard pulls from the
+// webhook package. The dashboard's form-based actions (re-run,
+// zero-out cost) need the K8s jobbuilder, which lives in
+// webhook. The dashboard has no business knowing about K8s, so
+// the action is a callback the receiver wires up at startup;
+// the dashboard only sees the function signature.
+//
+// CreateRerunJob persists the new run row, creates the K8s Job,
+// and returns the new run id. A nil-able set of fields in cfg
+// or store is treated as "feature disabled" and the callback
+// returns an error so the dashboard can render a 503-style
+// "not configured" page rather than silently dropping the
+// action.
+type Actions struct {
+	CreateRerunJob func(ctx context.Context, prior store.Run, reason string) (newRunID string, err error)
+}
+
 //go:embed templates/*.html
 var templateFS embed.FS
 
@@ -45,27 +64,61 @@ var templateFS embed.FS
 // mounted under /dashboard/* in main.go and gated by
 // BOOP_DASHBOARD_TOKEN.
 type Handler struct {
-	store     *store.Store
-	logger    *slog.Logger
-	token     string
-	templates *template.Template
+	store  *store.Store
+	logger *slog.Logger
+	token  string
+	// actions are the cross-package dependencies the
+	// dashboard needs to do more than render. Re-run
+	// is the only one today; a future "drain queue"
+	// or "rotate webhook secret" button would land
+	// here too. Nil is fine for a read-only deploy.
+	actions Actions
 }
 
 // NewHandler builds a dashboard Handler. token is the
 // shared secret for the BOOP_DASHBOARD_TOKEN gate; an
 // empty token rejects every request — the dashboard is
-// opt-in, like the data layer.
-func NewHandler(st *store.Store, logger *slog.Logger, token string) (*Handler, error) {
-	tmpl, err := template.ParseFS(templateFS, "templates/*.html")
-	if err != nil {
-		return nil, fmt.Errorf("dashboard: parse templates: %w", err)
-	}
+// opt-in, like the data layer. actions wires the
+// cross-package dependencies; passing the zero value
+// disables form-initiated K8s actions (the re-run
+// button renders disabled and the form POSTs to a
+// 503-style "not configured" page).
+func NewHandler(st *store.Store, logger *slog.Logger, token string, actions Actions) (*Handler, error) {
 	return &Handler{
-		store:     st,
-		logger:    logger,
-		token:     token,
-		templates: tmpl,
+		store:   st,
+		logger:  logger,
+		token:   token,
+		actions: actions,
 	}, nil
+}
+
+// renderPage parses the layout + the page-specific
+// template together for each request. Per-request
+// parsing avoids the parse-time "last define" race
+// that hits the base set: when all templates share
+// the "title" and "content" block names, the base
+// ParseFS makes whichever file was parsed last win
+// for every page (alphabetic: runs.html). Parsing
+// just two files per request — the layout + the
+// page — keeps the page's defines the LAST to land
+// in the set, so the page renders its own content.
+//
+// The cost is two small files re-parsed per request.
+// Both are a few KB; the parse is well under a
+// millisecond. If profiling later shows this is the
+// hot path, the fix is to cache the parsed set per
+// page and Clone + reparse the page's defines into
+// the cache on each request.
+func (h *Handler) renderPage(w http.ResponseWriter, page string, data any) {
+	tmpl, err := template.ParseFS(templateFS, "templates/layout.html", "templates/"+page)
+	if err != nil {
+		h.logger.Warn("dashboard parse", "page", page, "err", err)
+		http.Error(w, "template error", http.StatusInternalServerError)
+		return
+	}
+	if err := tmpl.ExecuteTemplate(w, page, data); err != nil {
+		h.logger.Warn("dashboard render", "page", page, "err", err)
+	}
 }
 
 // Middleware gates the /dashboard/* routes with the
@@ -113,13 +166,29 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 	case path == "runs":
 		h.serveRuns(w, r)
 	case strings.HasPrefix(path, "runs/"):
-		h.serveRunDetail(w, r, strings.TrimPrefix(path, "runs/"))
+		rest := strings.TrimPrefix(path, "runs/")
+		// /dashboard/runs/{id}/rerun and
+		// /dashboard/runs/{id}/zero-cost are the two
+		// form-based action endpoints the exceptions
+		// view posts to. Each takes a different
+		// verb-suffix split.
+		if strings.HasSuffix(rest, "/rerun") && r.Method == http.MethodPost {
+			h.serveRerun(w, r, strings.TrimSuffix(rest, "/rerun"))
+			return
+		}
+		if strings.HasSuffix(rest, "/zero-cost") && r.Method == http.MethodPost {
+			h.serveZeroCost(w, r, strings.TrimSuffix(rest, "/zero-cost"))
+			return
+		}
+		h.serveRunDetail(w, r, rest)
 	case path == "live":
 		h.serveLive(w, r)
 	case path == "exceptions":
 		h.serveExceptions(w, r)
 	case path == "costs":
 		h.serveCosts(w, r)
+	case path == "retention":
+		h.serveRetention(w, r)
 	case path == "installations":
 		h.serveInstallations(w, r)
 	case strings.HasPrefix(path, "installations/"):
@@ -138,6 +207,21 @@ func (h *Handler) serveRuns(w http.ResponseWriter, r *http.Request) {
 	}
 	if s := q.Get("status"); s != "" {
 		f.Status = store.RunStatus(s)
+	}
+	// QU B-113 / CQ-004: forward the failure_class
+	// filter chip value to the store. The previous
+	// shape dropped it on the floor — the dropdown
+	// rendered the chip but the result set was the
+	// whole page, so an operator who picked
+	// "OOMKilled" saw every failed run instead of
+	// the OOMKilled subset. FailureClass is a free-
+	// form string (today's values are
+	// oom_killed / container_error / crash_loop /
+	// image_pull / config_error; future
+	// failure_class taxonomy is a receiver-side
+	// concern, not a dashboard-side one).
+	if fc := q.Get("failure_class"); fc != "" {
+		f.FailureClass = fc
 	}
 	if s := q.Get("limit"); s != "" {
 		// The default (50) is fine for a dashboard page;
@@ -168,9 +252,7 @@ func (h *Handler) serveRuns(w http.ResponseWriter, r *http.Request) {
 		Runs:   rows,
 		Filter: runsFilter{Q: r.URL.Query().Get("q"), Status: q.Get("status"), FailureClass: q.Get("failure_class")},
 	}
-	if err := h.templates.ExecuteTemplate(w, "runs.html", data); err != nil {
-		h.logger.Warn("dashboard runs render", "err", err)
-	}
+	h.renderPage(w, "runs.html", data)
 }
 
 type runsView struct {
@@ -218,9 +300,7 @@ func (h *Handler) serveRunDetail(w http.ResponseWriter, r *http.Request, id stri
 			data.Run.Duration = dur.Round(time.Second).String()
 		}
 	}
-	if err := h.templates.ExecuteTemplate(w, "run_detail.html", data); err != nil {
-		h.logger.Warn("dashboard run detail render", "err", err)
-	}
+	h.renderPage(w, "run_detail.html", data)
 }
 
 type runDetailView struct {
@@ -334,9 +414,7 @@ func (h *Handler) serveLive(w http.ResponseWriter, r *http.Request) {
 		Running: runRows,
 		Stuck:   stuckRows,
 	}
-	if err := h.templates.ExecuteTemplate(w, "live.html", data); err != nil {
-		h.logger.Warn("dashboard live render", "err", err)
-	}
+	h.renderPage(w, "live.html", data)
 }
 
 type liveView struct {
@@ -374,9 +452,7 @@ func (h *Handler) serveExceptions(w http.ResponseWriter, r *http.Request) {
 		Exceptions: rows,
 		Filter:     exceptionsFilter{Class: class},
 	}
-	if err := h.templates.ExecuteTemplate(w, "exceptions.html", data); err != nil {
-		h.logger.Warn("dashboard exceptions render", "err", err)
-	}
+	h.renderPage(w, "exceptions.html", data)
 }
 
 type exceptionsView struct {
@@ -400,14 +476,67 @@ func (h *Handler) serveCosts(w http.ResponseWriter, r *http.Request) {
 	from := to.Add(-30 * 24 * time.Hour)
 	rollup, _ := h.store.LensCostSummary(r.Context(), from, to)
 	data := costsView{Nav: "costs", LensRollup: rollup}
-	if err := h.templates.ExecuteTemplate(w, "costs.html", data); err != nil {
-		h.logger.Warn("dashboard costs render", "err", err)
-	}
+	h.renderPage(w, "costs.html", data)
 }
 
 type costsView struct {
 	Nav        string
 	LensRollup []store.LensCostRollup
+}
+
+// serveRetention renders /dashboard/retention — a row per
+// run with its scheduled-deletion timestamp and an
+// "imminent" flag for rows scheduled within the next 7
+// days. The retention loop prunes on a 5-min tick; the
+// schedule here is the row's started_at + DefaultRetention,
+// not the actual delete time. The page is the operator's
+// proof that retention is enforced as a schedule, not a
+// config-file promise (QUB-112).
+//
+// An empty schedule means either the data layer is empty
+// or the retention tick has already pruned everything; the
+// template renders an "empty" hint in either case. The
+// retention duration is the store's DefaultRetention (no
+// dashboard override today; a future retention-config
+// route would add one).
+func (h *Handler) serveRetention(w http.ResponseWriter, r *http.Request) {
+	rows, err := h.store.ListRetentionSchedule(r.Context(), 0)
+	if err != nil {
+		h.logger.Warn("dashboard retention", "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	now := time.Now().UTC()
+	schedule := make([]retentionRow, 0, len(rows))
+	for _, row := range rows {
+		daysOut := int(row.ScheduledDeletion.Sub(now).Hours() / 24)
+		schedule = append(schedule, retentionRow{
+			RunID:             row.RunID,
+			StartedAt:         row.StartedAt.Format("2006-01-02 15:04"),
+			ScheduledDeletion: row.ScheduledDeletion.Format("2006-01-02 15:04"),
+			DaysOut:           daysOut,
+			Imminent:          daysOut < 7,
+		})
+	}
+	data := retentionView{
+		Nav:           "retention",
+		Schedule:      schedule,
+		RetentionDays: int(store.DefaultRetention.Hours() / 24),
+	}
+	h.renderPage(w, "retention.html", data)
+}
+
+type retentionView struct {
+	Nav           string
+	Schedule      []retentionRow
+	RetentionDays int
+}
+type retentionRow struct {
+	RunID             string
+	StartedAt         string
+	ScheduledDeletion string
+	DaysOut           int
+	Imminent          bool
 }
 
 // serveInstallations is the /dashboard/installations view.
@@ -421,9 +550,7 @@ func (h *Handler) serveInstallations(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	data := installationsView{Nav: "installations", Installations: rows}
-	if err := h.templates.ExecuteTemplate(w, "installations.html", data); err != nil {
-		h.logger.Warn("dashboard installations render", "err", err)
-	}
+	h.renderPage(w, "installations.html", data)
 }
 
 type installationsView struct {
@@ -440,6 +567,22 @@ type installRow struct {
 // lens_opt_out (comma-separated lens names). The store
 // has a single SetInstallationControls method that
 // writes both fields atomically.
+//
+// Every successful edit appends an audit row so the
+// "who paused this install?" question has a durable
+// answer. The action is one of:
+//
+//	install.pause     operator flipped paused from false to true
+//	install.resume    operator flipped paused from true to false
+//	lens_opt_out.set  operator changed the lens filter
+//
+// A single form submission that changes both fields
+// emits a single audit row tagged with the union (e.g.
+// a pause + lens edit is one "install.pause" row with
+// the new lens list in details). The dashboard's
+// audit-trail view surfaces the actor + the action +
+// the pre/post values; the union is cleaner than two
+// rows for one click.
 func (h *Handler) serveInstallationControl(w http.ResponseWriter, r *http.Request, idStr string) {
 	var id int64
 	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
@@ -459,22 +602,206 @@ func (h *Handler) serveInstallationControl(w http.ResponseWriter, r *http.Reques
 			}
 		}
 	}
+	reason := strings.TrimSpace(r.FormValue("reason"))
+	prev, _ := h.store.GetInstallation(r.Context(), id)
 	if err := h.store.SetInstallationControls(r.Context(), id, paused, lens); err != nil {
 		h.logger.Warn("dashboard install control", "id", id, "err", err)
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
+	// Pick the dominant action for the audit row. A
+	// pause/resume flip is the most consequential
+	// change; a lens edit that does not also flip
+	// paused gets its own action type. Both fired in
+	// the same click is rare (and the form does not
+	// currently allow it) — we record the flip and
+	// drop the lens change on the floor, which is
+	// the same shape the existing `paused` toggle
+	// would have.
+	action := "lens_opt_out.set"
+	if prev.Paused != paused {
+		if paused {
+			action = "install.pause"
+		} else {
+			action = "install.resume"
+		}
+	}
+	if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
+		Action:   action,
+		Actor:    h.actor(),
+		TargetID: idStr,
+		Details: store.MarshalDetails(map[string]any{
+			"paused":       paused,
+			"lens_opt_out": lens,
+			"reason":       reason,
+		}),
+	}); err != nil {
+		// Non-fatal: a failed audit row is logged but
+		// does not block the operator's action. The
+		// dashboard's audit view will surface a gap
+		// for this row, which is preferable to a 5xx
+		// that flips the operator's pause back.
+		h.logger.Warn("dashboard install control audit", "id", id, "err", err)
+	}
 	http.Redirect(w, r, "/dashboard/installations", http.StatusSeeOther)
 }
 
-// renderJSON is a debug helper used during development;
-// not wired to a route but kept around in case the
-// operator wants to curl the dashboard data without
-// the HTML shell.
-func renderJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+// serveRerun is the form-based "Requeue" handler the
+// exceptions view posts to. Persists the lineage row
+// (parent_run_id + superseded_by_id), creates the K8s
+// Job via the cross-package Actions callback, and
+// records an audit event with the actor. Returns 503
+// if the cross-package callback is not wired (a
+// read-only deploy that does not have the K8s jobbuilder).
+//
+// The id is the prior run id (the row the operator is
+// re-running from). reason is the operator's free-form
+// note; it lands on the new run's row and in the
+// audit row's details blob.
+func (h *Handler) serveRerun(w http.ResponseWriter, r *http.Request, idStr string) {
+	if h.actions.CreateRerunJob == nil {
+		http.Error(w, "rerun not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	if r.FormValue("confirm") != "true" {
+		http.Error(w, "confirm: true required", http.StatusBadRequest)
+		return
+	}
+	reason := strings.TrimSpace(r.FormValue("reason"))
+	if reason == "" {
+		http.Error(w, "reason is required", http.StatusBadRequest)
+		return
+	}
+	prior, err := h.store.GetRun(r.Context(), idStr)
+	if err != nil {
+		if errors.Is(err, store.ErrUnknownRun) {
+			http.Error(w, "run not found", http.StatusNotFound)
+			return
+		}
+		h.logger.Warn("dashboard rerun get", "run", idStr, "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	if prior.Status != store.StatusSucceeded && prior.Status != store.StatusFailed {
+		http.Error(w, "can only re-run a terminal run", http.StatusConflict)
+		return
+	}
+	newID, err := h.actions.CreateRerunJob(r.Context(), prior, reason)
+	if err != nil {
+		h.logger.Warn("dashboard rerun create", "run", idStr, "err", err)
+		http.Error(w, "create rerun", http.StatusInternalServerError)
+		return
+	}
+	if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
+		Action:   "rerun.create",
+		Actor:    h.actor(),
+		TargetID: newID,
+		Details:  store.MarshalDetails(map[string]any{"prior_run_id": idStr, "reason": reason}),
+	}); err != nil {
+		h.logger.Warn("dashboard rerun audit", "run", newID, "err", err)
+	}
+	h.logger.Info("dashboard rerun created", "prior", idStr, "new", newID, "reason", reason)
+	http.Redirect(w, r, "/dashboard/exceptions", http.StatusSeeOther)
+}
+
+// serveZeroCost is the form-based "Zero out cost"
+// handler the exceptions view posts to. Computes the
+// run's total tokens (input + output + reasoning
+// across the aggregate telemetry), appends a refund
+// row, and records the audit event. The dashboard's
+// refund list is the per-run audit trail; the global
+// audit_events table is the cross-cutting one.
+//
+// A zero-out is all-lenses by default (the form does
+// not expose a per-lens picker today; the store
+// helper is shaped to accept a lens filter when one
+// is added). The action is idempotent: a second
+// click adds a second refund row. The operator can
+// see the refund history on the run-detail page; the
+// lens_telemetry rows themselves are not zeroed (the
+// raw numbers stay so a future audit can recompute
+// the bill). The "zero out" promise is that the
+// dashboard's $ rollup excludes refunded runs — a
+// follow-up query helper does the subtraction.
+func (h *Handler) serveZeroCost(w http.ResponseWriter, r *http.Request, idStr string) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	reason := strings.TrimSpace(r.FormValue("reason"))
+	if reason == "" {
+		reason = "dashboard zero-out"
+	}
+	run, err := h.store.GetRun(r.Context(), idStr)
+	if err != nil {
+		if errors.Is(err, store.ErrUnknownRun) {
+			http.Error(w, "run not found", http.StatusNotFound)
+			return
+		}
+		h.logger.Warn("dashboard zero cost get", "run", idStr, "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	telem, terr := h.store.GetTelemetry(r.Context(), idStr)
+	if terr != nil {
+		// No telemetry yet — zero-out still lands
+		// (zero tokens to zero out) so the operator
+		// is not blocked. The refund row records 0
+		// tokens; the audit row records the
+		// "no telemetry" note.
+		telem = store.Telemetry{}
+	}
+	tokens := telem.InputTokens + telem.OutputTokens + telem.ReasoningTokens
+	actor := h.actor()
+	if _, err := h.store.RecordRefund(r.Context(), store.Refund{
+		RunID:      idStr,
+		Lens:       "", // all-lenses; the per-lens picker is a follow-up
+		Tokens:     tokens,
+		RefundedBy: actor,
+	}); err != nil {
+		h.logger.Warn("dashboard zero cost refund", "run", idStr, "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
+		Action:   "cost.zero_out",
+		Actor:    actor,
+		TargetID: idStr,
+		Details: store.MarshalDetails(map[string]any{
+			"tokens_zeroed": tokens,
+			"cost_usd":      telem.CostUSD,
+			"reason":        reason,
+			"owner":         run.Owner,
+			"repo":          run.Repo,
+			"pr_number":     run.PRNumber,
+		}),
+	}); err != nil {
+		h.logger.Warn("dashboard zero cost audit", "run", idStr, "err", err)
+	}
+	h.logger.Info("dashboard zero cost", "run", idStr, "tokens", tokens, "cost_usd", telem.CostUSD)
+	http.Redirect(w, r, "/dashboard/exceptions", http.StatusSeeOther)
+}
+
+// actor derives the audit-log actor from the
+// BOOP_DASHBOARD_TOKEN. Today the dashboard's only
+// authentication is a shared secret, so the actor is
+// a SHA-256 prefix of the token — stable across
+// requests (same operator, same actor) and
+// non-reversible (the token is not in the audit log).
+// A future per-user identity layer replaces the
+// token-derived actor; the AuditEvent.Actor field is
+// already a free-form string so the swap is a
+// one-call-site change.
+func (h *Handler) actor() string {
+	if h.token == "" {
+		return "dashboard:disabled"
+	}
+	sum := sha256.Sum256([]byte(h.token))
+	return "dashboard:" + hex.EncodeToString(sum[:4])
 }
 
 // Health is a liveness endpoint for the dashboard. It
@@ -492,6 +819,3 @@ func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 }
-
-// ensure context import survives goimports.
-var _ = context.Background

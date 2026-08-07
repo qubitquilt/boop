@@ -201,13 +201,13 @@ type ListRunsResponse struct {
 // time-series, by_repo and by_model are the leaderboards. The
 // dashboard renders this in one fetch.
 type StatsResponse struct {
-	From        time.Time                `json:"from"`
-	To          time.Time                `json:"to"`
-	Bucket      store.StatsBucket        `json:"bucket"`
-	Summary     store.SummaryStats       `json:"summary"`
-	Buckets     []store.BucketPoint      `json:"buckets"`
-	ByRepo      []store.RepoRollup       `json:"by_repo"`
-	ByModel     []store.ModelRollup      `json:"by_model"`
+	From    time.Time           `json:"from"`
+	To      time.Time           `json:"to"`
+	Bucket  store.StatsBucket   `json:"bucket"`
+	Summary store.SummaryStats  `json:"summary"`
+	Buckets []store.BucketPoint `json:"buckets"`
+	ByRepo  []store.RepoRollup  `json:"by_repo"`
+	ByModel []store.ModelRollup `json:"by_model"`
 }
 
 // Stats handles GET /api/stats. Defaults: 30-day window ending
@@ -365,10 +365,10 @@ func (h *Handler) RecordTelemetry(w http.ResponseWriter, r *http.Request) {
 // dashboard's "live runs" panel can show the current stage
 // without polling K8s.
 type statusRequest struct {
-	Stage     string     `json:"stage"`
-	EndedAt   *time.Time `json:"ended_at,omitempty"`
-	DurationMS *int64    `json:"duration_ms,omitempty"`
-	Error     string     `json:"error,omitempty"`
+	Stage      string     `json:"stage"`
+	EndedAt    *time.Time `json:"ended_at,omitempty"`
+	DurationMS *int64     `json:"duration_ms,omitempty"`
+	Error      string     `json:"error,omitempty"`
 }
 
 // RecordStatus handles POST /api/runs/:id/status. The runner
@@ -465,9 +465,9 @@ func (h *Handler) checkRunnerToken(r *http.Request) bool {
 // signal (ended=true). The receiver's clock is authoritative
 // for both started_at and ended_at.
 type stageRequest struct {
-	Stage  string `json:"stage"`
-	Ended  bool   `json:"ended,omitempty"`
-	Meta   string `json:"meta,omitempty"`
+	Stage string `json:"stage"`
+	Ended bool   `json:"ended,omitempty"`
+	Meta  string `json:"meta,omitempty"`
 }
 
 // RecordStage handles POST /api/runs/:id/stages. The runner
@@ -511,16 +511,32 @@ func (h *Handler) RecordStage(w http.ResponseWriter, r *http.Request) {
 		StartedAt: now,
 	}
 	if body.Ended {
-		// Duration is 0 on the first "ended" POST because
-		// the start was just stamped in the same second.
-		// The waterfall renders "<1s" for sub-second bars
-		// rather than "0s", which is what an operator
-		// would see as "instant" rather than "missing".
-		dur := int64(0)
+		// QU B-113 / EH-003: do NOT stamp duration_ms.
+		// The previous shape set dur := int64(0) and
+		// passed it through, which the SQL
+		// ON CONFLICT clause happily wrote over the
+		// real duration (0 is non-null, so
+		// COALESCE(excluded, existing) takes 0). The
+		// dashboard's durMS() falls back to
+		// EndedAt - StartedAt when DurationMS is nil,
+		// so the bar's real length renders correctly.
+		// EH-001: a not-yet-persisted run triggers a
+		// FK violation (run_stages.run_id REFERENCES
+		// runs.id). The runner's postWithRetry
+		// retries 5xx once, then drops the call —
+		// the waterfall silently loses the start
+		// POST. Return 202 here so the runner treats
+		// it like RecordStatus / RecordHeartbeat
+		// (a transient "run not visible yet" that the
+		// next stage transition retries).
 		stage.EndedAt = &now
-		stage.DurationMS = &dur
 	}
 	if _, err := h.store.UpsertRunStage(r.Context(), stage); err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isForeignKeyError(err) {
+			h.logger.Info("record stage: run not yet persisted, runner should retry on next stage", "run", id, "stage", body.Stage)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		h.logger.Warn("record stage", "run", id, "stage", body.Stage, "err", err)
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -578,9 +594,9 @@ func (h *Handler) RecordHeartbeat(w http.ResponseWriter, r *http.Request) {
 // contribution; the aggregate telemetry row stores the
 // total.
 type lensTelemetryRequest struct {
-	Lens       string  `json:"lens"`
-	Model      string  `json:"model,omitempty"`
-	Provider   string  `json:"provider,omitempty"`
+	Lens             string  `json:"lens"`
+	Model            string  `json:"model,omitempty"`
+	Provider         string  `json:"provider,omitempty"`
 	InputTokens      int64   `json:"input_tokens"`
 	OutputTokens     int64   `json:"output_tokens"`
 	ReasoningTokens  int64   `json:"reasoning_tokens"`
@@ -648,11 +664,41 @@ func (h *Handler) RecordLensTelemetry(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	if err := h.store.ReplaceLensTelemetry(r.Context(), id, rows); err != nil {
+		// EH-002: a not-yet-persisted run triggers a FK
+		// violation (lens_telemetry.run_id REFERENCES
+		// runs.id). Mirror RecordStage / RecordStatus's
+		// 202 fallback so the runner's retry loop
+		// catches up on the next stage transition
+		// instead of losing the cost row. Without this,
+		// a fast-starting run loses the entire
+		// per-lens rollup (the 5xx-then-drop chain in
+		// postWithRetry is silent in operator logs).
+		if errors.Is(err, sql.ErrNoRows) || isForeignKeyError(err) {
+			h.logger.Info("record lens telemetry: run not yet persisted, runner should retry on next stage", "run", id)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		h.logger.Warn("record lens telemetry", "run", id, "err", err)
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// isForeignKeyError reports whether err is a SQLite
+// "FOREIGN KEY constraint failed" error. The error
+// message is the only stable signal (sqlite3 does not
+// export typed errors for FK violations); matching the
+// substring is the same approach the rest of the store
+// uses for parse-error detection. A driver swap would
+// need to add a typed wrapper here; today the
+// dependency on mattn/go-sqlite3 keeps the message
+// stable.
+func isForeignKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "FOREIGN KEY constraint failed")
 }
 
 // startInstallationsPoller kicks off a background goroutine that

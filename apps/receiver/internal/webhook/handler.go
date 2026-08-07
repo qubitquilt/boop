@@ -327,11 +327,11 @@ func (h *Handler) deepHealth(w http.ResponseWriter, r *http.Request) {
 		httpStatus = http.StatusServiceUnavailable
 	}
 	body := map[string]any{
-		"status":        status,
-		"quick_check":   result,
-		"runs":          stats.Runs,
-		"telemetry":     stats.Telemetry,
-		"file_bytes":    stats.FileBytes,
+		"status":         status,
+		"quick_check":    result,
+		"runs":           stats.Runs,
+		"telemetry":      stats.Telemetry,
+		"file_bytes":     stats.FileBytes,
 		"freelist_pages": stats.FreelistCount,
 	}
 	buf, _ := json.Marshal(body)
@@ -373,8 +373,54 @@ func (h *Handler) HandleWebhook(w http.ResponseWriter, r *http.Request) {
 
 	if !verifySignature(sig, body, h.cfg.WebhookSecret) {
 		h.logger.Warn("invalid signature", "delivery", deliveryID)
+		// QUB-113: HMAC verification ledger. Every
+		// verification attempt — pass or fail — lands
+		// in audit_events so a future compliance audit
+		// can answer "who sent us a webhook between
+		// X and Y?" without grepping receiver logs.
+		// The peer is the only stable identity for a
+		// failure (the secret is unknown), so the
+		// actor is "unauthenticated:<peer>" rather
+		// than the dashboard-token-derived actor.
+		// For passes the actor is "github-webhook"
+		// because GitHub is the only legitimate
+		// signer of the secret.
+		if h.store != nil {
+			if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
+				Action:   "webhook.hmac.fail",
+				Actor:    hmacFailActor(r),
+				TargetID: deliveryID,
+				Details: store.MarshalDetails(map[string]any{
+					"event":   event,
+					"has_sig": sig != "",
+				}),
+			}); err != nil {
+				// Non-fatal: a failed audit row does
+				// not delay the 401 response.
+				h.logger.Warn("hmac fail audit", "err", err)
+			}
+		}
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
+	}
+	// QUB-113: pass-side audit. Lower volume than
+	// fail (legitimate traffic is bounded by GitHub's
+	// delivery rate), so the audit table stays small
+	// and the row is cheap. Stored with the actor as
+	// "github-webhook" — a future per-installation
+	// identity would replace this with the
+	// installation ID.
+	if h.store != nil {
+		if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
+			Action:   "webhook.hmac.pass",
+			Actor:    "github-webhook",
+			TargetID: deliveryID,
+			Details: store.MarshalDetails(map[string]any{
+				"event": event,
+			}),
+		}); err != nil {
+			h.logger.Warn("hmac pass audit", "err", err)
+		}
 	}
 
 	// M3: dedup on X-GitHub-Delivery. GitHub's webhook
@@ -763,9 +809,9 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		// the "Triggered by @user" attribution on its
 		// runner-created initial status comment. Empty for the
 		// pull_request path.
-		TriggeredBy:        triggeredBy,
-		BotLogin:           h.cfg.BotLogin,
-		JobName:            jobName,
+		TriggeredBy: triggeredBy,
+		BotLogin:    h.cfg.BotLogin,
+		JobName:     jobName,
 		// Dashboard URL is the receiver Service's in-cluster DNS.
 		// Hard-coded to the canonical Service name + namespace so
 		// a misconfigured operator can't accidentally point the
@@ -1258,6 +1304,45 @@ func verifySignature(header string, body []byte, secret string) bool {
 	expected := hex.EncodeToString(mac.Sum(nil))
 	got := strings.TrimPrefix(header, "sha256=")
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(got)) == 1
+}
+
+// hmacFailActor derives the audit-log actor for a
+// failed HMAC verification. The actor has to be
+// non-empty (the audit table rejects empty) but a
+// signature failure is unauthenticated by definition;
+// the most useful persistent identity is the peer's
+// remote address. The X-Forwarded-For header is
+// honored when present because GitHub's webhook
+// deliveries land via the configured proxy chain in
+// production, and the immediate peer is the proxy —
+// the XFF chain is what survives in logs anyway.
+//
+// A missing or unparseable peer yields
+// "unauthenticated:unknown"; the operator sees this
+// string in the audit feed and knows the receiver
+// was hit by something that wasn't GitHub's egress
+// (most likely a deployment-time smoke test or a
+// misconfigured reverse proxy).
+func hmacFailActor(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Take the leftmost address — the original
+		// client per RFC 7239.
+		if i := strings.Index(xff, ","); i > 0 {
+			xff = xff[:i]
+		}
+		xff = strings.TrimSpace(xff)
+		if xff != "" {
+			return "unauthenticated:" + xff
+		}
+	}
+	if host := r.RemoteAddr; host != "" {
+		// r.RemoteAddr is host:port; drop the port.
+		if i := strings.LastIndex(host, ":"); i > 0 {
+			host = host[:i]
+		}
+		return "unauthenticated:" + host
+	}
+	return "unauthenticated:unknown"
 }
 
 func writeAck(w http.ResponseWriter, status, detail, delivery string) {

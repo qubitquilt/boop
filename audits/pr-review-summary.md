@@ -1,174 +1,181 @@
-# PR Review: feat(runner): migrate boop review to openrouter sdk (QUB-94)
+# PR Review: feat(receiver): boop admin dashboard cross-cutting (QUB-108 / 109 / 110 / 111 / 112)
 
-**Date:** 2026-08-04
-**Branch:** `feature/qub-94-migrate-boop-runner-from-opencode-cli-to-openrouter-sdk`
-**Commit:** `a0f8090`
-**Files reviewed:** 12 files, **+1150 / −14** (Go receiver + Node runner + docs)
+**Date:** 2026-08-06
+**Branch:** `feature/qub-112-dashboard-cross-cutting`
+**Stacked commits:** 5 (QUB-108 → QUB-112, all on top of `main`)
+**Files reviewed:** 26 files, **+3946 / −46**
 
 ---
 
 ## Executive Summary
 
-The PR is a well-shaped, feature-flagged migration: the Go receiver resolves a cluster default + a per-PR label into a single `BOOP_USE_OPENROUTER_SDK` env var; the runner branches on a boolean and dispatches to a new in-process OpenRouter SDK call. The SDK boundary is clean (`@openrouter/sdk` is imported in exactly one new file, `openrouter.mjs`), the test seam mirrors the rest of the runner's pattern (`deps.callOpenRouter` override), and the QUB-98 deletion is mostly a one-file edit. **No blocking findings.** The two areas worth the author's attention are (1) the new `runOpenRouterSkill` orchestrator at `opencode.mjs:716` packs five jobs into 105 lines and the error path's `parseError = "sdk call failed"` collapses every non-abort failure mode (4xx/5xx/network) into a single string that the PR author sees when the dashboard data layer is off, and (2) three small documentation drifts — a misleading "cross-module surface" comment, a duplicate QUB-94 block in `runOpenCodeSkill`, and a debug-level log line that hides the SDK flag decision at default log level. Both are cheap to fix and one of them blocks operator triage on the rollout path.
+This is a five-commit, additive cross-cutting that turns the receiver into an operator-facing dashboard. The store layer is the strongest part: well-shaped migrations (v1→v5), well-commented Go APIs, ~12 new store-level tests, and a clean `UNIQUE(run_id, stage)` + `COALESCE(excluded, existing)` idiom for at-least-once stage POSTs. The new HTTP handlers and templates are mostly in sync, but **the dashboard view layer ships with at least three buttons that don't work on first click**: the re-run lineage render references field names the struct doesn't expose (`.Lineage.Up` vs `WalkUp`), the "Requeue" form posts form-encoded data to a JSON-only handler (400), and the "Zero out cost" button targets an unwired route. On the data side, the new `RecordStage` handler hardcodes `duration_ms = 0` on every end POST and overwrites the real duration via the `ON CONFLICT` clause, and the same handler returns 500 (instead of 202) when the run row hasn't been committed yet — the waterfall silently degrades for any run that starts a stage before the receiver's `UpsertRun` lands. The audit log is fully built (schema, store API, tests) but no mutation path writes an event; QUB-112 ships a table that compliance review will flag as "no actor, no UI, no entry point."
 
-**Merge-readiness signal: ready with minor changes.** Land the five change-now items below before merging; the rest can follow in QUB-98 or as a cleanup PR.
+**Highest-impact area:** the dashboard view layer + the new POST handlers. Six 🔴 findings, three of which are silent data loss / corruption in the user-facing waterfall.
+
+**Merge-readiness signal: needs changes first.** Block on the six 🔴 items below; the rest are reasonable to ship as follow-ups.
 
 ---
 
 ## Priority Issue Table
 
-| ID              | Tier        | File : Line                                         | Summary                                                                                          | Decide       |
-|-----------------|-------------|-----------------------------------------------------|--------------------------------------------------------------------------------------------------|--------------|
-| EH-001          | 🟡 Follow-up | `apps/receiver/internal/webhook/handler.go:565`     | `sdk flag resolved` logged at Debug; invisible at default Info level during rollout              | Change now   |
-| RD-007          | 🟡 Follow-up | `apps/runner/src/lib/opencode.mjs:585-600`          | Two QUB-94 comment blocks back-to-back; trim the in-body one                                      | Change now   |
-| CQ-004 / RD-004 / EH-002 | 🟡 Follow-up | `apps/runner/src/lib/openrouter.mjs:285`     | `readOpencodeModel` exported but not directly tested; on the QUB-98 cutover path                  | Change now   |
-| CQ-005 / EH-007 | 🟡 Follow-up | `apps/runner/src/lib/opencode.mjs:732`              | "no model configured" throw is uncovered; QUB-98 deletes the ConfigMap that hides the gap         | Change now   |
-| DP-002 / RD-003 / SP-006 | 🟡 Follow-up | `apps/runner/src/lib/opencode.mjs:712-715`    | Comment claims the cross-module surface is "one call to `callOpenRouter` and one call to `buildTelemetry`" — actually three imports, wrong constraint | Change now   |
-| EH-003          | 🟡 Follow-up | `apps/runner/src/lib/opencode.mjs:788-793`          | All non-abort SDK failures collapse to `parseError: "sdk call failed"`; loses HTTP status on the PR comment when dashboard is off | Defer        |
-| EH-005          | 🟡 Follow-up | `apps/receiver/internal/webhook/handler.go:827-835` | `BOOP_USE_OPENROUTER_SDK=true` (Helm convention) silently treated as `"0"`                        | Defer        |
-| RD-001 / SP-008 | 🟡 Follow-up | `apps/receiver/internal/webhook/handler.go:557`     | `submitJob` is now 15 positional args; test file needs `// reactionCommentID` inline labels        | Defer        |
-| RD-002          | 🟡 Follow-up | `apps/receiver/cmd/receiver/main.go:57` + 4 other sites | `"0"` / `"1"` string flag repeats at 5 sites; no shared symbol                                   | Defer        |
-| CQ-001 / SP-001 | 🟡 Follow-up | `apps/runner/src/lib/opencode.mjs:716`              | `runOpenRouterSkill` does 5 jobs in 105 lines; error-translation branch will be the next hot spot  | Defer        |
-| CQ-003 / SP-005 | 🟡 Follow-up | `apps/runner/src/lib/opencode.mjs:766-794`          | Dense `catch` block + `parseReviewOutput("") || "sdk call failed"` is a dead-branch surprise        | Defer        |
-| DP-003          | 🟡 Follow-up | `docs/development.md` (PR body)                    | QUB-98 framed as a "delete"; actually needs a rename + relocate + dep drop                         | Defer        |
-| RD-010 / DP-005 | 🟢 Optional  | `apps/runner/src/lib/opencode.mjs:720-736`          | Model-resolution block comment names the source order; no log of which source won                | Defer        |
-| CQ-002          | 🟢 Optional  | `apps/runner/src/lib/opencode.mjs`                  | File name no longer matches its content post-cutover; rename target not in this PR               | Defer        |
-| EH-004 / RD-006 | 🟢 Optional  | `apps/runner/src/lib/opencode.test.mjs:702-722`     | Test mock's `...opts` spread + `_args` field are dead and could normalize a leaky pattern         | Leave as-is  |
-| EH-006          | 🟢 Optional  | `apps/runner/src/lib/opencode.mjs:772`              | AbortError detection is a string match on `err.name`; SDK's real abort surface unverified          | Leave as-is  |
-| EH-008          | 🟢 Optional  | `apps/runner/src/lib/opencode.mjs:764`              | SDK path forwards only the API key; subprocess path scrubs a wider allowlist (asymmetry)         | Leave as-is  |
-| SP-003 / SP-004 / SP-007 | 🟢 Optional | `apps/runner/src/lib/opencode.mjs:752` + `openrouter.mjs:67` | Test seam + per-call SDK construction are fine for one-Job-one-call today         | Leave as-is  |
-| RD-005 / RD-008 / RD-009 | 🟢 Optional | `openrouter.mjs:220`, `openrouter.test.mjs:201`, `opencode.test.mjs:797` | Test names + dual-mode signatures are acceptable     | Leave as-is  |
+| ID         | Tier        | File : Line                                                          | Summary                                                                                    | Decide       |
+|------------|-------------|----------------------------------------------------------------------|--------------------------------------------------------------------------------------------|--------------|
+| EH-003     | 🔴 Blocking | `apps/receiver/internal/webhook/dashboard.go:519-521`                | `RecordStage` hardcodes `duration_ms = 0`; overwrites real duration via `ON CONFLICT` clause | Change now   |
+| EH-001     | 🔴 Blocking | `apps/receiver/internal/webhook/dashboard.go:484-529`                | `RecordStage` returns 500 on FK violation for not-yet-persisted run; should return 202       | Change now   |
+| EH-002     | 🔴 Blocking | `apps/receiver/internal/webhook/dashboard.go:611-656`                | `RecordLensTelemetry` same gap; `ReplaceLensTelemetry` 500s and retry drops the cost row     | Change now   |
+| CQ-001 / DP-001 | 🔴 Blocking | `apps/receiver/internal/dashboard/templates/run_detail.html:55-66` | Template reads `.Lineage.Up`/`.Down`; struct has `WalkUp`/`WalkDown`. Re-run lineage UI is silently empty | Change now   |
+| CQ-002     | 🔴 Blocking | `apps/receiver/internal/dashboard/templates/exceptions.html:30-34`  | "Requeue" form posts `application/x-www-form-urlencoded`; `Rerun` handler parses JSON. First click → 400 | Change now   |
+| CQ-003 / DP-003 / SP-002 | 🔴 Blocking | `apps/receiver/internal/dashboard/templates/exceptions.html:35-37` + `webhook/rerun.go:135-136` | "Zero out cost" form posts to `/dashboard/runs/{id}/zero-cost` (no route). `Rerun` docstring claims audit log written — it isn't. | Change now   |
+| CQ-004 / SP-001 | 🔴 Blocking | `apps/receiver/internal/dashboard/dashboard.go:135-141` + `store/runs.go:255-264` | `serveRuns` reads `failure_class` query param but never forwards it to the store; dropdown is a no-op | Change now   |
+| EH-006     | 🟡 Follow-up | `webhook/rerun.go:135-136`, `dashboard/dashboard.go:443-468`      | Audit log has zero producers; `Rerun` and `serveInstallationControl` don't call `RecordAuditEvent` | Change now   |
+| EH-005     | 🟡 Follow-up | `webhook/rerun.go:194-218`                                          | `Rerun` writes the new row + `superseded_by_id` in two separate transactions               | Change now   |
+| EH-004     | 🟡 Follow-up | `apps/runner/src/lib/workflow.mjs:314`                              | `await postStage(...)` on start POST contradicts the helper's "fire-and-forget" contract; +10s × stages on a degraded receiver | Change now   |
+| CQ-005     | 🟡 Follow-up | `webhook/dashboard.go:484-529, 611-656`, `webhook/k8s_reconcile.go`, `webhook/rerun.go:150-230, 68-130` | Zero direct tests for `RecordStage`/`RecordHeartbeat`/`RecordLensTelemetry`, the entire K8s reconciler (including the `failureClassFromContainerState` taxonomy), or `Rerun`/`RerunPreview` | Change now   |
+| CQ-006     | 🟡 Follow-up | `store/installations.go:55-151`                                     | `UpsertInstallations` 96 lines, CC ~12; read-before-DELETE preservation dance is fragile    | Defer        |
+| CQ-007     | 🟡 Follow-up | `dashboard/dashboard.go:474-478, 496-497`                           | `renderJSON` is dead code; `var _ = context.Background` is an import-keeper hack            | Change now   |
+| EH-008     | 🟡 Follow-up | `webhook/rerun.go:194-218`                                          | `CountRerunJobsForSHA` → `UpsertRun` TOCTOU race; concurrent re-runs clobber each other      | Defer        |
+| EH-009     | 🟡 Follow-up | `webhook/rerun.go:224-229`                                          | `Rerun` returns 202 + permanent `note` field; API contract drift                            | Defer        |
+| EH-010     | 🟡 Follow-up | `webhook/dashboard.go:51-108`                                       | `ListInstallations` cold-start refresh silently swallows `UpsertInstallations` error        | Defer        |
+| EH-007     | 🟡 Follow-up | `runner/src/lib/dashboard.mjs:212-220`                              | `postWithRetry` collapses 401 into "post rejected"; token-misconfig is invisible             | Defer        |
+| RD-001     | 🟡 Follow-up | `store/audit.go:18-24, 195-200`                                     | `var _ sql.NullString` placeholder; entire `database/sql` import held up only by this line   | Change now   |
+| RD-002 / DP-002 / CQ-009 / SP-003 | 🟡 Follow-up | `webhook/handler.go:1143-1151`, `webhook/rerun.go:242-257`, `store/rerun.go:78-89` | Job-name convention `boop-{owner}-{repo}-{pr}-{sha7}` held in three packages                | Defer        |
+| RD-003     | 🟡 Follow-up | `webhook/dashboard.go:345, 407, 557`                                | "Unknown run" detection uses three shapes at the HTTP boundary (`ErrUnknownRun` vs raw `sql.ErrNoRows`) | Defer        |
+| SP-004 / DP-005 | 🟡 Follow-up | `webhook/dashboard.go:428-438` vs `runner/src/lib/workflow.mjs:82-156` | Stage vocabulary duplicated by convention; live view filters `StatusRunning` and misses `auth`/`clone`/`review` | Defer        |
+| SP-005 / SP-010 | 🟡 Follow-up | `webhook/handler.go:135-173`                                        | `*Handler` is now app container (webhook + 4 background loops + 12 dashboard endpoints); no store interface seam | Defer        |
+| SP-006 / DP-009 | 🟡 Follow-up | `webhook/dashboard.go:167-177`, `dashboard/dashboard.go:154-164`   | N+1 telemetry query in `ListRuns` (HTML + JSON)                                            | Defer        |
+| SP-008     | 🟡 Follow-up | `store/audit.go:145-181` + `templates/`                              | `ListRetentionSchedule` defined and tested; no dashboard route, no template                  | Change now (small) |
+| DP-004     | 🟡 Follow-up | `webhook/dashboard.go:188-191`, `dashboard/dashboard.go:186-192` etc. | `store.Run` embedded directly in view structs; new column leaks to the wire                  | Defer        |
+| DP-006     | 🟡 Follow-up | `dashboard/dashboard.go` (497 lines)                                | One file with 6 view handlers, route table, waterfall math, auth middleware, dead `renderJSON` | Defer        |
+| DP-007     | 🟡 Follow-up | `dashboard/dashboard.go:195-224`                                    | `serveRunDetail` does 4 separate store reads; no transactional boundary                     | Defer        |
+| CQ-008     | 🟢 Optional | `dashboard/dashboard.go:101-130, 443-468`                           | `route()` switch grows linearly; per-view form parsing (e.g. `lens_opt_out` CSV) is inlined  | Defer        |
+| SP-007     | 🟢 Optional | `runner/src/lib/workflow.mjs:279`                                    | `deps.postStage || defaultPostStage` override path is dead; `overrides.postStage` never reaches this line | Leave as-is  |
+| SP-009     | 🟢 Optional | `runner/src/index.mjs:46-52, 280-360`                                | `postStatus` is shadowed by `postDashboardStatus` import alias; dual-posting duplicated     | Leave as-is  |
 
-**Counts:** 🔴 Blocking 0 · 🟡 Follow-up 12 (5 change-now + 7 defer) · 🟢 Optional 7.
-**Out of scope (pre-existing, not flagged against this PR):** `// temporary verify mark 1785624554` at `apps/runner/src/lib/opencode.mjs:821` (added in commit `e3bce86`, three days before this PR, in a chore to test image-digest sync — flagged in `audits/design-pattern.md` as DP-001, demoted here per the skill's "Check scope" rule).
+**Counts:** 🔴 Blocking 8 · 🟡 Follow-up 19 (10 change-now + 9 defer) · 🟢 Optional 3.
+**Top 3 for the author to act on first:** EH-003 (every stage duration is wrong), EH-001+EH-002 (silent data loss on waterfall + cost rollup), CQ-001 / DP-001 (lineage UI shows nothing).
 
 ---
 
 ## Categorized Findings
 
 ### Code Quality (CQ-*)
-- **CQ-001** (Defer): `runOpenRouterSkill` is 105 lines doing five jobs; CC is 7-8 (under threshold) but cognitive load is real. Split the error-translation tail into a helper. (Also: SP-001)
-- **CQ-003** (Defer): Catch block at `opencode.mjs:766-794` interleaves `isAbort` classification, errlog, and a `parseReviewOutput("") || "sdk call failed"` whose `||` branch is dead because the parser always sets `parseError`. (Also: SP-005)
-- **CQ-004** (Change now): `readOpencodeModel` is exported but not directly tested. On the QUB-98 cutover path. (Also: RD-004, EH-002)
-- **CQ-005** (Change now): The "no model configured" throw is uncovered. (Also: EH-007)
-- **CQ-002, CQ-006, CQ-007, CQ-008, CQ-009**: minor cohesion / test-coverage / name-clarity items. None blocking.
+
+The store layer is the cleanest part of the PR — five new files, ~1,200 lines, well-commented, with ~12 new test cases in `store_test.go`. The dashboard view layer is the weakest: a few small template/handler contracts landed out of sync, and three of the new handler modules (`RecordStage`, `Rerun`, the K8s reconciler) ship with no direct test coverage. The honest docstring discipline ("Phase 3 ships the lineage half; K8s Job creation is wired in Phase 4") is the most useful pattern in the PR and is worth preserving.
+
+The blocking CQ-001 → CQ-004 are all "template and Go struct disagreed on names" / "form and handler disagreed on Content-Type" / "button targeted an unwired route" — small, mechanical, and 1-3 line fixes each.
 
 ### Structural Choices (DP-*)
-- **DP-002** (Change now): The `// cross-module surface is just one call to callOpenRouter and one call to buildTelemetry` comment in `opencode.mjs:712-715` is wrong — the file imports three symbols and the *real* constraint is reusing `buildBoopPrompt` + `parseReviewOutput` from the same file. (Also: RD-003, SP-006)
-- **DP-003** (Defer): The PR body says "QUB-98 deletes the opencode CLI, ConfigMap, and PTY wrap." It also requires renaming `runOpenCodeSkill` → `runReviewSkill` (or similar), moving `runOpenRouterSkill` out of `opencode.mjs`, and dropping the `opencode-ai` dep. Add this to the QUB-98 handoff so the next author doesn't underestimate the work.
-- **DP-004, DP-005**: per-call SDK client + missing model-source log. Fine today.
+
+The structural pattern that works well: the store layer is the source of truth, the webhook/dashboard packages translate to HTTP, the runner POSTs best-effort to the receiver. The structural pattern that needs attention: the `webhook` package is now the de-facto app container — it owns the K8s reconciler, three background loops, the dashboard's GET/POST API, and the webhook handler. The store has no interface seam (only `ghClientAPI` does). The dashboard's view types embed `store.Run` directly, so every new column on the run table is implicitly shipped to the operator UI.
+
+The DP-001 / DP-003 blocking findings (lineage field name, audit log producers missing) overlap with the CQ / EH blocking findings above.
 
 ### Error Handling (EH-*)
-- **EH-001** (Change now): `sdk flag resolved` is logged at `slog.LevelDebug`. The receiver's default `LOG_LEVEL` falls through to `LevelInfo`. During a per-PR rollout, an operator investigating a misrouted PR won't see the decision without restarting the receiver with `LOG_LEVEL=debug`. Promote to `Info`.
-- **EH-003** (Defer): When the SDK fails for any non-abort reason, the PR status comment collapses to `parseError: "sdk call failed"` and the real `err.message` only lands in `telemetry.error`. When the dashboard data layer is off (the default for clusters without `RUNNER_TOKEN` set), the PR author loses all triage detail. Two reasonable fixes in `audits/error-handling.md` (enrich parseError with HTTP status, or add a `parseErrorDetail` field).
-- **EH-005** (Defer): `resolveSDKEnabled` accepts any non-empty string from `BOOP_USE_OPENROUTER_SDK` and only treats `"1"` as truthy. An operator who sets `BOOP_USE_OPENROUTER_SDK=true` (Helm convention) sees the cluster default flip to `"true"` in the log but the Job runs on the subprocess path. Add a startup warning for unexpected values.
-- **EH-002, EH-004, EH-006, EH-007, EH-008, EH-009**: minor; `EH-009` is a positive note (the "does not read files or spawn processes" test pins the SDK module's surface as pure I/O).
+
+The dashboard data layer is structurally sound: HTTP status codes are mostly right (200/202/204/4xx/5xx), the runner's POST helpers use the at-least-once `UNIQUE(run_id, stage)` constraint correctly, and the receiver's foreign-key cascade keeps the orphan-row surface low. **The two highest-risk gaps are EH-001/002 (missing 202 fallback on `RecordStage`/`RecordLensTelemetry` for a not-yet-persisted run) and EH-003 (`RecordStage` hardcodes `duration_ms = 0` on every end POST, overwriting the real duration via `COALESCE`).** Both cause silent data loss / corruption in the user-facing waterfall.
+
+The audit log gap (EH-006) is the contract gap that compliance review will catch — the table is built, the API is built, the tests are passing, and no production handler writes a row.
 
 ### Readability (RD-*)
-- **RD-001 / SP-008** (Defer): `submitJob` is 15 positional args; the test file needs `// reactionCommentID`, `// statusCommentID`, `// installationID` inline labels — evidence the call site is at the readability ceiling. The structural audit (SP-008) recommends a `submitJobInput` struct; the readability angle is the inline `//` comments. Not a QUB-94 change, but flag the next per-PR feature lands on a struct shape, not a 16th positional.
-- **RD-002** (Defer): `BOOP_USE_OPENROUTER_SDK` string flag carries `"0"` / `"1"` literals through 5 sites in 2 languages with no shared symbol. One Go helper would close it.
-- **RD-007** (Change now): Two QUB-94 comment blocks back-to-back in `runOpenCodeSkill` (lines 590-594 + 596-600). Trim the in-body one to the one piece of information not in the docstring (the delete target).
-- **RD-003** (Change now, with DP-002 / SP-006): trim the "cross-module surface" sentence from the comment.
-- **RD-004** (Change now, with CQ-004): `readOpencodeModel` lives in `openrouter.mjs` but reads `opencode.json`; the name doesn't signal that it's a transitional helper.
-- **RD-005, RD-006, RD-008, RD-009**: minor (test names, mock shapes, dual-mode signatures). Leave as-is.
-- **RD-010** (Defer, with DP-005): model-resolution block comment is the only place that names the source order; a one-line `modelSource` log field would be greppable.
+
+Two patterns will slow the next reader down: (1) the new `webhook/rerun.go` re-declares `shortSHARerun` / `buildJobNameRerun` / `rerunJobNameSanitizer` to mirror unexported `handler.go` helpers, so the Job-name convention is now load-bearing knowledge held in two files; (2) the "unknown run" detection at the HTTP boundary uses three different shapes in two files (`store.ErrUnknownRun` in `RecordTelemetry` and the re-run handlers, but raw `sql.ErrNoRows` in `RecordStatus` and `RecordHeartbeat`). The `var _ sql.NullString` placeholder at the bottom of `store/audit.go` is a third one-line issue that should die before it gets copy-pasted.
 
 ### Structural & Dependency (SP-*)
-- **SP-001** (Defer, with CQ-001): `runOpenRouterSkill` plays three roles.
-- **SP-002** (Defer): the QUB-94 comment on `runOpenCodeSkill` says "the subprocess block below can be deleted in QUB-98." After the delete, the function still has the name `runOpenCodeSkill` even though it does not call opencode. Open a QUB-98 todo: rename `runOpenCodeSkill` → `runReviewSkill`.
-- **SP-005** (Defer, with CQ-003): the dual error contract on the SDK call (throw on Abort, return degraded review on everything else) is correct but the comment at `opencode.mjs:768-771` only explains the AbortError case. Add a one-line comment above the `catch` describing the dual contract.
-- **SP-006** (Change now, with RD-003 / DP-002): the "circular import" comment is wrong — `openrouter.mjs` does not import from `opencode.mjs`. The real constraint is that putting `runOpenRouterSkill` in `openrouter.mjs` would force `openrouter.mjs` to import `buildBoopPrompt` + `parseReviewOutput`, completing a cycle. Update the comment.
-- **SP-008** (Defer, with RD-001): `submitJob` parameter list.
-- **SP-003, SP-004, SP-007**: test seam, env-shaped key, per-call SDK construction. Fine today.
+
+The cross-cutting is shaped well for the rollback: each QUB-N commit introduces one new file or one narrow edit, and the data-layer changes in `store/` are additive migrations. The dashboard's own coupling risk is that the operator UI is built directly on `*store.Store` with no seam, and the receiver's `*Handler` is the de-facto app container for everything. The audit log and retention schedule (QUB-112) are the most worrying: the store-side API exists, the tests exist, and no caller writes a row or renders a view.
+
+The runner's "fire-and-forget" docstring on `postStage` is contradicted by `await` at `workflow.mjs:314` (also EH-004) — the per-stage latency on a degraded receiver is 10s × N stages longer than the design says.
 
 ---
 
 ## Suggested PR Comments
 
-### Comment 1 — Promote the SDK flag log
-**File:** `apps/receiver/internal/webhook/handler.go:565` | **Tier:** 🟡 Follow-up | **Decide:** Change now
+### Comment 1 — Lineage view is silently empty
 
-**Observation:** `sdk flag resolved` is logged at `slog.LevelDebug`. The receiver's default log level is `Info` (`main.go:138`), so during a per-PR rollout the operator investigating a misrouted PR won't see the decision without restarting the receiver with `LOG_LEVEL=debug`.
-
-**Impact:** The flag is per-PR; this is a regression hazard during the QUB-94 rollout.
-
+**File:** `apps/receiver/internal/dashboard/templates/run_detail.html:55-66` | **Lines:** 55–66
+**Observation:** The template iterates `{{if .Lineage.Up}}` and `{{range .Lineage.Up}}`, but `store.Lineage` (`apps/receiver/internal/store/rerun.go:99-102`) has fields `WalkUp` and `WalkDown`. Go's `html/template` silently renders the zero value on missing fields, so the "Lineage" section always reads "No parent (this is the root of a chain.)" — even on a chain with three re-runs. The data is computed and stored; the template drops it.
+**Impact:** The QUB-110 re-run lineage feature is invisible from the dashboard. The store round-trip test passes because it asserts the Go fields, not the template.
 **Suggestion:**
+```html
+{{if .Lineage.WalkUp}}
+<p>Walked {{len .Lineage.WalkUp}} ancestor(s):</p>
+<ul>
+  {{range .Lineage.WalkUp}}<li><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a> — {{.Status}}</li>{{end}}
+</ul>
+{{else}}
+<div class="empty">No parent (this is the root of a chain).</div>
+{{end}}
+{{if .Lineage.WalkDown}}
+<h4>Superseded by</h4>
+<ul>
+  {{range .Lineage.WalkDown}}<li><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a> — {{.Status}}</li>{{end}}
+</ul>
+{{end}}
+```
+*Decide: Change now*
+
+### Comment 2 — `RecordStage` overwrites the real duration with 0
+
+**File:** `apps/receiver/internal/webhook/dashboard.go:519-521` | **Lines:** 519–521
+**Observation:** When `body.Ended` is true, the handler sets `dur := int64(0)` and passes it to `UpsertRunStage`. The `ON CONFLICT(run_id, stage) DO UPDATE SET duration_ms = COALESCE(excluded.duration_ms, run_stages.duration_ms)` clause takes `0` (not NULL) and overwrites the real duration. The dashboard's `durMS` (`dashboard.go:297-305`) returns 0 because `DurationMS` is non-nil, never falling through to the `EndedAt - StartedAt` fallback. Every waterfall bar's duration is wrong for stages longer than 1 second.
+**Impact:** Operators have no signal that a stage was slow. The waterfall looks fine; the run actually took minutes on the slow stage.
+**Suggestion:** Don't set `DurationMS` from the handler; let the dashboard compute it from `EndedAt - StartedAt`:
 ```go
-h.logger.Info("sdk flag resolved", "delivery", delivery, "value", sdkEnabled,
-  "label_present", hasLabel(labels, sdkEnabledLabel),
-  "cluster_default", h.cfg.OpenRouterSDKDefault)
-```
-
-The line is emitted once per review (low volume) and carries no secret material.
-
-### Comment 2 — Trim the cross-module surface comment
-**File:** `apps/runner/src/lib/opencode.mjs:712-715` | **Tier:** 🟡 Follow-up | **Decide:** Change now
-
-**Observation:** The comment claims the cross-module surface is "one call to `callOpenRouter` and one call to `buildTelemetry`." The import block at the top of the file pulls three symbols from `openrouter.mjs` (`buildTelemetry`, `callOpenRouter`, `readOpencodeModel`), and the function body also calls `readOpencodeModel` at line 730.
-
-**Impact:** Future readers who `grep` for "the cross-module surface" will miss the third import and the function's own model-resolution branch.
-
-**Suggestion:** Drop the second sentence and tighten the constraint to the actual reason `runOpenRouterSkill` lives in `opencode.mjs`:
-```js
-// The function lives in opencode.mjs (not openrouter.mjs) because
-// it reuses buildBoopPrompt + parseReviewOutput, and openrouter.mjs
-// is meant to stay a leaf. Moving this function would force
-// openrouter.mjs to import from opencode.mjs, completing a cycle
-// (opencode.mjs already imports from openrouter.mjs).
-```
-
-### Comment 3 — Add the two uncovered tests
-**File:** `apps/runner/src/lib/openrouter.test.mjs` + `apps/runner/src/lib/opencode.test.mjs` | **Tier:** 🟡 Follow-up | **Decide:** Change now
-
-**Observation:** `readOpencodeModel` is exported but not directly tested, and the orchestrator's "no model configured" throw is uncovered. Both are on the QUB-98 cutover path (which deletes the ConfigMap the `readOpencodeModel` branch reads).
-
-**Impact:** The first time `readOpencodeModel` fails in production — or the first time the throw fires after QUB-98 — is the first time the failure is tested.
-
-**Suggestion:** Three small tests (full snippets in `audits/code-quality.md` CQ-004 + CQ-005). All three close gaps on the QUB-98 upgrade path.
-
-### Comment 4 — Trim the duplicate QUB-94 comment in `runOpenCodeSkill`
-**File:** `apps/runner/src/lib/opencode.mjs:585-600` | **Tier:** 🟡 Follow-up | **Decide:** Change now
-
-**Observation:** Two QUB-94 comment blocks within ten lines of each other. The function-level docstring (590-594) already says "the function takes the in-process SDK path; the old TUI / JSON paths stay intact so a flag flip is the rollback." The in-body comment (596-600) repeats the same context.
-
-**Impact:** A reader skims both and walks away with the same information twice.
-
-**Suggestion:** Keep the function-level docstring. Trim the in-body comment to the one piece of new information — the delete target:
-```js
-if (ctx.openrouterSdkEnabled) {
-  // SDK fast-path. The legacy branch below dies in QUB-98.
-  return await runOpenRouterSkill(openrouterApiKey, ctx, deps);
+if body.Ended {
+    stage.EndedAt = &now
+    // leave DurationMS nil — durMS() in the dashboard
+    // computes the real value from EndedAt - StartedAt.
 }
 ```
+*Decide: Change now*
 
-### Comment 5 — Capture the QUB-98 rename in the handoff
-**File:** PR description / `docs/development.md` | **Tier:** 🟡 Follow-up | **Decide:** Defer
+### Comment 3 — `RecordStage` and `RecordLensTelemetry` lose data on a not-yet-persisted run
 
-**Observation:** The PR body frames QUB-98 as "deletes the opencode CLI, ConfigMap, and PTY wrap." After that delete, `runOpenCodeSkill` no longer calls opencode and `runOpenRouterSkill` is the only path — but it lives in `opencode.mjs` because of a circular-import constraint that the delete removes. QUB-98 also has to drop `opencode-ai` from `package.json` and `package-lock.json`, and rename `runOpenCodeSkill` → `runReviewSkill` (plus the `defaultRunOpenCodeSkill` caller in `workflow.mjs`).
+**File:** `apps/receiver/internal/webhook/dashboard.go:484-529, 611-656` | **Lines:** 484–529, 611–656
+**Observation:** Both handlers map every store error to 500 + body "store error". The schema has `run_id ... REFERENCES runs(id) ON DELETE CASCADE` (`migrations.go:235`) and `foreign_keys=on`, so a POST for a run the receiver hasn't committed yet fails the INSERT with FK violation. The runner's `postWithRetry` retries 5xx once, then drops the call. `RecordStatus` and `RecordHeartbeat` already handle the same race with `sql.ErrNoRows → 202 Accepted`; these two are the only POST endpoints that don't.
+**Impact:** Silent data loss on the waterfall (start POSTs lost; end POSTs land and stamp `started_at = now`) and on the cost rollup (lens telemetry rows dropped) for any run that starts a stage before the receiver's `UpsertRun` is visible.
+**Suggestion:** Mirror the `RecordStatus` pattern:
+```go
+if _, err := h.store.UpsertRunStage(r.Context(), stage); err != nil {
+    if errors.Is(err, sql.ErrNoRows) {
+        w.WriteHeader(http.StatusAccepted)
+        return
+    }
+    h.logger.Warn("record stage", "run", id, "stage", body.Stage, "err", err)
+    http.Error(w, "store error", http.StatusInternalServerError)
+    return
+}
+```
+Same fix for `RecordLensTelemetry` — pre-check with `GetRun` or interpret the FK error as "run not yet visible" and return 202.
+*Decide: Change now*
 
-**Impact:** If the QUB-98 author treats the work as a pure delete, the wrong-named function stays in the wrong-named file and "opencode" anchors the runner module name forever.
+### Comment 4 — "Zero out cost" button is wired to a route that doesn't exist
 
-**Suggestion:** Add a one-line QUB-98 todo: "rename `runOpenCodeSkill` → `runReviewSkill`, move into the OpenRouter module, delete `opencode.mjs` / `opencode_json.mjs` / `materializeConfig` / `runOpencode` / `importRunOpencodeJSON` / `shellQuote` / `opencode-ai` dep."
+**File:** `apps/receiver/internal/dashboard/templates/exceptions.html:35-37` | **Lines:** 35–37
+**Observation:** The "Zero out cost" button posts to `/dashboard/runs/{id}/zero-cost`. The dashboard's `route()` switch (`dashboard.go:101-130`) doesn't match this path; the closest is `RecordRefund` (`store/stages.go:197-234`), but no HTTP handler is wired. The `audit_events.action` docstring lists `"cost.zero_out"` as a real action, but no caller emits it. The same gap is in `Rerun`: the docstring (`webhook/rerun.go:135-136`) says the `reason` is "logged in the audit trail," but the handler never calls `RecordAuditEvent`.
+**Impact:** The button returns 404 to the operator. The audit log's "actor is the load-bearing column" promise is empty — no producer writes a row. Compliance review will flag this.
+**Suggestion:** Either remove the button (with a TODO comment that ships in a follow-up — matches the "Phase 3 ships the lineage half" pattern in `Rerun`), or wire both the route and the audit producer. Recommend both: add `serveZeroOutCost` to the dashboard, have it call `RecordRefund` + `RecordAuditEvent`, and add a `/dashboard/audit` view that uses the existing `ListAuditEvents` method.
+*Decide: Change now*
+
+### Comment 5 — "Requeue" form sends form-encoded data to a JSON-only handler
+
+**File:** `apps/receiver/internal/dashboard/templates/exceptions.html:30-34` | **Lines:** 30–34
+**Observation:** The "Requeue" form is rendered as `<form method="post" action="/api/runs/{{.ID}}/rerun">` with hidden `confirm` / `reason` inputs (Content-Type `application/x-www-form-urlencoded`). The `Rerun` handler does `json.NewDecoder(...).Decode(&body)` against the raw body, which fails on form-encoded data, returning 400 "bad json."
+**Impact:** The exception dock's primary re-queue action is broken in the most visible way — it returns an HTTP error the operator can read. The store's `Rerun` path is unreachable from the UI.
+**Suggestion:** Smaller fix: change `Rerun` to accept either `application/x-www-form-urlencoded` or JSON, parse conditionally, and return 400 only when neither matches. Consistent with the existing `serveInstallationControl` form pattern. One helper, a 3-line switch.
+*Decide: Change now*
 
 ---
 
 ## What's Working Well
 
-1. **The feature-flag seam is at the right layer.** The Go receiver resolves the cluster default + per-PR label into a single string env var; the runner just branches on a boolean and does not know about labels. The `resolveSDKEnabled` test table at `handler_test.go:179-207` covers the truth table cleanly (8 cases, including case-insensitive label match and unset default). `apps/receiver/internal/webhook/handler.go:815-835` is the cleanest new code in the PR.
+1. **Store migrations are well-shaped.** `migrations.go:51-155` runs each block idempotently with `IF NOT EXISTS` / `hasColumn` guards, writes `PRAGMA user_version` after each successful block, and resumes cleanly on a partial upgrade. The `v2 → v5` sequence adds the dashboard's hot tables (`run_stages`, `lens_telemetry`, lineage columns, `audit_events`) without breaking v1 (`runs`, `telemetry`, `installations`). The forward-comments on each block name the index target and the dashboard query that consumes it — `apps/receiver/internal/store/migrations.go:43-50`.
 
-2. **The SDK boundary is clean.** `@openrouter/sdk` is imported in exactly one file (`apps/runner/src/lib/openrouter.mjs`); the `extractAssistantText` / `extractUsage` helpers normalise the SDK's `promptTokens` / `promptTokensDetails.cachedTokens` / `completionTokensDetails.reasoningTokens` (camelCase, nested) into the runner's `prompt_tokens` / `cached_tokens` / `reasoning_tokens` (snake_case, flat) before anything outside the module sees them. The "does not read files or spawn processes" test at `openrouter.test.mjs:201-229` is a load-bearing guard that pins the boundary — if a future change accidentally introduces `fs.readFile` or `child_process.spawn` into the SDK path, the test fails loudly. Defense-in-depth worth keeping.
+2. **`UpsertRunStage` enforces the at-least-once contract in SQL.** The `UNIQUE(run_id, stage)` constraint plus `ON CONFLICT(run_id, stage) DO UPDATE SET ended_at = COALESCE(excluded.ended_at, run_stages.ended_at), duration_ms = COALESCE(excluded.duration_ms, run_stages.duration_ms)` clause is the load-bearing correctness rule for the dashboard's waterfall. A re-delivered end POST that lands after the row is already closed cannot accidentally re-open a closed stage. A re-delivered start POST cannot clobber a closed stage's `ended_at`. This is the right shape: idempotency in the SQL, not the application — `apps/receiver/internal/store/stages.go:61-71`.
 
-3. **The QUB-98 deletion is mostly a one-file edit.** The conditional dispatch is a single early `if (ctx.openrouterSdkEnabled)` at `opencode.mjs:595`; every subprocess-side function (`materializeConfig`, `runOpencode`, `importRunOpencodeJSON`, `shellQuote`, the JSON-mode branch) sits in one file, below the SDK branch's `if/return`. The new SDK path reuses `parseReviewOutput` so `postReview` / `postInlineComments` are unchanged. The author kept the rollback path symmetric: `BOOP_USE_OPENROUTER_SDK=0` is the opencode subprocess, and a flag flip is the rollback — no code change, no Job re-create, no migration.
+3. **`k8s_reconcile.go` keeps the K8s surface contained.** `failureClassFromContainerState` / `mapExitReason` / `mapWaitingReason` are a tiny, named, single-purpose trio that reads as a vocabulary mapping rather than a flow. The K8s-side `Waiting.Reason` strings (`CrashLoopBackOff`, `ImagePullBackOff`, `ErrImagePull`, `CreateContainerConfigError`) are converted at the receiver boundary into the dashboard's filter-chip values (`oom_killed`, `container_error`, `crash_loop`, `image_pull`, `config_error`, `stuck_*`, `container_*`). Future taxonomy changes touch one function — `apps/receiver/internal/webhook/k8s_reconcile.go:47-103`.
 
----
+4. **The `BOOP_DASHBOARD_TOKEN` gate is honest about being opt-in.** `dashboard/dashboard.go:76-92` rejects every request with 401 when the env var is empty, using `subtle.ConstantTimeCompare`. The `main.go:123-126` log line ("BOOP_DASHBOARD_TOKEN is unset: /dashboard/* will return 401") tells the operator exactly what state the receiver is in. The "data layer disabled" 503 path in every handler is consistent.
 
-## Sub-Agent Output Files
-
-- `audits/code-quality.md` (9 findings, 0 🔴 / 5 🟡 / 4 🟢)
-- `audits/design-pattern.md` (5 findings, 0 🔴 / 3 🟡 / 2 🟢)
-- `audits/error-handling.md` (9 findings, 0 🔴 / 3 🟡 / 5 🟢 + 1 positive)
-- `audits/readability.md` (10 findings, 0 🔴 / 4 🟡 / 6 🟢)
-- `audits/solid-principles.md` (8 findings, 0 🔴 / 4 🟡 / 4 🟢)
-- `audits/pr-review-summary.md` (this file)
-
-**Cross-audit dedup applied.** The 5 change-now items in the priority table are each the merged result of 2-3 sub-agent findings pointing at the same location for related reasons. Tier-🔴-Blocking findings re-verified: 0.
+5. **The runner's `deps` bundle is clean.** Every lib function reads only what it needs from `deps`; tests inject `fetchImpl`, `spawnFn`, `log`, `errlog` per concern. The 14 tests in `dashboard.test.mjs` cover the no-op / 5xx-retry / 4xx-no-retry / 202-no-retry / batch shape / heartbeat contract — `apps/runner/src/lib/dashboard.test.mjs:1-191`.
