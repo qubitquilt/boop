@@ -1,0 +1,47 @@
+{{define "title"}}Exception dock — Boop Dashboard{{end}}
+{{define "content"}}
+<h2>Exception dock</h2>
+<p>Filter chip on each row maps to the failure_class the K8s reconciler wrote. OOMKilled, llm_timeout, json_parse_fail, rate_limit_429, dedup_loop, handshake_fail.</p>
+
+<form method="get" action="/dashboard/exceptions" class="toolbar">
+  <select name="class">
+    <option value="">any class</option>
+    <option value="oom_killed" {{if eq .Filter.Class "oom_killed"}}selected{{end}}>OOMKilled</option>
+    <option value="container_error" {{if eq .Filter.Class "container_error"}}selected{{end}}>Container error</option>
+    <option value="crash_loop" {{if eq .Filter.Class "crash_loop"}}selected{{end}}>Crash loop</option>
+    <option value="image_pull" {{if eq .Filter.Class "image_pull"}}selected{{end}}>Image pull</option>
+  </select>
+  <button type="submit">Filter</button>
+</form>
+
+{{if .Exceptions}}
+<table>
+  <thead><tr><th>Run</th><th>Owner/Repo</th><th>PR</th><th>Class</th><th>Started</th><th>Error</th><th>Actions</th></tr></thead>
+  <tbody>
+    {{range .Exceptions}}
+    <tr>
+      <td><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a></td>
+      <td>{{.Owner}}/{{.Repo}}</td>
+      <td>#{{.PRNumber}}</td>
+      <td><span class="chip chip-class">{{.FailureClass}}</span></td>
+      <td>{{.StartedAt}}</td>
+      <td><code>{{.Error}}</code></td>
+      <td>
+        <form method="post" action="/api/runs/{{.ID}}/rerun" style="display:inline">
+          <input type="hidden" name="confirm" value="true">
+          <input type="hidden" name="reason" value="exception dock requeue">
+          <button class="primary" type="submit">Requeue</button>
+        </form>
+        <form method="post" action="/dashboard/runs/{{.ID}}/zero-cost" style="display:inline">
+          <button class="danger" type="submit">Zero out cost</button>
+        </form>
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No exceptions match the filter.</div>
+{{end}}
+{{end}}
+{{template "layout" .}}

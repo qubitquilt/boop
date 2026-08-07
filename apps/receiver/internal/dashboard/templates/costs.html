@@ -1,0 +1,27 @@
+{{define "title"}}Costs &amp; lenses — Boop Dashboard{{end}}
+{{define "content"}}
+<h2>Costs &amp; lenses</h2>
+<p>Lens is the row grain. "deep" tends to dominate; the leaderboard surfaces the lens that is actually expensive.</p>
+
+<h3>$/lens leaderboard (last 30 days)</h3>
+{{if .LensRollup}}
+<table>
+  <thead><tr><th>Lens</th><th>Runs</th><th>Cost (USD)</th><th>Input tokens</th><th>Output tokens</th><th>Steps</th></tr></thead>
+  <tbody>
+    {{range .LensRollup}}
+    <tr>
+      <td>{{.Lens}}</td>
+      <td>{{.RunCount}}</td>
+      <td>${{.CostUSD}}</td>
+      <td>{{.InputTokens}}</td>
+      <td>{{.OutputTokens}}</td>
+      <td>{{.StepCount}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No lens telemetry yet.</div>
+{{end}}
+{{end}}
+{{template "layout" .}}

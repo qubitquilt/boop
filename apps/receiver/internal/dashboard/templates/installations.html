@@ -1,0 +1,32 @@
+{{define "title"}}Installations — Boop Dashboard{{end}}
+{{define "content"}}
+<h2>Installations</h2>
+{{if .Installations}}
+<table>
+  <thead><tr>
+    <th>ID</th><th>Account</th><th>Type</th><th>Paused</th><th>Lens opt-out</th><th>Actions</th>
+  </tr></thead>
+  <tbody>
+    {{range .Installations}}
+    <tr>
+      <td>{{.ID}}</td>
+      <td>{{.AccountLogin}}</td>
+      <td>{{.AccountType}}</td>
+      <td>{{if .Paused}}<span class="chip chip-fail">paused</span>{{else}}<span class="chip chip-ok">active</span>{{end}}</td>
+      <td><code>{{.LensOptOut}}</code></td>
+      <td>
+        <form method="post" action="/dashboard/installations/{{.ID}}" style="display:inline">
+          <input type="hidden" name="paused" value="{{if .Paused}}false{{else}}true{{end}}">
+          <input type="hidden" name="lens_opt_out" value="{{.LensOptOutCSV}}">
+          <button type="submit">{{if .Paused}}Resume{{else}}Pause{{end}}</button>
+        </form>
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No installations.</div>
+{{end}}
+{{end}}
+{{template "layout" .}}

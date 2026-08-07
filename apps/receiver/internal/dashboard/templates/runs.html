@@ -1,0 +1,50 @@
+{{define "title"}}Runs — Boop Dashboard{{end}}
+{{define "content"}}
+<h2>Runs</h2>
+<div class="toolbar">
+  <form method="get" action="/dashboard/runs">
+    <input type="search" name="q" value="{{.Filter.Q}}" placeholder="owner/repo or PR#">
+    <select name="status">
+      <option value="">any status</option>
+      <option value="running" {{if eq .Filter.Status "running"}}selected{{end}}>running</option>
+      <option value="succeeded" {{if eq .Filter.Status "succeeded"}}selected{{end}}>succeeded</option>
+      <option value="failed" {{if eq .Filter.Status "failed"}}selected{{end}}>failed</option>
+      <option value="pending" {{if eq .Filter.Status "pending"}}selected{{end}}>pending</option>
+    </select>
+    <select name="failure_class">
+      <option value="">any class</option>
+      <option value="oom_killed" {{if eq .Filter.FailureClass "oom_killed"}}selected{{end}}>OOMKilled</option>
+      <option value="container_error" {{if eq .Filter.FailureClass "container_error"}}selected{{end}}>Container error</option>
+      <option value="crash_loop" {{if eq .Filter.FailureClass "crash_loop"}}selected{{end}}>Crash loop</option>
+      <option value="image_pull" {{if eq .Filter.FailureClass "image_pull"}}selected{{end}}>Image pull</option>
+    </select>
+    <button type="submit">Filter</button>
+  </form>
+</div>
+{{if .Runs}}
+<table>
+  <thead><tr>
+    <th>Run</th><th>Owner/Repo</th><th>PR</th><th>SHA</th><th>Status</th>
+    <th>Class</th><th>Started</th><th>Duration</th><th>Cost</th>
+  </tr></thead>
+  <tbody>
+    {{range .Runs}}
+    <tr>
+      <td><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a></td>
+      <td>{{.Owner}}/{{.Repo}}</td>
+      <td>#{{.PRNumber}}</td>
+      <td><code>{{slice .CommitSHA 0 7}}</code></td>
+      <td><span class="chip chip-{{.Status}}">{{.Status}}</span></td>
+      <td>{{if .FailureClass}}<span class="chip chip-class">{{.FailureClass}}</span>{{end}}</td>
+      <td>{{.StartedAt}}</td>
+      <td>{{.Duration}}</td>
+      <td>{{.Cost}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No runs match the filter.</div>
+{{end}}
+{{end}}
+{{template "layout" .}}

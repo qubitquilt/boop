@@ -1,0 +1,70 @@
+{{define "title"}}Run {{.Run.ID}} — Boop Dashboard{{end}}
+{{define "content"}}
+<h2>Run <code>{{.Run.ID}}</code></h2>
+<div class="toolbar">
+  <a href="/dashboard/runs">&larr; back to runs</a>
+  {{if or (eq .Run.Status "succeeded") (eq .Run.Status "failed")}}
+  <form method="get" action="/api/runs/{{.Run.ID}}/rerun-preview" target="_blank" style="margin-left:auto">
+    <button type="submit" class="primary">Re-run</button>
+  </form>
+  {{end}}
+</div>
+
+<div class="kpi"><div class="v">{{.Run.Status}}</div><div class="l">status</div></div>
+{{if .Run.FailureClass}}<div class="kpi"><div class="v">{{.Run.FailureClass}}</div><div class="l">failure class</div></div>{{end}}
+<div class="kpi"><div class="v">{{.Run.StartedAt}}</div><div class="l">started</div></div>
+{{if .Run.EndedAt}}<div class="kpi"><div class="v">{{.Run.EndedAt}}</div><div class="l">ended</div></div>{{end}}
+{{if .Run.Duration}}<div class="kpi"><div class="v">{{.Run.Duration}}</div><div class="l">duration</div></div>{{end}}
+
+<h3>Waterfall</h3>
+{{if .Stages}}
+<div class="waterfall">
+  {{range .Stages}}
+  <div class="stage-bar">
+    <div class="label">{{.Stage}}</div>
+    <div class="bar" style="margin-left: {{.OffsetPct}}%; width: {{.WidthPct}}%;"></div>
+    <div style="margin-left:8px; color:#777;">{{.Duration}}ms</div>
+  </div>
+  {{end}}
+</div>
+{{else}}
+<div class="empty">No stage telemetry yet.</div>
+{{end}}
+
+<h3>Per-lens breakdown</h3>
+{{if .Lenses}}
+<table>
+  <thead><tr><th>Lens</th><th>Model</th><th>Tokens (in/out)</th><th>Cost</th><th>Steps</th></tr></thead>
+  <tbody>
+    {{range .Lenses}}
+    <tr>
+      <td>{{.Lens}}</td>
+      <td><code>{{.Model}}</code></td>
+      <td>{{.InputTokens}} / {{.OutputTokens}}</td>
+      <td>${{.CostUSD}}</td>
+      <td>{{.StepCount}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No per-lens telemetry yet.</div>
+{{end}}
+
+<h3>Lineage</h3>
+{{if .Lineage.Up}}
+<p>Walked {{len .Lineage.Up}} ancestor(s):</p>
+<ul>
+  {{range .Lineage.Up}}<li><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a> — {{.Status}}</li>{{end}}
+</ul>
+{{else}}
+<div class="empty">No parent (this is the root of a chain).</div>
+{{end}}
+{{if .Lineage.Down}}
+<h4>Superseded by</h4>
+<ul>
+  {{range .Lineage.Down}}<li><a href="/dashboard/runs/{{.ID}}">{{.ID}}</a> — {{.Status}}</li>{{end}}
+</ul>
+{{end}}
+{{end}}
+{{template "layout" .}}

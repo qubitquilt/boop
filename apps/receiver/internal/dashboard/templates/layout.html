@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{{block "title" .}}Boop Dashboard{{end}}</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <script src="https://unpkg.com/htmx.org@1.9.10" defer></script>
+  <style>
+    /* Minimal CSS — operators do not need pretty, they need
+       legible. The one design rule: the failure_class chip
+       on a row is a color. The waterfall is a flexbox. The
+       rest is reading text. No animations. */
+    body { font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; color: #1a1a1a; }
+    header { background: #0d0d0d; color: #f5f5f5; padding: 12px 24px; display: flex; align-items: center; gap: 24px; }
+    header h1 { font-size: 16px; font-weight: 600; margin: 0; }
+    header nav a { color: #c8c8c8; text-decoration: none; padding: 6px 10px; border-radius: 4px; }
+    header nav a:hover, header nav a.active { background: #2a2a2a; color: #fff; }
+    main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+    h2 { font-size: 18px; font-weight: 600; margin: 0 0 16px; }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #e6e6e6; vertical-align: top; }
+    th { font-weight: 600; color: #555; background: #fafafa; }
+    tr:hover td { background: #f5f5f5; }
+    .chip { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .chip-ok { background: #e6f4ea; color: #137333; }
+    .chip-fail { background: #fce8e6; color: #b71c1c; }
+    .chip-pending { background: #fef7e0; color: #8a6d00; }
+    .chip-running { background: #e8f0fe; color: #1967d2; }
+    .chip-class { background: #f3e8fd; color: #6a1b9a; }
+    .stuck { background: #fff3e0; }
+    .empty { color: #999; font-style: italic; padding: 24px; text-align: center; }
+    .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+    .toolbar form { display: flex; gap: 6px; }
+    input[type=text], input[type=search], select { padding: 6px 10px; border: 1px solid #d0d0d0; border-radius: 4px; font-size: 13px; }
+    button { padding: 6px 12px; border: 1px solid #d0d0d0; border-radius: 4px; background: #fff; cursor: pointer; font-size: 13px; }
+    button.primary { background: #1967d2; color: #fff; border-color: #1967d2; }
+    button.danger { background: #d93025; color: #fff; border-color: #d93025; }
+    .waterfall { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+    .stage-bar { display: flex; align-items: center; height: 22px; }
+    .stage-bar .label { width: 140px; color: #555; }
+    .stage-bar .bar { height: 100%; background: #4285f4; min-width: 2px; }
+    .stage-bar .bar.comment { background: #34a853; }
+    .stage-bar .bar.lens { background: #9c27b0; }
+    .kpi { display: inline-block; padding: 12px 18px; margin-right: 16px; background: #fafafa; border-radius: 6px; }
+    .kpi .v { font-size: 22px; font-weight: 600; }
+    .kpi .l { font-size: 12px; color: #777; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>🐾 Boop</h1>
+    <nav>
+      <a href="/dashboard/runs" class="{{if eq .Nav "runs"}}active{{end}}">Runs</a>
+      <a href="/dashboard/live" class="{{if eq .Nav "live"}}active{{end}}">Live ops</a>
+      <a href="/dashboard/exceptions" class="{{if eq .Nav "exceptions"}}active{{end}}">Exception dock</a>
+      <a href="/dashboard/costs" class="{{if eq .Nav "costs"}}active{{end}}">Costs &amp; lenses</a>
+      <a href="/dashboard/installations" class="{{if eq .Nav "installations"}}active{{end}}">Installations</a>
+    </nav>
+  </header>
+  <main>
+    {{block "content" .}}{{end}}
+  </main>
+</body>
+</html>
