@@ -37,6 +37,14 @@ const (
 // json_parse_fail); LastHeartbeatAt is updated by the
 // receiver on every runner heartbeat POST and powers the
 // stuck-runs panel.
+//
+// ParentRunID and SupersededByID are QUB-110 additions:
+// ParentRunID points to the run this one was re-run from;
+// SupersededByID points to the run that re-ran this one.
+// The two columns are not symmetric — a re-run never
+// branches, so SupersededByID is at most one row. The
+// dashboard's "vertical timeline" view walks the chain
+// via ParentRunID.
 type Run struct {
 	ID              string
 	Owner           string
@@ -54,6 +62,8 @@ type Run struct {
 	Error           string
 	FailureClass    string
 	LastHeartbeatAt *time.Time
+	ParentRunID     string
+	SupersededByID  string
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
@@ -87,20 +97,24 @@ func (s *Store) UpsertRun(ctx context.Context, r Run) (Run, error) {
 			review_number, reason, installation_id, status,
 			started_at, ended_at, duration_ms, error,
 			failure_class,
+			parent_run_id, superseded_by_id,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			status        = excluded.status,
-			ended_at      = excluded.ended_at,
-			duration_ms   = excluded.duration_ms,
-			error         = excluded.error,
-			failure_class = excluded.failure_class,
-			updated_at    = excluded.updated_at
+			status           = excluded.status,
+			ended_at         = excluded.ended_at,
+			duration_ms      = excluded.duration_ms,
+			error            = excluded.error,
+			failure_class    = excluded.failure_class,
+			parent_run_id    = excluded.parent_run_id,
+			superseded_by_id = excluded.superseded_by_id,
+			updated_at       = excluded.updated_at
 	`,
 		r.ID, r.Owner, r.Repo, r.PRNumber, r.CommitSHA, r.BaseRef,
 		r.ReviewNumber, nullString(r.Reason), nullInt64(r.InstallationID), string(r.Status),
 		r.StartedAt.UTC().Format(time.RFC3339Nano), nullTimePtr(r.EndedAt), nullInt64Ptr(r.DurationMS), nullString(r.Error),
 		nullString(r.FailureClass),
+		nullString(r.ParentRunID), nullString(r.SupersededByID),
 		r.CreatedAt.UTC().Format(time.RFC3339Nano), r.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -182,19 +196,55 @@ func (s *Store) SetRunFailureClass(ctx context.Context, id, failureClass string)
 	return nil
 }
 
-// GetRun returns the run with the given id, or sql.ErrNoRows if
-// none exists. Used by the runner's POST endpoints to look up the
-// row before they update it.
+// SetSupersededBy writes just the superseded_by_id column
+// on a run row. Used by the re-run flow (Phase 3) to
+// backfill the lineage pointer without re-touching any
+// other field. The prior run's status, ended_at, error,
+// failure_class, etc. stay exactly as the runner left
+// them; only the new lineage pointer lands.
+//
+// Returns sql.ErrNoRows if the prior has been pruned —
+// the re-run flow treats that as a non-fatal no-op so
+// the new run row still lands and the operator's
+// "show me the lineage" view is consistent (the prior
+// just renders as "(pruned)" on the dashboard side).
+func (s *Store) SetSupersededBy(ctx context.Context, priorID, newID string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET superseded_by_id = ?, updated_at = ? WHERE id = ?
+	`, nullString(newID), now, priorID)
+	if err != nil {
+		return fmt.Errorf("store: set superseded by: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: set superseded by rows: %w", err)
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// GetRun returns the run with the given id, or ErrUnknownRun
+// (wrapping sql.ErrNoRows) if none exists. Used by the
+// runner's POST endpoints to look up the row before they
+// update it.
 func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, owner, repo, pr_number, commit_sha, base_ref,
 			review_number, reason, installation_id, status,
 			started_at, ended_at, duration_ms, error,
 			failure_class, last_heartbeat_at,
+			COALESCE(parent_run_id, ''), COALESCE(superseded_by_id, ''),
 			created_at, updated_at
 		FROM runs WHERE id = ?
 	`, id)
-	return scanRun(row)
+	r, err := scanRun(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Run{}, ErrUnknownRun
+	}
+	return r, err
 }
 
 // ListRunsFilter narrows a ListRuns call. Empty fields are ignored
@@ -290,6 +340,7 @@ func (s *Store) ListRuns(ctx context.Context, f ListRunsFilter) (ListRunsResult,
 			review_number, reason, installation_id, status,
 			started_at, ended_at, duration_ms, error,
 			failure_class, last_heartbeat_at,
+			COALESCE(parent_run_id, ''), COALESCE(superseded_by_id, ''),
 			created_at, updated_at
 		FROM runs
 		%s
@@ -366,6 +417,8 @@ func scanRun(r rowScanner) (Run, error) {
 		installID      sql.NullInt64
 		failureClass   sql.NullString
 		heartbeatPtr   sql.NullString
+		parentID       string
+		supersededBy   string
 		createdStr     string
 		updatedStr     string
 	)
@@ -374,6 +427,7 @@ func scanRun(r rowScanner) (Run, error) {
 		&rr.ReviewNumber, &reason, &installID, &status,
 		&startedStr, &endedPtr, &durPtr, &errPtr,
 		&failureClass, &heartbeatPtr,
+		&parentID, &supersededBy,
 		&createdStr, &updatedStr,
 	); err != nil {
 		return Run{}, err
@@ -382,6 +436,8 @@ func scanRun(r rowScanner) (Run, error) {
 	rr.BaseRef = baseRef.String
 	rr.Reason = reason.String
 	rr.FailureClass = failureClass.String
+	rr.ParentRunID = parentID
+	rr.SupersededByID = supersededBy
 	if installID.Valid {
 		rr.InstallationID = installID.Int64
 	}
