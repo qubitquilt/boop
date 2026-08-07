@@ -181,6 +181,24 @@ spec:
                   name: boop-secrets
                   key: RUNNER_TOKEN
                   optional: true
+            # Dashboard auth gate: shared secret the receiver's
+            # /dashboard/* middleware compares against the
+            # X-Boop-Dashboard-Token header (constant-time).
+            # Reuses the RUNNER_TOKEN key from boop-secrets —
+            # the dashboard gate and the runner telemetry POSTs
+            # are both "operator-only" surfaces and the same
+            # shared secret is sufficient for both. An empty
+            # value disables the dashboard entirely (every
+            # request gets 401); keeping it `optional: true`
+            # matches RUNNER_TOKEN's opt-in posture. Split into
+            # a separate key if the dashboard ever needs a
+            # distinct rotation cadence from the runner.
+            - name: BOOP_DASHBOARD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: boop-secrets
+                  key: RUNNER_TOKEN
+                  optional: true
             # QUB-106: model id forwarded to every runner
             # Job as OPENROUTER_MODEL. The receiver's
             # main.go reads this and puts it on every
