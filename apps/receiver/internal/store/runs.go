@@ -165,6 +165,46 @@ func (s *Store) UpdateRunStatus(ctx context.Context, id string, status RunStatus
 	return s.GetRun(ctx, id)
 }
 
+// UpdateRunStatusIfRunning is the reconciler's variant of
+// UpdateRunStatus: it only writes the terminal fields when the
+// current row is still "running". Used by the K8s Job
+// reconciler so a late reconciler tick cannot overwrite a
+// status the runner already finalised via UpdateRunStatus
+// (e.g. "succeeded" with a posted summary comment).
+//
+// Returns (true, nil) when the row was updated, (false, nil)
+// when the row was already terminal, (Run{}, sql.ErrNoRows)
+// when no such row exists. The bool lets the reconciler
+// log "we reconciled N runs" without a follow-up SELECT.
+func (s *Store) UpdateRunStatusIfRunning(ctx context.Context, id string, status RunStatus, endedAt *time.Time, durationMS *int64, errMsg string) (bool, error) {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET
+			status      = ?,
+			ended_at    = COALESCE(?, ended_at),
+			duration_ms = COALESCE(?, duration_ms),
+			error       = COALESCE(NULLIF(?, ''), error),
+			updated_at  = ?
+		WHERE id = ? AND status = ?
+	`,
+		string(status),
+		nullTimePtr(endedAt),
+		nullInt64Ptr(durationMS),
+		errMsg,
+		now.UTC().Format(time.RFC3339Nano),
+		id,
+		string(StatusRunning),
+	)
+	if err != nil {
+		return false, fmt.Errorf("store: update run status if running: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: update run status if running rows: %w", err)
+	}
+	return n > 0, nil
+}
+
 // SetRunFailureClass writes just the failure_class column on a
 // run row. Used by the K8s reconciler (Phase 1's post-createJob
 // path) to backfill the exit reason once the Job terminates.
@@ -224,6 +264,59 @@ func (s *Store) SetSupersededBy(ctx context.Context, priorID, newID string) erro
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+// MarkOrphanedRuns bulk-marks every "running" row whose
+// runner never heartbeated as "failed" with a synthetic
+// "orphaned" error. Used by the dashboard's admin endpoint
+// to clean up the dashboard after a deployment regression
+// where runner telemetry posts never landed (see QUB-114
+// for the original incident): every review was created
+// with status="running" but the runner never reached the
+// heartbeat stage, so the rows are stuck in the live view
+// indefinitely until the 365-day retention tick prunes
+// them.
+//
+// The grace argument skips rows younger than now-grace:
+// a healthy review typically takes 30-90s to reach its
+// first heartbeat, and the admin endpoint should not race
+// with the next in-flight review. 5 minutes is the
+// documented floor for the dashboard's "stuck" panel and
+// doubles as the orphan grace here — anything older than
+// 5m and still heartbeating-free is, by definition, an
+// orphan.
+//
+// Returns the number of rows updated.
+func (s *Store) MarkOrphanedRuns(ctx context.Context, grace time.Duration) (int64, error) {
+	now := time.Now().UTC()
+	cutoff := now.Add(-grace).UTC().Format(time.RFC3339Nano)
+	endedAt := now.UTC().Format(time.RFC3339Nano)
+	errMsg := "orphaned: K8s Job no longer exists; runner never recorded final status"
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET
+			status      = ?,
+			ended_at    = ?,
+			error       = ?,
+			updated_at  = ?
+		WHERE status = ?
+		  AND last_heartbeat_at IS NULL
+		  AND started_at < ?
+	`,
+		string(StatusFailed),
+		endedAt,
+		errMsg,
+		endedAt,
+		string(StatusRunning),
+		cutoff,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("store: mark orphaned runs: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: mark orphaned runs rows: %w", err)
+	}
+	return n, nil
 }
 
 // GetRun returns the run with the given id, or ErrUnknownRun

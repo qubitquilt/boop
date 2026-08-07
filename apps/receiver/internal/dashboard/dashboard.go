@@ -202,6 +202,21 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 		h.serveInstallations(w, r)
 	case strings.HasPrefix(path, "installations/"):
 		h.serveInstallationControl(w, r, strings.TrimPrefix(path, "installations/"))
+	case strings.HasPrefix(path, "admin/") && r.Method == http.MethodPost:
+		// QUB-114: operator-facing admin actions.
+		// Today the only endpoint is /admin/mark-orphaned
+		// which bulk-marks old, never-heartbeated runs as
+		// failed so the dashboard's "live" view doesn't
+		// accumulate zombies after a runner telemetry
+		// regression. Auth is the same BOOP_DASHBOARD_TOKEN
+		// middleware applied to the whole /dashboard/* tree.
+		rest := strings.TrimPrefix(path, "admin/")
+		switch rest {
+		case "mark-orphaned":
+			h.serveMarkOrphaned(w, r)
+		default:
+			http.NotFound(w, r)
+		}
 	default:
 		http.NotFound(w, r)
 	}
@@ -874,6 +889,65 @@ func (h *Handler) actor() string {
 	}
 	sum := sha256.Sum256([]byte(h.token))
 	return "dashboard:" + hex.EncodeToString(sum[:4])
+}
+
+// serveMarkOrphaned handles POST /dashboard/admin/mark-orphaned.
+// Bulk-marks every "running" row whose runner never
+// heartbeated as "failed" with a synthetic "orphaned" error.
+//
+// QUB-114: the original incident was a runner telemetry
+// regression where the runner process exited before its
+// first heartbeat, leaving every review row stuck at
+// status="running" in the dashboard. The reconciler fix
+// (k8s_reconcile.go) prevents this going forward for new
+// runs; this endpoint cleans up the legacy zombies from
+// the dashboard in one shot.
+//
+// Auth: same X-Boop-Dashboard-Token as the rest of the
+// /dashboard/* tree (the middleware in this package).
+//
+// Optional query params:
+//   grace=<duration> — overrides the default 5m grace
+//     window. Useful for tests and for the operator
+//     who wants to wait longer before marking a slow
+//     runner's row as orphaned. Format is a Go duration
+//     string (5m, 30s, 1h).
+//
+// Response: 200 with {"marked": <int>} on success, 400 on
+// a malformed grace value, 500 on a store error.
+func (h *Handler) serveMarkOrphaned(w http.ResponseWriter, r *http.Request) {
+	grace := 5 * time.Minute
+	if g := r.URL.Query().Get("grace"); g != "" {
+		d, err := time.ParseDuration(g)
+		if err != nil {
+			http.Error(w, "bad grace: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if d < 0 {
+			http.Error(w, "grace must be non-negative", http.StatusBadRequest)
+			return
+		}
+		grace = d
+	}
+	n, err := h.store.MarkOrphanedRuns(r.Context(), grace)
+	if err != nil {
+		h.logger.Warn("dashboard mark orphaned", "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
+		Action:   "admin.mark_orphaned",
+		Actor:    h.actor(),
+		TargetID: "bulk",
+		Details:  store.MarshalDetails(map[string]any{"marked": n, "grace_seconds": grace.Seconds()}),
+	}); err != nil {
+		// Non-fatal: the dashboard's audit view will surface
+		// a gap, which is preferable to a 5xx that loses
+		// the operator's cleanup progress.
+		h.logger.Warn("dashboard mark orphaned audit", "err", err)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(fmt.Sprintf(`{"marked":%d}`, n)))
 }
 
 // Health is a liveness endpoint for the dashboard. It
