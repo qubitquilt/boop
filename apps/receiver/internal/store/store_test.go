@@ -152,6 +152,135 @@ func TestUpdateRunStatus_UnknownRun(t *testing.T) {
 	}
 }
 
+func TestUpdateRunStatusIfRunning_OnlyWritesWhenRunning(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusRunning, now)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	ended := now.Add(60 * time.Second)
+	dur := int64(60_000)
+	written, err := s.UpdateRunStatusIfRunning(ctx, "boop-a-b-1-aaaaaaa", StatusFailed, &ended, &dur, "reconciled")
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if !written {
+		t.Fatal("expected written=true on running row")
+	}
+	got, err := s.GetRun(ctx, "boop-a-b-1-aaaaaaa")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != StatusFailed {
+		t.Errorf("status = %q, want failed", got.Status)
+	}
+	if got.Error != "reconciled" {
+		t.Errorf("error = %q, want reconciled", got.Error)
+	}
+
+	// Second call on the now-terminal row should be a no-op.
+	written, err = s.UpdateRunStatusIfRunning(ctx, "boop-a-b-1-aaaaaaa", StatusSucceeded, &ended, &dur, "late tick")
+	if err != nil {
+		t.Fatalf("second update: %v", err)
+	}
+	if written {
+		t.Fatal("expected written=false on terminal row")
+	}
+	got, err = s.GetRun(ctx, "boop-a-b-1-aaaaaaa")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != StatusFailed {
+		t.Errorf("status overwritten: %q", got.Status)
+	}
+	if got.Error != "reconciled" {
+		t.Errorf("error overwritten: %q", got.Error)
+	}
+}
+
+func TestUpdateRunStatusIfRunning_UnknownRunReturnsFalse(t *testing.T) {
+	s := newTestStore(t)
+	written, err := s.UpdateRunStatusIfRunning(context.Background(), "no-such-run", StatusFailed, nil, nil, "")
+	if err != nil {
+		t.Fatalf("expected no error for unknown run, got %v", err)
+	}
+	if written {
+		t.Fatal("expected written=false for unknown run")
+	}
+}
+
+func TestMarkOrphanedRuns_OnlyOldNoHeartbeat(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	now := time.Now().UTC()
+	old := now.Add(-10 * time.Minute) // outside the 5m grace window
+	fresh := now.Add(-2 * time.Minute) // inside the 5m grace window
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusRunning, old)); err != nil {
+		t.Fatalf("seed old: %v", err)
+	}
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-2-bbbbbbb", "a", "b", 2, "bbbbbbb", StatusRunning, fresh)); err != nil {
+		t.Fatalf("seed fresh: %v", err)
+	}
+	// Heartbeated row, old — must NOT be marked.
+	heartbeated := sampleRun("boop-a-b-3-ccccccc", "a", "b", 3, "ccccccc", StatusRunning, old)
+	if _, err := s.UpsertRun(ctx, heartbeated); err != nil {
+		t.Fatalf("seed heartbeated: %v", err)
+	}
+	if err := s.TouchRunHeartbeat(ctx, heartbeated.ID); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+
+	n, err := s.MarkOrphanedRuns(ctx, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("marked = %d, want 1", n)
+	}
+
+	// The old, no-heartbeat row is now failed with the orphan error.
+	got, err := s.GetRun(ctx, "boop-a-b-1-aaaaaaa")
+	if err != nil {
+		t.Fatalf("get old: %v", err)
+	}
+	if got.Status != StatusFailed {
+		t.Errorf("old status = %q, want failed", got.Status)
+	}
+	if got.Error == "" || got.Error[:8] != "orphaned" {
+		t.Errorf("old error = %q, want orphan prefix", got.Error)
+	}
+
+	// The fresh and heartbeated rows are untouched.
+	for _, id := range []string{"boop-a-b-2-bbbbbbb", "boop-a-b-3-ccccccc"} {
+		got, err := s.GetRun(ctx, id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		if got.Status != StatusRunning {
+			t.Errorf("%s status = %q, want running", id, got.Status)
+		}
+	}
+}
+
+func TestMarkOrphanedRuns_NoMatches(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusRunning, time.Now().UTC())); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	n, err := s.MarkOrphanedRuns(ctx, 5*time.Minute)
+	if err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("marked = %d, want 0", n)
+	}
+}
+
 func TestListRuns_FilterByOwnerRepo(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
