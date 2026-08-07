@@ -22,6 +22,14 @@ import (
 // to assert the cross-package call), and a discard logger.
 func newTestDashboard(t *testing.T, rerunFn func(ctx context.Context, prior store.Run, reason string) (string, error)) *Handler {
 	t.Helper()
+	return newTestDashboardWithLogs(t, rerunFn, nil)
+}
+
+// newTestDashboardWithLogs is the variant that also wires
+// Actions.FetchPodLogs. Used by TestServeRunDetail* to
+// assert that the dashboard surfaces the runner's pod logs.
+func newTestDashboardWithLogs(t *testing.T, rerunFn func(ctx context.Context, prior store.Run, reason string) (string, error), fetchLogsFn func(ctx context.Context, jobName string) (string, error)) *Handler {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "boop.db")
 	s, err := store.Open(path)
 	if err != nil {
@@ -34,6 +42,7 @@ func newTestDashboard(t *testing.T, rerunFn func(ctx context.Context, prior stor
 		token:  "test-dashboard-token",
 		actions: Actions{
 			CreateRerunJob: rerunFn,
+			FetchPodLogs:   fetchLogsFn,
 		},
 	}
 }
@@ -454,6 +463,145 @@ func TestServeRetention_ImminentFlag(t *testing.T) {
 	}
 	if !strings.Contains(body, `<span class="chip chip-fail">yes</span>`) {
 		t.Errorf("imminent row missing yes chip: %s", body)
+	}
+}
+
+// TestServeRunDetail_RendersFailedRun covers the full
+// run-detail render: a failed run carries an error
+// string + a failure_class; the page renders both, plus
+// the K8s pod logs (from the Actions.FetchPodLogs
+// callback) and the PR link composed from
+// owner/repo/PRNumber.
+func TestServeRunDetail_RendersFailedRun(t *testing.T) {
+	var fetched string
+	fetchLogs := func(ctx context.Context, jobName string) (string, error) {
+		fetched = jobName
+		return `{"stage":"start","msg":"hi"}
+{"stage":"opencode","msg":"calling llm"}
+{"stage":"opencode","code":1,"msg":"exit non-zero"}
+`, nil
+	}
+	h := newTestDashboardWithLogs(t, nil, fetchLogs)
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	run := store.Run{
+		ID: "boop-a-b-42-aaaaaaa", Owner: "alice", Repo: "widgets",
+		PRNumber: 42, CommitSHA: "aaaaaaa", BaseRef: "main",
+		ReviewNumber: 1, Reason: "pull_request.opened", InstallationID: 1,
+		Status: store.StatusFailed, StartedAt: now.Add(-2 * time.Minute),
+		Error:        "BackoffLimitExceeded: pod crashed before heartbeat",
+		FailureClass: "container_error",
+	}
+	if _, err := h.store.UpsertRun(ctx, run); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	ended := now.Add(-30 * time.Second)
+	dur := int64(90_000)
+	if _, err := h.store.UpdateRunStatus(ctx, run.ID, store.StatusFailed, &ended, &dur, run.Error); err != nil {
+		t.Fatalf("finalise: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/dashboard/runs/"+run.ID, nil)
+	rr := httptest.NewRecorder()
+	h.route(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+
+	for _, want := range []string{
+		"PR #42 on GitHub",     // PR link in toolbar
+		"container_error",      // failure class chip
+		"BackoffLimitExceeded", // full error string in the Error section
+		"opencode",             // a stage name from the seeded K8s logs
+		"K8s pod logs",         // the new logs section
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q", want)
+		}
+	}
+	if fetched != run.ID {
+		t.Errorf("FetchPodLogs called with %q, want %q", fetched, run.ID)
+	}
+}
+
+// TestServeRunDetail_RendersLogsUnavailable covers the
+// "Job TTL'd" path: the FetchPodLogs callback returns
+// ("", nil) and the dashboard renders the empty-state
+// hint, not a 500.
+func TestServeRunDetail_RendersLogsUnavailable(t *testing.T) {
+	h := newTestDashboardWithLogs(t, nil, func(ctx context.Context, jobName string) (string, error) {
+		return "", nil
+	})
+	ctx := context.Background()
+	run := seedRunForDashboard(t, h, store.StatusFailed, 0)
+	if _, err := h.store.UpsertRun(ctx, run); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/dashboard/runs/"+run.ID, nil)
+	rr := httptest.NewRecorder()
+	h.route(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "TTL'd") {
+		t.Errorf("body missing TTL'd hint: %s", rr.Body.String())
+	}
+}
+
+// TestServeRunDetail_RendersLogsError covers the
+// FetchPodLogs-error path: the callback returns an
+// error and the dashboard surfaces it as the reason
+// logs are unavailable (the operator sees a real error
+// rather than a silent gap).
+func TestServeRunDetail_RendersLogsError(t *testing.T) {
+	h := newTestDashboardWithLogs(t, nil, func(ctx context.Context, jobName string) (string, error) {
+		return "", errors.New("kube client timeout")
+	})
+	ctx := context.Background()
+	run := seedRunForDashboard(t, h, store.StatusFailed, 0)
+	if _, err := h.store.UpsertRun(ctx, run); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/dashboard/runs/"+run.ID, nil)
+	rr := httptest.NewRecorder()
+	h.route(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "kube client timeout") {
+		t.Errorf("body missing error reason: %s", rr.Body.String())
+	}
+}
+
+// TestServeRunDetail_NoPRLinkForOrphanedRows covers the
+// edge case where the run row has no owner/repo/PR (the
+// defensive check; MarkOrphanedRuns always carries those
+// fields, but a hand-edited row might not). The page must
+// still render without the PR link and without a 500.
+func TestServeRunDetail_NoPRLinkForOrphanedRows(t *testing.T) {
+	h := newTestDashboardWithLogs(t, nil, nil)
+	ctx := context.Background()
+	run := store.Run{
+		ID: "boop-x-y-1-deadbee", Status: store.StatusRunning,
+		StartedAt: time.Now().UTC(),
+	}
+	if _, err := h.store.UpsertRun(ctx, run); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/dashboard/runs/"+run.ID, nil)
+	rr := httptest.NewRecorder()
+	h.route(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if strings.Contains(rr.Body.String(), "PR #") {
+		t.Errorf("body should not contain PR link for owner-less run")
 	}
 }
 

@@ -165,8 +165,14 @@ func main() {
 	// the dashboard package from importing webhook
 	// (which would be a cycle once webhook starts
 	// wanting to call back into dashboard).
+	//
+	// FetchPodLogs is the run-detail page's on-demand
+	// log fetcher: the dashboard wants the raw
+	// runner stdout for the run, and only the
+	// webhook package holds the kube client.
 	dash, err := dashboard.NewHandler(h.Store(), logger, dashboardToken, dashboard.Actions{
 		CreateRerunJob: h.CreateRerunJob,
+		FetchPodLogs:   h.FetchPodLogs,
 	})
 	if err != nil {
 		logger.Error("init dashboard", "err", err)
