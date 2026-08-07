@@ -142,6 +142,14 @@ export function loadConfig(env = process.env) {
     dashboardUrl: env.BOOP_DASHBOARD_URL || null,
     dashboardToken: env.BOOP_DASHBOARD_TOKEN || null,
     jobName: env.BOOP_JOB_NAME || null,
+    // QUB-110: parent-run id. Set by the receiver's
+    // re-run jobbuilder when this Job is a re-run
+    // of an earlier run. The runner uses it to
+    // populate the prompt's PRIOR_RUN_CONTEXT block
+    // so the model is aware a previous review exists
+    // and should not re-flag issues already addressed.
+    // Empty on the first review of a PR.
+    parentRunId: env.BOOP_PARENT_RUN_ID || null,
     // Model name forwarded to the OpenRouter SDK. The QUB-94
     // cutover used opencode.json's `model` field as the
     // fallback; QUB-98 deleted the opencode.json ConfigMap so

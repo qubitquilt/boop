@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/michaelruelas/boop-receiver/internal/dashboard"
 	boopgithub "github.com/michaelruelas/boop-receiver/internal/github"
 	"github.com/michaelruelas/boop-receiver/internal/webhook"
-	"github.com/michaelruelas/boop-receiver/internal/dashboard"
 )
 
 func main() {
@@ -137,6 +137,16 @@ func main() {
 	// Per-lens telemetry (Phase 4's "lens is the row grain"
 	// rule). Batch replace — re-runs land on the same shape.
 	mux.HandleFunc("POST /api/runs/{id}/lens_telemetry", h.RecordLensTelemetry)
+	// QUB-110 / QUB-113: re-run lineage. The preview
+	// endpoint is a GET (the operator-facing diff);
+	// the rerun endpoint is a POST that mints a new
+	// run + K8s Job. The dashboard's form-based
+	// requeue posts to /dashboard/runs/{id}/rerun
+	// (which lands here via the cross-package
+	// callback) so the audit row has the same shape
+	// regardless of which path the operator uses.
+	mux.HandleFunc("GET /api/runs/{id}/rerun-preview", h.RerunPreview)
+	mux.HandleFunc("POST /api/runs/{id}/rerun", h.Rerun)
 
 	// QUB-111: dashboard. The BOOP_DASHBOARD_TOKEN env
 	// var gates the /dashboard/* routes; an empty value
@@ -147,7 +157,17 @@ func main() {
 	if dashboardToken == "" {
 		logger.Warn("BOOP_DASHBOARD_TOKEN is unset: /dashboard/* will return 401 (operator UI is opt-in)")
 	}
-	dash, err := dashboard.NewHandler(h.Store(), logger, dashboardToken)
+	// QUB-113: wire the dashboard's cross-package
+	// actions. The form-based re-run button on the
+	// exceptions view needs to mint a new K8s Job;
+	// that requires the K8s client + cfg which only
+	// the webhook package holds. The callback keeps
+	// the dashboard package from importing webhook
+	// (which would be a cycle once webhook starts
+	// wanting to call back into dashboard).
+	dash, err := dashboard.NewHandler(h.Store(), logger, dashboardToken, dashboard.Actions{
+		CreateRerunJob: h.CreateRerunJob,
+	})
 	if err != nil {
 		logger.Error("init dashboard", "err", err)
 		os.Exit(1)

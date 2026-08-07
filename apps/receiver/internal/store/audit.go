@@ -17,7 +17,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -100,8 +99,8 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]AuditEvent, e
 	var out []AuditEvent
 	for rows.Next() {
 		var (
-			ev  AuditEvent
-			t   string
+			ev AuditEvent
+			t  string
 		)
 		if err := rows.Scan(&ev.ID, &ev.Action, &ev.Actor, &ev.TargetID, &t, &ev.Details); err != nil {
 			return nil, fmt.Errorf("store: scan audit event: %w", err)
@@ -124,10 +123,10 @@ func (s *Store) ListAuditEvents(ctx context.Context, limit int) ([]AuditEvent, e
 // retention-pruned?" without grepping the receiver
 // config.
 type RetentionRow struct {
-	RunID              string
-	StartedAt          time.Time
-	ScheduledDeletion  time.Time
-	RetentionDays      int
+	RunID             string
+	StartedAt         time.Time
+	ScheduledDeletion time.Time
+	RetentionDays     int
 }
 
 // ListRetentionSchedule returns every run with its
@@ -157,8 +156,8 @@ func (s *Store) ListRetentionSchedule(ctx context.Context, retention time.Durati
 	var out []RetentionRow
 	for rows.Next() {
 		var (
-			id  string
-			t   string
+			id string
+			t  string
 		)
 		if err := rows.Scan(&id, &t); err != nil {
 			return nil, fmt.Errorf("store: scan retention row: %w", err)
@@ -191,10 +190,3 @@ func MarshalDetails(v any) string {
 	}
 	return string(b)
 }
-
-// sql is imported for the future use of sql.NullString
-// in the audit event's details column scan path. The
-// compiler complains about an unused import if we
-// remove the import; the alias is here as a guard
-// against a future refactor that needs it.
-var _ sql.NullString

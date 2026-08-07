@@ -18,6 +18,7 @@
         <form method="post" action="/dashboard/installations/{{.ID}}" style="display:inline">
           <input type="hidden" name="paused" value="{{if .Paused}}false{{else}}true{{end}}">
           <input type="hidden" name="lens_opt_out" value="{{.LensOptOutCSV}}">
+          <input type="text" name="reason" placeholder="reason (optional)" size="20">
           <button type="submit">{{if .Paused}}Resume{{else}}Pause{{end}}</button>
         </form>
       </td>
@@ -29,4 +30,4 @@
 <div class="empty">No installations.</div>
 {{end}}
 {{end}}
-{{template "layout" .}}
+{{template "layout.html" .}}

@@ -650,6 +650,35 @@ export async function buildBoopPrompt(ctx, deps) {
       "format (required)' — the runner parses that block " +
       "to post the review on GitHub.",
     "",
+    // QUB-110: prior-run context. Landed when the
+    // receiver's re-run jobbuilder set
+    // BOOP_PARENT_RUN_ID. The block tells the model
+    // the prior exists and tells it NOT to re-flag
+    // already-posted issues. The dedup side (the
+    // per-inline boop-inline: marker) catches
+    // duplicates on the GitHub side; the prompt
+    // side keeps the model focused on the delta
+    // instead of re-litigating decisions. Empty on
+    // first reviews (parentRunId unset).
+    ...(ctx.parentRunId
+      ? [
+          "## Prior run context (QUB-110)",
+          "",
+          `This is a re-run of run \`${ctx.parentRunId}\`. ` +
+            `A prior review exists for the same head SHA and is ` +
+            `still on the PR (the receiver's lineage chain points ` +
+            `parent_run_id at it). The prior's per-inline markers ` +
+            `(boop-inline: <path>:<line>:<body-hash>) dedup ` +
+            `duplicates on the GitHub side, but a duplicate-free ` +
+            `prompt keeps the model focused on what is genuinely ` +
+            `new since the prior review. Re-flag only issues ` +
+            `introduced by changes after the prior review. ` +
+            `Surface 3-8 of the most important new findings, not ` +
+            `a re-litigation of decisions already made.`,
+          "",
+        ]
+      : []),
+    "",
     "## Output format (required)",
     "",
     "When you finish, end with EXACTLY this block — the runner parses it:",

@@ -12,7 +12,7 @@ import {
   buildBoopPrompt,
   stripOpenRouterPrefix,
 } from "./openrouter.mjs";
-import { LENS_FILES } from "./config.mjs";
+import { LENS_FILES, loadConfig } from "./config.mjs";
 
 // A fake OpenRouter client. Mirrors the shape that the real SDK's
 // `client.chat.send` returns: an `APIPromise` that resolves to a
@@ -915,6 +915,87 @@ test("buildBoopPrompt falls back to fs.readFile when deps.rtk is absent", async 
   // some may have errored silently without a fixture.
   assert.ok(fsReadCount >= 1, "expected fs.readFile to be called at least once");
   assert.match(prompt, /raw skill/);
+});
+
+// --- QUB-110 / QUB-113: prior-run context block -------------------------
+
+// buildBoopPrompt emits the PRIOR_RUN_CONTEXT block only when
+// ctx.parentRunId is set. First reviews (parentRunId unset) must
+// not see the block — a stale-tab re-run with an empty value
+// would otherwise silently reframe every PR review as a re-run.
+test("buildBoopPrompt omits prior-run context when parentRunId is unset", async () => {
+  const fakeFs = makeFakeFs({
+    [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
+  });
+  const ctx = { ...baseCtx, parentRunId: null };
+  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  assert.doesNotMatch(prompt, /Prior run context/);
+  assert.doesNotMatch(prompt, /re-run of run/);
+});
+
+// buildBoopPrompt emits the block on re-runs and surfaces
+// the parent id verbatim so the model can attribute its
+// dedup reasoning.
+test("buildBoopPrompt emits prior-run context when parentRunId is set", async () => {
+  const fakeFs = makeFakeFs({
+    [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
+  });
+  const ctx = { ...baseCtx, parentRunId: "boop-a-b-1-aaaaaaa" };
+  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  assert.match(prompt, /## Prior run context \(QUB-110\)/);
+  assert.match(prompt, /re-run of run `boop-a-b-1-aaaaaaa`/);
+  assert.match(prompt, /boop-inline: <path>:<line>:<body-hash>/);
+});
+
+// The block lives in the SYSTEM INSTRUCTIONS section, not
+// the PR-controlled DATA section. A hostile metadata string
+// should not be able to inject its own "prior run" framing;
+// the block is structural and the model sees it as an
+// authoritative hint, not as data to react to.
+test("buildBoopPrompt places prior-run context before DATA fence", async () => {
+  const fakeFs = makeFakeFs({
+    [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
+  });
+  const ctx = { ...baseCtx, parentRunId: "boop-a-b-1-aaaaaaa" };
+  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const blockIdx = prompt.indexOf("## Prior run context (QUB-110)");
+  const dataIdx = prompt.indexOf("DATA (PR-controlled");
+  assert.ok(blockIdx > -1, "missing prior block");
+  assert.ok(dataIdx > -1, "missing DATA fence");
+  assert.ok(blockIdx < dataIdx, "prior block leaked into DATA section");
+});
+
+// loadConfig surfaces BOOP_PARENT_RUN_ID as ctx.parentRunId.
+// A future env rename has to keep the wire-side name
+// (BOOP_PARENT_RUN_ID) so an existing Job template does not
+// silently drop the value.
+test("loadConfig reads BOOP_PARENT_RUN_ID into parentRunId", () => {
+  const env = {
+    PR_OWNER: "qubitquilt",
+    PR_REPO: "boop",
+    PR_NUMBER: "42",
+    PR_HEAD_SHA: "0123456789abcdef0123456789abcdef01234567",
+    PR_BASE_REF: "main",
+    GITHUB_APP_ID: "1",
+    GITHUB_APP_INSTALLATION_ID: "1",
+    BOOP_PARENT_RUN_ID: "boop-a-b-1-aaaaaaa",
+  };
+  const ctx = loadConfig(env);
+  assert.equal(ctx.parentRunId, "boop-a-b-1-aaaaaaa");
+});
+
+test("loadConfig defaults parentRunId to null", () => {
+  const env = {
+    PR_OWNER: "qubitquilt",
+    PR_REPO: "boop",
+    PR_NUMBER: "42",
+    PR_HEAD_SHA: "0123456789abcdef0123456789abcdef01234567",
+    PR_BASE_REF: "main",
+    GITHUB_APP_ID: "1",
+    GITHUB_APP_INSTALLATION_ID: "1",
+  };
+  const ctx = loadConfig(env);
+  assert.equal(ctx.parentRunId, null);
 });
 
 // --- runOpenCodeSkill ---------------------------------------------------
