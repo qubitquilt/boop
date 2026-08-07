@@ -21,7 +21,7 @@ import (
 // N only after the entire block has run. A block that fails
 // half-way leaves user_version unchanged and the next Open
 // retries from that point.
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 // applyMigrations runs the schema migrations, gated on
 // PRAGMA user_version. The version starts at 0 on a fresh
@@ -88,6 +88,24 @@ func applyMigrations(db *sql.DB) error {
 			return fmt.Errorf("migration v2: write user_version: %w", err)
 		}
 		v = 2
+	}
+	// v3 (QUB-109) adds the lens_telemetry table. The
+	// dashboard's "lens is the row grain" rule (Phase 4's
+	// Costs & lenses view) needs per-lens rows, not the
+	// aggregate telemetry's one-row-per-run shape. The
+	// runner parses `lens: <name>` markers from the
+	// orchestrator's output and POSTs a batch at end-of-run;
+	// this table is the destination. The unique index on
+	// (run_id, lens) makes the runner's at-least-once
+	// re-delivery safe — a re-run lands on the same row.
+	if v < 3 {
+		if err := migrateV3(ctx, db); err != nil {
+			return fmt.Errorf("migration v3: %w", err)
+		}
+		if err := writeUserVersion(ctx, db, 3); err != nil {
+			return fmt.Errorf("migration v3: write user_version: %w", err)
+		}
+		v = 3
 	}
 	// Add later migrations as additional `if v < N { ... }`
 	// blocks here. Each must set user_version = N on success.
@@ -283,6 +301,47 @@ func hasColumn(ctx context.Context, db *sql.DB, table, col string) (bool, error)
 		return false, err
 	}
 	return false, nil
+}
+
+// migrateV3 (QUB-109) adds the lens_telemetry table. The
+// runner parses `lens: <name>` markers from the orchestrator's
+// output (decoupled from prompt layout — the meta-review
+// refactor in QUB-96 won't break attribution) and POSTs one
+// row per lens at end-of-run.
+//
+// The UNIQUE(run_id, lens) constraint is what makes the
+// runner's at-least-once delivery safe. The runner's
+// ReplaceLensTelemetry method is the in-Go DROP+INSERT
+// atomic path used by the POST endpoint, but if a future
+// change ever does a per-lens UPSERT the constraint is
+// already there to back it up.
+func migrateV3(ctx context.Context, db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS lens_telemetry (
+			id                INTEGER PRIMARY KEY,
+			run_id            TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+			lens              TEXT NOT NULL,
+			model             TEXT,
+			provider          TEXT,
+			input_tokens      INTEGER NOT NULL DEFAULT 0,
+			output_tokens     INTEGER NOT NULL DEFAULT 0,
+			reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+			cost_usd          REAL NOT NULL DEFAULT 0,
+			step_count        INTEGER NOT NULL DEFAULT 0,
+			recorded_at       TEXT NOT NULL,
+			UNIQUE(run_id, lens)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_lens_telemetry_run_id ON lens_telemetry(run_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_lens_telemetry_lens ON lens_telemetry(lens)`,
+	}
+	for i, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v3 statement %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // readUserVersion returns the current PRAGMA user_version, or 0

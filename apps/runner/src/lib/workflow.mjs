@@ -68,6 +68,10 @@ import { readSecretFile } from "./security.mjs";
 import {
   generateWalkthrough as defaultGenerateWalkthrough,
 } from "./walkthrough.mjs";
+// QUB-109: stage POSTs feed the waterfall. Imported as a
+// soft dependency so a test that wants to drive stages
+// without a dashboard can pass overrides.postStage = noop.
+import { postStage as defaultPostStage } from "./dashboard.mjs";
 
 // Default retry policy. The receiver passes overrides via the
 // runner's env (BOOP_STAGE_MAX_ATTEMPTS, BOOP_STAGE_BACKOFF_BASE_MS,
@@ -296,6 +300,7 @@ export function statusStageFor(id) {
 // mid-run does not lose progress.
 export async function runStages(ctx, deps, overrides, state, options = {}) {
   const onStagePassed = options.onStagePassed || (() => {});
+  const postStage = deps.postStage || defaultPostStage;
   for (const stage of STAGES) {
     if (state.passed && state.passed.includes(stage.id)) {
       // QUB-102: another pod of this Job already passed this
@@ -324,8 +329,23 @@ export async function runStages(ctx, deps, overrides, state, options = {}) {
       state.parseFailed = true;
       return state;
     }
+    // QUB-109: post the start of the stage, then run, then
+    // post the end. The receiver stamps both timestamps
+    // with its own clock; the runner's wall time is
+    // intentionally ignored. Failures in the post are
+    // absorbed by the helper so a dashboard blip never
+    // aborts a review.
+    await postStage(stage.id, ctx, deps);
     const wasPassed = state.parseFailed;
-    await withRetry(stage, ctx, deps, overrides, state);
+    try {
+      await withRetry(stage, ctx, deps, overrides, state);
+    } finally {
+      // Always post the end, even on a thrown error —
+      // a waterfall that hangs open on a thrown stage
+      // misleads the operator into thinking the run is
+      // still working on it.
+      await postStage(stage.id, ctx, deps, { ended: true });
+    }
     if (state.parseFailed && !wasPassed) return state;
     if (state.parseFailed) return state;
     // The stage passed. Append to state.passed and notify.

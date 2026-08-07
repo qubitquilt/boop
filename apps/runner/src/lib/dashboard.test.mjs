@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { postStatus, postTelemetry } from "./dashboard.mjs";
+import { postStatus, postTelemetry, postStage, postLensTelemetry, startHeartbeat } from "./dashboard.mjs";
 
 // Captures the last call into a global so individual tests can
 // assert on the URL/method/body the helper would have sent.
@@ -138,4 +138,54 @@ test("postTelemetry is a no-op when telemetry is null", async () => {
   sent.length = 0;
   await postTelemetry(null, makeCtx(), { log: () => {}, fetchImpl: makeFetchOK() });
   assert.equal(sent.length, 0);
+});
+
+test("postStage posts to /api/runs/{id}/stages with stage and optional meta (QUB-109)", async () => {
+  sent.length = 0;
+  await postStage("clone", makeCtx(), { log: () => {}, fetchImpl: makeFetchOK() }, { meta: '{"path":"src/index.ts","line":42}' });
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0].url.endsWith("/api/runs/boop-a-b-1-aaaaaaa/stages"), "URL path");
+  assert.deepEqual(JSON.parse(sent[0].init.body), { stage: "clone", ended: false, meta: '{"path":"src/index.ts","line":42}' });
+});
+
+test("postStage flips `ended` to true on the end POST", async () => {
+  sent.length = 0;
+  await postStage("clone", makeCtx(), { log: () => {}, fetchImpl: makeFetchOK() }, { ended: true });
+  assert.deepEqual(JSON.parse(sent[0].init.body), { stage: "clone", ended: true });
+});
+
+test("postStage is a no-op when dashboardUrl is unset", async () => {
+  sent.length = 0;
+  await postStage("clone", { dashboardUrl: null, dashboardToken: "x", jobName: "j" }, { log: () => {}, fetchImpl: makeFetchOK() });
+  assert.equal(sent.length, 0);
+});
+
+test("postLensTelemetry sends a batch with one row per lens (QUB-109)", async () => {
+  sent.length = 0;
+  const lenses = [
+    { lens: "security", model: "openai/gpt-4.1", costUsd: 0.05, inputTokens: 100, outputTokens: 50 },
+    { lens: "deep", model: "anthropic/claude-3.7-sonnet", costUsd: 0.20, inputTokens: 400, outputTokens: 200, stepCount: 3 },
+  ];
+  await postLensTelemetry(lenses, makeCtx(), { log: () => {}, fetchImpl: makeFetchOK() });
+  assert.equal(sent.length, 1);
+  const body = JSON.parse(sent[0].init.body);
+  assert.equal(body.lenses.length, 2);
+  assert.equal(body.lenses[0].lens, "security");
+  assert.equal(body.lenses[1].lens, "deep");
+  assert.equal(body.lenses[1].cost_usd, 0.20);
+  assert.equal(body.lenses[1].step_count, 3);
+});
+
+test("postLensTelemetry is a no-op on an empty array", async () => {
+  sent.length = 0;
+  await postLensTelemetry([], makeCtx(), { log: () => {}, fetchImpl: makeFetchOK() });
+  assert.equal(sent.length, 0);
+});
+
+test("startHeartbeat returns a no-op stop when dashboardUrl is unset", () => {
+  const stop = startHeartbeat({ dashboardUrl: null, dashboardToken: "x", jobName: "j" }, { log: () => {}, fetchImpl: makeFetchOK() });
+  assert.equal(typeof stop, "function");
+  // Stop is idempotent.
+  stop();
+  stop();
 });

@@ -44,7 +44,12 @@ import {
   readWorkflowState,
   writeWorkflowState,
 } from "./lib/github.mjs";
-import { postStatus as postDashboardStatus, postTelemetry } from "./lib/dashboard.mjs";
+import {
+  postStatus as postDashboardStatus,
+  postTelemetry,
+  postLensTelemetry,
+  startHeartbeat,
+} from "./lib/dashboard.mjs";
 import { createRtkAdapter } from "./lib/rtk.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -192,6 +197,16 @@ export async function run(env = process.env, overrides = {}) {
     reason: rtkState.reason,
     disabled: ctx.rtkDisabled,
   });
+
+  // QUB-109: 30s heartbeat so the receiver's stuck-runs
+  // panel can distinguish a hung LLM call (heartbeats
+  // arrive, stage never advances) from a crashed pod (no
+  // heartbeats). Stop is wired into the finally block
+  // below so a successful run, a failed run, and a
+  // thrown error all clean up the timer. The unref inside
+  // startHeartbeat keeps the timer from holding the
+  // event loop open.
+  const stopHeartbeat = startHeartbeat(ctx, deps);
 
   // Validate every PR-controlled refname BEFORE it touches `git` or
   // any subprocess argv. validateBaseRef in the receiver is the
@@ -345,6 +360,14 @@ export async function run(env = process.env, overrides = {}) {
     if (state.review && state.review.telemetry) {
       await postTelemetry(state.review.telemetry, ctx, { log: log.log, fetchImpl: deps.fetchImpl });
     }
+    // QUB-109: per-lens rollup. The runner accumulates one
+    // entry per lens as the orchestrator emits `lens: <name>`
+    // markers; this batch lands once at the end of the run
+    // (or skipped entirely on a sniff-parse failure, which
+    // has no lens attribution yet).
+    if (state.lensTelemetry && state.lensTelemetry.length > 0) {
+      await postLensTelemetry(state.lensTelemetry, ctx, { log: log.log, fetchImpl: deps.fetchImpl });
+    }
     await postDashboardStatus("done", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
     await deps.postStatus("done");
     // QUB-114: in reaction mode (issue_comment-triggered
@@ -376,6 +399,9 @@ export async function run(env = process.env, overrides = {}) {
     }
     throw err;
   } finally {
+    // QUB-109: stop the heartbeat before cleanup so a
+    // pending POST doesn't race the credential scrub.
+    stopHeartbeat();
     // Always scrub credentials and tmp artefacts, even on failure.
     // Order matters: revoke the netrc / gitconfig before unlinking
     // them so a future `git fetch` against the in-memory state

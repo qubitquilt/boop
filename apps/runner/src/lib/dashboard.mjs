@@ -66,6 +66,123 @@ export async function postTelemetry(telemetry, ctx, deps) {
   await postWithRetry(url, body, ctx.dashboardToken, deps);
 }
 
+// QUB-109: per-stage POST for the waterfall. The receiver
+// stamps started_at and ended_at with its own clock — the
+// runner passes only the stage name and a "this is the
+// exit" signal. The receiver overwrites any client-supplied
+// started_at so the waterfall bars line up across stages
+// that span pods (hmac_verify runs in the receiver,
+// pod_schedule runs in the K8s API, comment_post runs in
+// the runner).
+//
+// `meta` is the per-stage escape hatch: comment_post stages
+// pass {"path":"...","line":N}, lens stages pass
+// {"model":"...","tokens":N}. Stored verbatim in
+// run_stages.meta; the dashboard reads it for the inline-
+// comment map and the lens self-tag.
+//
+// QUB-109 calls are fire-and-forget by design — the runner
+// posts the START of a stage, then immediately fires the
+// async work. The END POST lands from a finally /
+// setImmediate / Promise.then at the natural exit point.
+// The receiver's UNIQUE(run_id, stage) constraint makes
+// re-delivery safe: a re-post overwrites start without
+// losing end.
+export function postStage(stageName, ctx, deps, opts = {}) {
+  if (!ctx.dashboardUrl || !ctx.dashboardToken) return;
+  const url = `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(ctx.jobName || jobNameFromCtx(ctx))}/stages`;
+  const body = JSON.stringify({
+    stage: stageName,
+    ended: !!opts.ended,
+    meta: opts.meta || undefined,
+  });
+  return postWithRetry(url, body, ctx.dashboardToken, deps);
+}
+
+/**
+ * startHeartbeat kicks off a 30s interval that POSTs to
+ * /api/runs/:id/heartbeat. The receiver stamps last_heartbeat_at
+ * with its own clock; the runner's clock is irrelevant. The
+ * stuck-runs panel reads the gap (no heartbeat in 2 minutes
+ * while status=running = "stuck").
+ *
+ * Returns a stop function. Callers MUST invoke it in a
+ * finally block — leaking a timer across a successful run
+ * keeps the process alive past its work. The stop is
+ * idempotent.
+ *
+ * QUB-109: a hung LLM call keeps heartbeating (the
+ * setInterval fires while the LLM awaits) but never
+ * advances the stage. A crashed pod stops heartbeating.
+ * These are different operator responses (re-queue vs
+ * investigate model latency) and the spec's
+ * "distinguishes a hung LLM call from a crashed pod"
+ * rule is exactly what the heartbeat/stage-emission
+ * split captures.
+ */
+export function startHeartbeat(ctx, deps) {
+  if (!ctx.dashboardUrl || !ctx.dashboardToken) {
+    return () => {};
+  }
+  const url = `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(ctx.jobName || jobNameFromCtx(ctx))}/heartbeat`;
+  let stopped = false;
+  const tick = () => {
+    if (stopped) return;
+    // postWithRetry is fire-and-forget; failures are
+    // logged inside the helper. The timer is the source
+    // of the stuck-runs signal, not any single tick's
+    // success.
+    postWithRetry(url, "", ctx.dashboardToken, deps).catch(() => {});
+  };
+  // First tick after 30s so the receiver's UpsertRun has
+  // a chance to land — an immediate tick would land a 202
+  // (run not persisted) and retry forever. The receiver's
+  // stuck-runs panel uses a 2-minute threshold, so a 30s
+  // first tick still gets two more attempts before
+  // "stuck" lights up.
+  const t = setInterval(tick, 30_000);
+  // Don't keep the event loop alive just for the heartbeat.
+  if (typeof t.unref === "function") t.unref();
+  return () => {
+    if (stopped) return;
+    stopped = true;
+    clearInterval(t);
+  };
+}
+
+/**
+ * postLensTelemetry posts a batch of per-lens rollups at
+ * end-of-run. The runner parses `lens: <name>` markers
+ * from the orchestrator's output and accumulates one
+ * rollup per lens; the receiver REPLACES the per-lens
+ * rows for the run so a re-run / re-delivery lands on
+ * the same shape the dashboard expects.
+ *
+ * Decouples attribution from prompt layout — the
+ * meta-review refactor in QUB-96 won't break this as
+ * long as the orchestrator still emits the markers.
+ */
+export async function postLensTelemetry(lenses, ctx, deps) {
+  if (!ctx.dashboardUrl || !ctx.dashboardToken) return;
+  if (!Array.isArray(lenses) || lenses.length === 0) return;
+  const url = `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(ctx.jobName || jobNameFromCtx(ctx))}/lens_telemetry`;
+  const body = JSON.stringify({
+    lenses: lenses.map((l) => ({
+      lens: l.lens,
+      model: l.model,
+      provider: l.provider,
+      input_tokens: l.inputTokens || 0,
+      output_tokens: l.outputTokens || 0,
+      reasoning_tokens: l.reasoningTokens || 0,
+      cache_read_tokens: l.cacheReadTokens || 0,
+      cache_write_tokens: l.cacheWriteTokens || 0,
+      cost_usd: l.costUsd || 0,
+      step_count: l.stepCount || 0,
+    })),
+  });
+  await postWithRetry(url, body, ctx.dashboardToken, deps);
+}
+
 function jobNameFromCtx(ctx) {
   // ctx.jobName is set by the runner from the pod's downward-API
   // JOB_NAME (or from the PR's owner/repo/number/sha as a
