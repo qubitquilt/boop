@@ -21,7 +21,7 @@ import (
 // N only after the entire block has run. A block that fails
 // half-way leaves user_version unchanged and the next Open
 // retries from that point.
-const currentSchemaVersion = 4
+const currentSchemaVersion = 5
 
 // applyMigrations runs the schema migrations, gated on
 // PRAGMA user_version. The version starts at 0 on a fresh
@@ -124,6 +124,23 @@ func applyMigrations(db *sql.DB) error {
 			return fmt.Errorf("migration v4: write user_version: %w", err)
 		}
 		v = 4
+	}
+	// v5 (QUB-112) adds the audit_events table. Every
+	// dashboard-initiated action (re-run, pause, zero-out)
+	// appends a row with the actor and the prior/post
+	// values. The "actor" column is the load-bearing
+	// piece — without it, an admin action is
+	// unattributable, and a future compliance audit
+	// cannot answer "who did this?". The HMAC ledger
+	// (a different table) is a follow-up.
+	if v < 5 {
+		if err := migrateV5(ctx, db); err != nil {
+			return fmt.Errorf("migration v5: %w", err)
+		}
+		if err := writeUserVersion(ctx, db, 5); err != nil {
+			return fmt.Errorf("migration v5: write user_version: %w", err)
+		}
+		v = 5
 	}
 	// Add later migrations as additional `if v < N { ... }`
 	// blocks here. Each must set user_version = N on success.
@@ -402,6 +419,51 @@ func migrateV4(ctx context.Context, db *sql.DB) error {
 	for i, stmt := range idxStmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("migration v4 index %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// migrateV5 (QUB-112) adds the audit_events table. The
+// "actor" column is the load-bearing piece — a
+// dashboard-initiated action is unattributable without
+// it, and a future compliance audit ("who paused this
+// install?") cannot be answered.
+//
+// The action field is a free-form string; the dashboard
+// emits one of:
+//
+//   - "rerun.create"      Phase 3 /rerun POST
+//   - "install.pause"     Phase 4 pause toggle
+//   - "install.resume"    Phase 4 pause toggle off
+//   - "lens_opt_out.set"  Phase 4 lens editor
+//   - "cost.zero_out"     Phase 4 zero-out action
+//   - "webhook.hmac.fail" cross-cutting ledger
+//   - "webhook.hmac.pass" cross-cutting ledger
+//
+// The "details" column is a JSON blob whose shape is
+// per-action. A future schema bump can normalize
+// per-action columns; today the JSON is the simplest
+// shape that does not force a migration per new
+// action.
+func migrateV5(ctx context.Context, db *sql.DB) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS audit_events (
+			id          INTEGER PRIMARY KEY,
+			action      TEXT NOT NULL,
+			actor       TEXT NOT NULL,
+			target_id   TEXT,
+			occurred_at TEXT NOT NULL,
+			details     TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_events_occurred_at ON audit_events(occurred_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_events_target ON audit_events(target_id)`,
+	}
+	for i, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v5 statement %d: %w", i, err)
 		}
 	}
 	return nil
