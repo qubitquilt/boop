@@ -215,10 +215,20 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   // timeout than the walkthrough call (the expert returns
   // terse JSON, not a long review). 90s is enough for the
   // current model family.
+  //
+  // The fallback matches the walkthrough pattern
+  // (walkthrough.mjs:128): tests inject a fake via
+  // deps.callOpenRouter; production resolves the real
+  // SDK call from openrouter.mjs. The multi-expert pipeline
+  // (QUB-95) inherited the deps contract but skipped the
+  // fallback here — the boop reviewer crashed with
+  // "deps.callOpenRouter is not a function" on every PR
+  // until this fallback landed.
   const EXPERT_TIMEOUT_MS = 90_000;
+  const callOpenRouter = deps.callOpenRouter || (await import("./openrouter.mjs")).callOpenRouter;
   let callResult;
   try {
-    callResult = await deps.callOpenRouter(userPrompt, {
+    callResult = await callOpenRouter(userPrompt, {
       ...deps,
       model: deps.model,
       timeoutMs: EXPERT_TIMEOUT_MS,
