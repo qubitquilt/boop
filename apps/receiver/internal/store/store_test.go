@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -728,3 +729,175 @@ func TestRunRetention_PrunesAndCheckpoints(t *testing.T) {
 }
 
 func ptrInt64(v int64) *int64 { return &v }
+
+// QUB-108: failure_class round-trip. The reconciler writes
+// the K8s container exit reason into this column; the
+// dashboard reads it for the exception dock's filter chips.
+func TestUpsertRun_FailureClassRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := "boop-a-b-1-aaaaaaa"
+	if _, err := s.UpsertRun(ctx, sampleRun(id, "a", "b", 1, "aaaaaaa", StatusFailed, time.Now())); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := s.SetRunFailureClass(ctx, id, "oom_killed"); err != nil {
+		t.Fatalf("set failure class: %v", err)
+	}
+	got, err := s.GetRun(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.FailureClass != "oom_killed" {
+		t.Errorf("failure_class = %q, want oom_killed", got.FailureClass)
+	}
+	// Clear and re-read.
+	if err := s.SetRunFailureClass(ctx, id, ""); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	got, err = s.GetRun(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.FailureClass != "" {
+		t.Errorf("failure_class after clear = %q, want empty", got.FailureClass)
+	}
+}
+
+// QUB-108: set on a missing run is a no-op (retention race).
+func TestSetRunFailureClass_UnknownRun(t *testing.T) {
+	s := newTestStore(t)
+	err := s.SetRunFailureClass(context.Background(), "no-such-run", "oom_killed")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("err = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// QUB-108: run_stages upsert is idempotent on (run_id, stage).
+// The runner is at-least-once; a re-delivery of the same
+// stage must not create a duplicate row.
+func TestUpsertRunStage_IdempotentOnStage(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := "boop-a-b-1-aaaaaaa"
+	if _, err := s.UpsertRun(ctx, sampleRun(id, "a", "b", 1, "aaaaaaa", StatusRunning, time.Now())); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	now := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		if _, err := s.UpsertRunStage(ctx, RunStage{
+			RunID: id, Stage: "clone", StartedAt: now, Meta: `{"attempt":1}`,
+		}); err != nil {
+			t.Fatalf("upsert stage: %v", err)
+		}
+	}
+	stages, err := s.ListRunStages(ctx, id)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(stages) != 1 {
+		t.Errorf("got %d stages, want 1 (re-deliveries must upsert)", len(stages))
+	}
+}
+
+// QUB-108: heartbeat touch. The runner POSTs every 30s; the
+// receiver stamps the server clock. A second call updates
+// the field; an unknown run returns sql.ErrNoRows.
+func TestTouchRunHeartbeat_UpdatesAndMissing(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := "boop-a-b-1-aaaaaaa"
+	if _, err := s.UpsertRun(ctx, sampleRun(id, "a", "b", 1, "aaaaaaa", StatusRunning, time.Now())); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	if err := s.TouchRunHeartbeat(ctx, id); err != nil {
+		t.Fatalf("touch: %v", err)
+	}
+	got, err := s.GetRun(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.LastHeartbeatAt == nil {
+		t.Fatalf("last_heartbeat_at not set")
+	}
+	if err := s.TouchRunHeartbeat(ctx, "missing"); !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("err = %v, want sql.ErrNoRows", err)
+	}
+}
+
+// QUB-108: installation controls. Pausing mutes webhooks;
+// lens_opt_out is a JSON array. The GitHub poll must not
+// overwrite an operator's pause.
+func TestSetInstallationControls_AndPauseCheck(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	ins := []Installation{
+		{ID: 1, AccountLogin: "alpha", AccountType: "User", FetchedAt: time.Now().UTC()},
+	}
+	if err := s.UpsertInstallations(ctx, ins); err != nil {
+		t.Fatalf("upsert installs: %v", err)
+	}
+	if err := s.SetInstallationControls(ctx, 1, true, []string{"security", "deep"}); err != nil {
+		t.Fatalf("set controls: %v", err)
+	}
+	paused, err := s.IsInstallationPaused(ctx, 1)
+	if err != nil {
+		t.Fatalf("is paused: %v", err)
+	}
+	if !paused {
+		t.Errorf("paused = false, want true")
+	}
+	got, err := s.GetInstallation(ctx, 1)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.Paused {
+		t.Errorf("paused field = false")
+	}
+	if len(got.LensOptOut) != 2 || got.LensOptOut[0] != "security" {
+		t.Errorf("lens_opt_out = %v, want [security deep]", got.LensOptOut)
+	}
+	// A subsequent UpsertInstallations from the GitHub poll
+	// must not silently clear the operator's pause.
+	if err := s.UpsertInstallations(ctx, ins); err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	paused, err = s.IsInstallationPaused(ctx, 1)
+	if err != nil {
+		t.Fatalf("is paused after re-upsert: %v", err)
+	}
+	if !paused {
+		t.Errorf("paused cleared by GitHub poll — operator mute lost")
+	}
+}
+
+// QUB-108: refund audit row. Every "zero out cost" action
+// appends a row; no UPDATE path.
+func TestRecordRefund_AppendOnly(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	id := "boop-a-b-1-aaaaaaa"
+	if _, err := s.UpsertRun(ctx, sampleRun(id, "a", "b", 1, "aaaaaaa", StatusSucceeded, time.Now())); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	for i, tokens := range []int64{100, 200, 50} {
+		if _, err := s.RecordRefund(ctx, Refund{
+			RunID:      id,
+			Lens:       "deep",
+			Tokens:     tokens,
+			RefundedBy: "tester",
+		}); err != nil {
+			t.Fatalf("refund %d: %v", i, err)
+		}
+	}
+	got, err := s.ListRefunds(ctx, id)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("got %d refunds, want 3 (append-only)", len(got))
+	}
+	// Newest first.
+	if got[0].Tokens != 50 || got[2].Tokens != 100 {
+		t.Errorf("ordering broken: got[0]=%d got[2]=%d", got[0].Tokens, got[2].Tokens)
+	}
+}

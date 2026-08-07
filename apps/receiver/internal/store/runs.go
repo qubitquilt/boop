@@ -29,23 +29,33 @@ const (
 // run row to the live Job for the duration the Job is in the
 // namespace. After the Job is GC'd, the id is still meaningful —
 // it carries the owner, repo, PR number, and short SHA.
+//
+// FailureClass and LastHeartbeatAt are QUB-108/QUB-109
+// additions: FailureClass is set by the receiver at
+// UpsertRun time from the K8s container exit reason (or by
+// the runner at end-of-run for non-pod failures like
+// json_parse_fail); LastHeartbeatAt is updated by the
+// receiver on every runner heartbeat POST and powers the
+// stuck-runs panel.
 type Run struct {
-	ID             string
-	Owner          string
-	Repo           string
-	PRNumber       int
-	CommitSHA      string
-	BaseRef        string
-	ReviewNumber   int
-	Reason         string
-	InstallationID int64
-	Status         RunStatus
-	StartedAt      time.Time
-	EndedAt        *time.Time
-	DurationMS     *int64
-	Error          string
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID              string
+	Owner           string
+	Repo            string
+	PRNumber        int
+	CommitSHA       string
+	BaseRef         string
+	ReviewNumber    int
+	Reason          string
+	InstallationID  int64
+	Status          RunStatus
+	StartedAt       time.Time
+	EndedAt         *time.Time
+	DurationMS      *int64
+	Error           string
+	FailureClass    string
+	LastHeartbeatAt *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // UpsertRun inserts the run if it does not exist, or updates the
@@ -76,18 +86,21 @@ func (s *Store) UpsertRun(ctx context.Context, r Run) (Run, error) {
 			id, owner, repo, pr_number, commit_sha, base_ref,
 			review_number, reason, installation_id, status,
 			started_at, ended_at, duration_ms, error,
+			failure_class,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
-			status      = excluded.status,
-			ended_at    = excluded.ended_at,
-			duration_ms = excluded.duration_ms,
-			error       = excluded.error,
-			updated_at  = excluded.updated_at
+			status        = excluded.status,
+			ended_at      = excluded.ended_at,
+			duration_ms   = excluded.duration_ms,
+			error         = excluded.error,
+			failure_class = excluded.failure_class,
+			updated_at    = excluded.updated_at
 	`,
 		r.ID, r.Owner, r.Repo, r.PRNumber, r.CommitSHA, r.BaseRef,
 		r.ReviewNumber, nullString(r.Reason), nullInt64(r.InstallationID), string(r.Status),
 		r.StartedAt.UTC().Format(time.RFC3339Nano), nullTimePtr(r.EndedAt), nullInt64Ptr(r.DurationMS), nullString(r.Error),
+		nullString(r.FailureClass),
 		r.CreatedAt.UTC().Format(time.RFC3339Nano), r.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	)
 	if err != nil {
@@ -138,6 +151,37 @@ func (s *Store) UpdateRunStatus(ctx context.Context, id string, status RunStatus
 	return s.GetRun(ctx, id)
 }
 
+// SetRunFailureClass writes just the failure_class column on a
+// run row. Used by the K8s reconciler (Phase 1's post-createJob
+// path) to backfill the exit reason once the Job terminates.
+// Splitting this from UpdateRunStatus keeps the
+// already-witnessed status/ended_at fields from being
+// overwritten by a later reconciler tick, and it lets the
+// reconciler do an empty-string clear ("no failure class
+// known") without coupling that to a status update.
+//
+// Returns sql.ErrNoRows if the run has been pruned between
+// the reconciler's read of the Job and the write here — the
+// reconciler treats that as a no-op so it doesn't have to
+// retry on a retention race.
+func (s *Store) SetRunFailureClass(ctx context.Context, id, failureClass string) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE runs SET failure_class = ?, updated_at = ? WHERE id = ?
+	`, nullString(failureClass), now, id)
+	if err != nil {
+		return fmt.Errorf("store: set run failure class: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: set run failure class rows: %w", err)
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // GetRun returns the run with the given id, or sql.ErrNoRows if
 // none exists. Used by the runner's POST endpoints to look up the
 // row before they update it.
@@ -146,6 +190,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
 		SELECT id, owner, repo, pr_number, commit_sha, base_ref,
 			review_number, reason, installation_id, status,
 			started_at, ended_at, duration_ms, error,
+			failure_class, last_heartbeat_at,
 			created_at, updated_at
 		FROM runs WHERE id = ?
 	`, id)
@@ -244,6 +289,7 @@ func (s *Store) ListRuns(ctx context.Context, f ListRunsFilter) (ListRunsResult,
 		SELECT id, owner, repo, pr_number, commit_sha, base_ref,
 			review_number, reason, installation_id, status,
 			started_at, ended_at, duration_ms, error,
+			failure_class, last_heartbeat_at,
 			created_at, updated_at
 		FROM runs
 		%s
@@ -309,22 +355,25 @@ type rowScanner interface {
 
 func scanRun(r rowScanner) (Run, error) {
 	var (
-		rr         Run
-		status     string
-		startedStr string
-		endedPtr   sql.NullString
-		durPtr     sql.NullInt64
-		errPtr     sql.NullString
-		baseRef    sql.NullString
-		reason     sql.NullString
-		installID  sql.NullInt64
-		createdStr string
-		updatedStr string
+		rr             Run
+		status         string
+		startedStr     string
+		endedPtr       sql.NullString
+		durPtr         sql.NullInt64
+		errPtr         sql.NullString
+		baseRef        sql.NullString
+		reason         sql.NullString
+		installID      sql.NullInt64
+		failureClass   sql.NullString
+		heartbeatPtr   sql.NullString
+		createdStr     string
+		updatedStr     string
 	)
 	if err := r.Scan(
 		&rr.ID, &rr.Owner, &rr.Repo, &rr.PRNumber, &rr.CommitSHA, &baseRef,
 		&rr.ReviewNumber, &reason, &installID, &status,
 		&startedStr, &endedPtr, &durPtr, &errPtr,
+		&failureClass, &heartbeatPtr,
 		&createdStr, &updatedStr,
 	); err != nil {
 		return Run{}, err
@@ -332,6 +381,7 @@ func scanRun(r rowScanner) (Run, error) {
 	rr.Status = RunStatus(status)
 	rr.BaseRef = baseRef.String
 	rr.Reason = reason.String
+	rr.FailureClass = failureClass.String
 	if installID.Valid {
 		rr.InstallationID = installID.Int64
 	}
@@ -348,6 +398,11 @@ func scanRun(r rowScanner) (Run, error) {
 		rr.DurationMS = &v
 	}
 	rr.Error = errPtr.String
+	if heartbeatPtr.Valid {
+		if t, err := time.Parse(time.RFC3339Nano, heartbeatPtr.String); err == nil {
+			rr.LastHeartbeatAt = &t
+		}
+	}
 	if t, err := time.Parse(time.RFC3339Nano, createdStr); err == nil {
 		rr.CreatedAt = t
 	}
