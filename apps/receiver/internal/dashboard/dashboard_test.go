@@ -457,6 +457,97 @@ func TestServeRetention_ImminentFlag(t *testing.T) {
 	}
 }
 
+// TestServeMarkOrphaned_HandlesRealStore covers the full
+// happy path: seed an orphan + a fresh row + a
+// heartbeated row, POST /admin/mark-orphaned, and assert
+// the orphan moved to failed while the others stayed
+// running.
+func TestServeMarkOrphaned_HandlesRealStore(t *testing.T) {
+	h := newTestDashboard(t, nil)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	orphan := store.Run{
+		ID: "boop-a-b-1-aaaaaaa", Owner: "a", Repo: "b", PRNumber: 1,
+		CommitSHA: "aaaaaaa", BaseRef: "main", ReviewNumber: 1,
+		Reason: "pull_request.opened", InstallationID: 1,
+		Status: store.StatusRunning, StartedAt: now.Add(-30 * time.Minute),
+	}
+	fresh := orphan
+	fresh.ID = "boop-a-b-2-bbbbbbb"
+	fresh.StartedAt = now.Add(-1 * time.Minute)
+	heartbeated := orphan
+	heartbeated.ID = "boop-a-b-3-ccccccc"
+	heartbeated.StartedAt = now.Add(-30 * time.Minute)
+	for _, r := range []store.Run{orphan, fresh, heartbeated} {
+		if _, err := h.store.UpsertRun(ctx, r); err != nil {
+			t.Fatalf("seed %s: %v", r.ID, err)
+		}
+	}
+	if err := h.store.TouchRunHeartbeat(ctx, heartbeated.ID); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/dashboard/admin/mark-orphaned", nil)
+	rr := httptest.NewRecorder()
+	h.route(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"marked":1`) {
+		t.Errorf("body = %q, want marked=1", body)
+	}
+
+	// Orphan row → failed
+	got, err := h.store.GetRun(ctx, orphan.ID)
+	if err != nil {
+		t.Fatalf("get orphan: %v", err)
+	}
+	if got.Status != store.StatusFailed {
+		t.Errorf("orphan status = %q, want failed", got.Status)
+	}
+	if !strings.HasPrefix(got.Error, "orphaned") {
+		t.Errorf("orphan error = %q, want orphan prefix", got.Error)
+	}
+	// Fresh row → still running
+	got, err = h.store.GetRun(ctx, fresh.ID)
+	if err != nil {
+		t.Fatalf("get fresh: %v", err)
+	}
+	if got.Status != store.StatusRunning {
+		t.Errorf("fresh status = %q, want running", got.Status)
+	}
+	// Heartbeated row → still running
+	got, err = h.store.GetRun(ctx, heartbeated.ID)
+	if err != nil {
+		t.Fatalf("get heartbeated: %v", err)
+	}
+	if got.Status != store.StatusRunning {
+		t.Errorf("heartbeated status = %q, want running", got.Status)
+	}
+}
+
+func TestServeMarkOrphaned_RejectsBadGrace(t *testing.T) {
+	h := newTestDashboard(t, nil)
+	req := httptest.NewRequest("POST", "/dashboard/admin/mark-orphaned?grace=notaduration", nil)
+	rr := httptest.NewRecorder()
+	h.route(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rr.Code)
+	}
+}
+
+func TestServeMarkOrphaned_RejectsGetMethod(t *testing.T) {
+	h := newTestDashboard(t, nil)
+	req := httptest.NewRequest("GET", "/dashboard/admin/mark-orphaned", nil)
+	rr := httptest.NewRecorder()
+	h.route(rr, req)
+	if rr.Code != http.StatusMethodNotAllowed && rr.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (only POST is routed)", rr.Code)
+	}
+}
+
 // errorSink is a small helper for tests that want to
 // assert "no error" but keep error handling explicit.
 // Avoids t.Fatalf in tests where the failure mode is

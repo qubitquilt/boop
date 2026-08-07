@@ -20,11 +20,14 @@ package webhook
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/michaelruelas/boop-receiver/internal/store"
 )
 
 // failureClassFromContainerState maps a pod's last container
@@ -182,7 +185,88 @@ func (h *Handler) reconcileJobsOnce(ctx context.Context) {
 			// stays low.
 			h.logger.Debug("reconcile set failure class", "job", name, "err", err)
 		}
+		// QUB-114: also reconcile the run's terminal status.
+		// Previously this loop only wrote failure_class,
+		// which left status="running" forever on any run
+		// whose runner never called /api/runs/{id}/status
+		// (a container_error / OOMKilled job where the
+		// process died before reaching the
+		// post-summary status post). The dashboard's
+		// live view showed these as in-progress until
+		// the 365-day retention tick pruned them.
+		// UpdateRunStatusIfRunning is a no-op when the
+		// runner already finalised the row, so a healthy
+		// run that finished via the normal
+		// stage → done transition is never overwritten.
+		status, errMsg, endedAt := deriveTerminalState(job)
+		if status == "" {
+			continue
+		}
+		written, err := h.store.UpdateRunStatusIfRunning(ctx, name, status, endedAt, nil, errMsg)
+		if err != nil {
+			h.logger.Debug("reconcile set status", "job", name, "err", err)
+			continue
+		}
+		if written {
+			h.logger.Info("reconciled orphaned run", "job", name, "status", status)
+		}
 	}
+}
+
+// deriveTerminalState maps a terminal K8s Job to the
+// (status, error, ended_at) triple to write into the runs
+// row. Returns ("", nil, nil) when the Job is not actually
+// terminal (e.g. Failed=0/Succeeded=0 with only the Active
+// counter ticking down — K8s marks the conditions a beat
+// late, so callers should check jobIsTerminal first).
+//
+// The error message comes from the Job's Failed condition
+// when present ("BackoffLimitExceeded" / "DeadlineExceeded"
+// / a custom message), and from a synthetic
+// "reconciled: <N> failed pods" line otherwise. The
+// empty-status guard lets callers skip the write for a Job
+// that the conditions haven't settled on yet.
+func deriveTerminalState(job *batchv1.Job) (store.RunStatus, string, *time.Time) {
+	var (
+		status  store.RunStatus
+		errMsg  string
+		endedAt *time.Time
+	)
+	if job.Status.CompletionTime != nil {
+		t := job.Status.CompletionTime.Time
+		endedAt = &t
+	}
+	for _, c := range job.Status.Conditions {
+		if c.Status != "True" {
+			continue
+		}
+		switch c.Type {
+		case batchv1.JobComplete:
+			status = store.StatusSucceeded
+		case batchv1.JobFailed:
+			status = store.StatusFailed
+			if c.Reason != "" {
+				errMsg = c.Reason
+				if c.Message != "" {
+					errMsg = c.Reason + ": " + c.Message
+				}
+			} else if c.Message != "" {
+				errMsg = c.Message
+			} else if job.Status.Failed > 0 {
+				errMsg = fmt.Sprintf("reconciled: %d failed pods", job.Status.Failed)
+			}
+		}
+	}
+	if status == "" && job.Status.Failed > 0 {
+		status = store.StatusFailed
+		if errMsg == "" {
+			errMsg = fmt.Sprintf("reconciled: %d failed pods", job.Status.Failed)
+		}
+	}
+	if status == "" && job.Status.Succeeded > 0 {
+		status = store.StatusSucceeded
+	}
+	return status, errMsg, endedAt
 }
 
 // jobIsTerminal reports whether the Job is in a state
