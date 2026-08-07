@@ -229,3 +229,51 @@ test("defaultNarrate returns a placeholder review when no findings", async () =>
   assert.deepEqual(review.inlineComments, []);
   assert.equal(review.confidence, "low");
 });
+
+// defaultExpert must fall back to the imported callOpenRouter
+// when deps.callOpenRouter is unset. Without the fallback,
+// production deps (built by index.mjs's makeDeps) trigger
+// "deps.callOpenRouter is not a function" on every expert
+// dispatch. The walkthrough stage has the same pattern
+// (walkthrough.mjs:128); this test pins the experts half so
+// a future refactor that drops the fallback breaks a test
+// instead of crashing the boop reviewer.
+test("defaultExpert falls back to imported callOpenRouter when deps has none", async () => {
+  // No callOpenRouter in deps, no expertOverrides. The
+  // fallback imports the real SDK call which fails without
+  // OPENROUTER_API_KEY. The error shape we assert is "the
+  // SDK was reached" — NOT "deps.callOpenRouter is not a
+  // function", which is the pre-fix failure.
+  const deps = {
+    fs: {
+      readFile: async () =>
+        "# test lens\nYou are a test expert. Return JSON {findings:[]}.",
+    },
+    postStatus: async () => {},
+    model: "test-model",
+    env: {},
+    log: () => {},
+    errlog: () => {},
+  };
+  try {
+    await runExperts(["regression-hunter"], {
+      paths: { configSrc: "/tmp" },
+    }, deps);
+    // If we got here, the SDK call unexpectedly succeeded
+    // (e.g. an env-level API key was set). Skip rather than
+    // fail so CI doesn't get flaky on a developer's machine.
+  } catch (err) {
+    const msg = String(err?.message ?? err);
+    assert.ok(
+      !/deps\.callOpenRouter is not a function/.test(msg),
+      `expert dispatch must not crash with the pre-fix error; got: ${msg}`,
+    );
+    // The walkthrough equivalent throws an OPENROUTER_API_KEY
+    // error in the same shape. Either that or the wrapped
+    // "expert dispatch failed" message is acceptable.
+    assert.ok(
+      /OPENROUTER_API_KEY|expert dispatch failed|API key/i.test(msg),
+      `expected an SDK-call error after fallback, got: ${msg}`,
+    );
+  }
+});
