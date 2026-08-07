@@ -3,6 +3,9 @@
 <h2>Run <code>{{.Run.ID}}</code></h2>
 <div class="toolbar">
   <a href="/dashboard/runs">&larr; back to runs</a>
+  {{if .Run.PRURL}}
+  <a href="{{.Run.PRURL}}" target="_blank" rel="noopener" style="margin-left:12px">PR #{{.Run.PRNumber}} on GitHub &rarr;</a>
+  {{end}}
   {{if or (eq .Run.Status "succeeded") (eq .Run.Status "failed")}}
   <form method="post" action="/dashboard/runs/{{.Run.ID}}/rerun" style="margin-left:auto">
     <input type="hidden" name="confirm" value="true">
@@ -18,6 +21,17 @@
 {{if .Run.EndedAt}}<div class="kpi"><div class="v">{{.Run.EndedAt}}</div><div class="l">ended</div></div>{{end}}
 {{if .Run.Duration}}<div class="kpi"><div class="v">{{.Run.Duration}}</div><div class="l">duration</div></div>{{end}}
 
+{{if eq .Run.Status "failed"}}
+<h3>Error</h3>
+<div class="error-block">
+  {{if .Run.Error}}
+  <pre>{{.Run.Error}}</pre>
+  {{else}}
+  <div class="empty">No error message recorded. The runner likely exited before posting a status update — check the K8s pod logs below for the exit reason.</div>
+  {{end}}
+</div>
+{{end}}
+
 <h3>Waterfall</h3>
 {{if .Stages}}
 <div class="waterfall">
@@ -29,8 +43,40 @@
   </div>
   {{end}}
 </div>
+<h4>Stage timeline</h4>
+<table>
+  <thead><tr><th>Stage</th><th>Started</th><th>Ended</th><th>Duration</th><th>Meta</th></tr></thead>
+  <tbody>
+    {{range .Stages}}
+    <tr>
+      <td><code>{{.Stage}}</code></td>
+      <td>{{.StartedAt}}</td>
+      <td>{{if .EndedAt}}{{.EndedAt}}{{else}}<span class="muted">in progress</span>{{end}}</td>
+      <td>{{.Duration}}ms</td>
+      <td><code class="meta">{{.Meta}}</code></td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
 {{else}}
-<div class="empty">No stage telemetry yet.</div>
+<div class="empty">
+  {{if eq .Run.Status "running"}}
+  No stage telemetry yet — the runner has not reached the first stage transition. The K8s pod is still starting up; refresh in a minute.
+  {{else if eq .Run.Status "failed"}}
+  No stage telemetry was posted before the runner exited. The K8s pod logs below are the only direct evidence of what happened.
+  {{else}}
+  No stage telemetry yet.
+  {{end}}
+</div>
+{{end}}
+
+<h3>K8s pod logs</h3>
+{{if .Logs}}
+<pre class="logs">{{.Logs}}</pre>
+{{else if .LogsErr}}
+<div class="empty">Logs unavailable: {{.LogsErr}}</div>
+{{else}}
+<div class="empty">Logs unavailable (Job may have been TTL'd out of the namespace; K8s garbage-collects Jobs 1h after they finish).</div>
 {{end}}
 
 <h3>Per-lens breakdown</h3>
