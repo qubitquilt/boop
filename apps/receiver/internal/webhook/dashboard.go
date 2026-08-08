@@ -196,6 +196,36 @@ type ListRunsResponse struct {
 	NextCursor string             `json:"next_cursor,omitempty"`
 }
 
+// GetRun handles GET /api/runs/{id}. Returns a single run with its
+// telemetry, or 404 if the run does not exist.
+func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
+	if h.store == nil {
+		http.Error(w, "data layer disabled", http.StatusServiceUnavailable)
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		http.Error(w, "missing run id", http.StatusBadRequest)
+		return
+	}
+	ctx := r.Context()
+	run, err := h.store.GetRun(ctx, id)
+	if err != nil {
+		if errors.Is(err, store.ErrUnknownRun) {
+			http.Error(w, "run not found", http.StatusNotFound)
+			return
+		}
+		h.logger.Warn("get run", "id", id, "err", err)
+		http.Error(w, "store error", http.StatusInternalServerError)
+		return
+	}
+	var telem store.Telemetry
+	if t, err := h.store.GetTelemetry(ctx, id); err == nil {
+		telem = t
+	}
+	writeJSON(w, http.StatusOK, RunWithTelemetry{Run: run, Telemetry: telem})
+}
+
 // StatsResponse is the body of GET /api/stats. The shape is
 // stable: summary is the top-line KPI block, buckets is the
 // time-series, by_repo and by_model are the leaderboards. The

@@ -28,20 +28,25 @@ import (
 // aggregate telemetry. RunID+Lens is the natural key; the
 // runner's batch replace drops + re-inserts on each delivery
 // so the dashboard never sees a half-applied batch.
+// LensTelemetry is one lens's contribution to a run's
+// aggregate telemetry. RunID+Lens is the natural key; the
+// runner's batch replace drops + re-inserts on each delivery
+// so the dashboard never sees a half-applied batch.
+// JSON tags for the /api/runs/{id}/lens_telemetry surface.
 type LensTelemetry struct {
-	ID              int64
-	RunID           string
-	Lens            string
-	Model           string
-	Provider        string
-	InputTokens     int64
-	OutputTokens    int64
-	ReasoningTokens int64
-	CacheReadTokens int64
-	CacheWriteTokens int64
-	CostUSD         float64
-	StepCount       int
-	RecordedAt      time.Time
+	ID               int64     `json:"id"`
+	RunID            string    `json:"run_id"`
+	Lens             string    `json:"lens"`
+	Model            string    `json:"model,omitempty"`
+	Provider         string    `json:"provider,omitempty"`
+	InputTokens      int64     `json:"input_tokens"`
+	OutputTokens     int64     `json:"output_tokens"`
+	ReasoningTokens  int64     `json:"reasoning_tokens"`
+	CacheReadTokens  int64     `json:"cache_read_tokens"`
+	CacheWriteTokens int64     `json:"cache_write_tokens"`
+	CostUSD          float64   `json:"cost_usd"`
+	StepCount        int       `json:"step_count"`
+	RecordedAt       time.Time `json:"recorded_at"`
 }
 
 // ReplaceLensTelemetry atomically replaces the per-lens
@@ -118,8 +123,8 @@ func (s *Store) ListLensTelemetry(ctx context.Context, runID string) ([]LensTele
 	var out []LensTelemetry
 	for rows.Next() {
 		var (
-			lt      LensTelemetry
-			recAt   string
+			lt    LensTelemetry
+			recAt string
 		)
 		if err := rows.Scan(
 			&lt.ID, &lt.RunID, &lt.Lens,

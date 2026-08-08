@@ -125,6 +125,7 @@ func main() {
 	mux.HandleFunc("GET /api/reviews", h.ListReviews)
 	mux.HandleFunc("GET /api/installations", h.ListInstallations)
 	mux.HandleFunc("GET /api/runs", h.ListRuns)
+	mux.HandleFunc("GET /api/runs/{id}", h.GetRun)
 	mux.HandleFunc("GET /api/stats", h.Stats)
 	mux.HandleFunc("POST /api/runs/{id}/telemetry", h.RecordTelemetry)
 	mux.HandleFunc("POST /api/runs/{id}/status", h.RecordStatus)

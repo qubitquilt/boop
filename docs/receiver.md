@@ -53,7 +53,8 @@ live template the receiver renders is the embedded one
 | GET    | `/health`                         | Liveness/readiness. Returns `200 ok`. Used by the K8s probes.           |
 | GET    | `/api/reviews`                    | Snapshot of boop review Jobs in `TARGET_NAMESPACE`. See below.         |
 | GET    | `/api/installations`              | Cached list of GitHub App installations (refreshed every 5 min).       |
-| GET    | `/api/runs`                       | Paginated, filterable run history. The data layer's primary read.     |
+| GET    | `/api/runs`                       | Paginated, filterable run history. The data layer primary read.     |
+| GET    | `/api/runs/{id}`                  | Single run by id (point lookup). Returns `RunWithTelemetry`.        |
 | GET    | `/api/stats`                      | Time-series + per-repo + per-model rollups for the dashboard.         |
 | POST   | `/api/runs/{id}/telemetry`        | Runner posts final token + cost. Requires `X-BOOP-Runner-Token`.       |
 | POST   | `/api/runs/{id}/status`           | Runner posts lifecycle transitions. Requires `X-BOOP-Runner-Token`.    |
@@ -162,8 +163,9 @@ require the `X-BOOP-Runner-Token` header, value matching the
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /api/installations` | One row per App installation: `id`, `account_login`, `account_type`, `repository_selection`, `installed_at`. Cached for 5 min; refreshed by a background poller so the dashboard's GET is a cheap table read. |
-| `GET /api/runs` | Paginated list of runs. Query string: `owner`, `repo`, `status`, `installation`, `from` (RFC3339), `to` (RFC3339), `cursor`, `limit` (clamped 1..200). Newest-first by `started_at`. Each row carries its telemetry (if recorded) inline so the dashboard's runs page is a single fetch. |
+| `GET /api/installations` | One row per App installation: `id`, `account_login`, `account_type`, `repository_selection`, `installed_at`. Cached for 5 min; refreshed by a background poller so the dashboard GET is a cheap table read. |
+| `GET /api/runs` | Paginated list of runs. Query string: `owner`, `repo`, `status`, `installation`, `from` (RFC3339), `to` (RFC3339), `cursor`, `limit` (clamped 1..200). Newest-first by `started_at`. Each row carries its telemetry (if recorded) inline so the dashboard runs page is a single fetch. |
+| `GET /api/runs/{id}` | Single run by id. Returns the same `RunWithTelemetry` shape as each row in the list endpoint. 404 if the run does not exist. |
 | `GET /api/stats` | Aggregations: `summary` (totals + p50/p95 duration + unique repos/installs), `buckets` (time series, day/hour/week), `by_repo` (leaderboard, top 50 by run count), `by_model` (cost + token breakdown). Query: `from`, `to`, `bucket`. |
 | `POST /api/runs/{id}/telemetry` | Body: `{model, provider, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens, cache_write_tokens, cost_usd, step_count}`. Idempotent (REPLACE on conflict). 404 if the run does not exist. |
 | `POST /api/runs/{id}/status` | Body: `{stage: "running"|"succeeded"|"done"|"failed", ended_at?, duration_ms?, error?}`. 202 (not 404) if the run does not exist yet — the runner will retry on the next stage transition. |

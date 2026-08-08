@@ -25,13 +25,36 @@ name: sync-image-digests
 # the ConfigMap's JOB_IMAGE value, then opens a PR to commit the
 # pin.
 #
-# Coalescing: build-receiver and build-runner both trigger this
-# workflow, and the two upstream builds often complete within a
-# few seconds of each other on the same push to main. The dedupe
-# below picks up the open sync PR's branch (if any) and pushes any
-# new digest changes to that branch instead of opening a parallel
-# PR — so a single PR always carries every digest update for the
-# cycle, and no digest update is silently dropped on the floor.
+# Fan-in: build-receiver and build-runner run as two independent
+# workflows and complete at different latencies (the runner image
+# is smaller, so build-runner finishes ~15s earlier than
+# build-receiver on a typical push). The workflow_run event fires
+# once per upstream completion, but the first event lands when only
+# one image has been pushed under :stable — so the digest query
+# would pin a half-correct pair (the just-pushed image + the
+# previous cycle's stale image for the other). This ran twice per
+# push (once per upstream), and each run committed a half-correct
+# state to main; the correct pair only landed on the second run's
+# commit, ~30-60s later.
+#
+# The fix adds a "Wait for sibling upstream build" step at the
+# top of the job. When this workflow fires via workflow_run, the
+# job polls the GitHub Actions API for the OTHER upstream's
+# successful run on the same head SHA; only when both are
+# confirmed does the job proceed to the digest query. The two
+# back-to-back workflow_run triggers coalesce on the same job
+# (concurrency.cancel-in-progress) and the second one waits
+# instead of immediately racing. workflow_dispatch skips the wait
+# (operator chose to run it manually; they can re-trigger if the
+# pair is wrong).
+#
+# A pull_request build of either upstream (which does not push to
+# :stable — the build-push-action gates on push) intentionally
+# fires this workflow; the digest resolution still queries the
+# current :stable (the latest main build), so a PR with a stale
+# pair is harmless — the sync PR is opened on a fresh branch and
+# no operator will merge a PR-derived sync PR while the underlying
+# main is the same.
 
 on:
   workflow_run:
@@ -53,6 +76,71 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
+      # QUB-114 (refined): wait for both upstream builds to land
+      # before resolving digests. Without this, the first sync run
+      # races against the slower upstream build and pins a
+      # half-correct pair (one fresh digest + one stale). We poll
+      # the GitHub Actions API rather than maintaining our own
+      # counter — the API is authoritative and survives workflow
+      # reruns.
+      #
+      # The trigger is one of {build-receiver, build-runner}. When
+      # that upstream completes successfully, this workflow fires
+      # via workflow_run. We then check whether the OTHER upstream
+      # has a successful run for the same head SHA. If so, both
+      # images are now pushed under :stable and the digest query
+      # will see the correct pair.
+      #
+      # What "github.event.workflow_run.created_at" is: it's the
+      # upstream run's created_at, NOT the workflow_run event
+      # timestamp. The two are within seconds, but using the
+      # upstream's created_at in a "< triggered_at" filter would
+      # exclude the upstream itself (created_at == triggered_at is
+      # not strictly less). So we filter on head_sha + conclusion
+      # only, and ask the API for runs in the last hour to bound
+      # the search.
+      - name: Wait for sibling upstream build
+        if: github.event_name == 'workflow_run'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          UPSTREAM: ${{ github.event.workflow_run.name }}
+        run: |
+          set -euo pipefail
+          if [ "${UPSTREAM}" = "build-receiver" ]; then
+            SIBLING="build-runner"
+          else
+            SIBLING="build-receiver"
+          fi
+          # 5 minutes covers a normal cold-cache build (the runner
+          # takes ~25s, the receiver ~1m30s without cache, plus
+          # buildx setup + push). Anything longer is a real outage
+          # and we want to fail loudly rather than spin silently.
+          DEADLINE=$(date -u -d '+5 minutes' +%s)
+          while true; do
+            if [ "$(date -u +%s)" -gt "${DEADLINE}" ]; then
+              echo "::error::Timed out waiting for ${SIBLING} to complete for ${HEAD_SHA:0:7}"
+              exit 1
+            fi
+            # The API returns runs newest-first. Filter to runs on
+            # the same head SHA with a success conclusion. We don't
+            # filter on created_at against the upstream that
+            # triggered us, because github.event.workflow_run.created_at
+            # equals the upstream's created_at, and "<" would
+            # exclude the upstream itself.
+            SIBLING_OK="$(
+              gh api "/repos/qubitquilt/boop/actions/workflows/${SIBLING}.yaml/runs?per_page=20" \
+                --jq ".workflow_runs[] | select(.head_sha == \"${HEAD_SHA}\" and .conclusion == \"success\") | .created_at" \
+                | head -1
+            )"
+            if [ -n "${SIBLING_OK}" ]; then
+              echo "Sibling ${SIBLING} completed for ${HEAD_SHA:0:7} at ${SIBLING_OK}; proceeding."
+              exit 0
+            fi
+            echo "Waiting for ${SIBLING} on ${HEAD_SHA:0:7}..."
+            sleep 15
+          done
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

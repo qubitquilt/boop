@@ -45,27 +45,32 @@ const (
 // branches, so SupersededByID is at most one row. The
 // dashboard's "vertical timeline" view walks the chain
 // via ParentRunID.
+// JSON tags are added so the /api/runs response has stable snake_case
+// keys (the CLI and any future API consumer depends on this). Without
+// tags Go would emit PascalCase field names, which is not a stable
+// wire format. The HTML dashboard is unaffected — it renders via Go
+// templates that access struct fields directly, not JSON keys.
 type Run struct {
-	ID              string
-	Owner           string
-	Repo            string
-	PRNumber        int
-	CommitSHA       string
-	BaseRef         string
-	ReviewNumber    int
-	Reason          string
-	InstallationID  int64
-	Status          RunStatus
-	StartedAt       time.Time
-	EndedAt         *time.Time
-	DurationMS      *int64
-	Error           string
-	FailureClass    string
-	LastHeartbeatAt *time.Time
-	ParentRunID     string
-	SupersededByID  string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	ID              string     `json:"id"`
+	Owner           string     `json:"owner"`
+	Repo            string     `json:"repo"`
+	PRNumber        int        `json:"pr_number"`
+	CommitSHA       string     `json:"commit_sha"`
+	BaseRef         string     `json:"base_ref"`
+	ReviewNumber    int        `json:"review_number"`
+	Reason          string     `json:"reason,omitempty"`
+	InstallationID  int64      `json:"installation_id"`
+	Status          RunStatus  `json:"status"`
+	StartedAt       time.Time  `json:"started_at"`
+	EndedAt         *time.Time `json:"ended_at,omitempty"`
+	DurationMS      *int64     `json:"duration_ms,omitempty"`
+	Error           string     `json:"error,omitempty"`
+	FailureClass    string     `json:"failure_class,omitempty"`
+	LastHeartbeatAt *time.Time `json:"last_heartbeat_at,omitempty"`
+	ParentRunID     string     `json:"parent_run_id,omitempty"`
+	SupersededByID  string     `json:"superseded_by_id,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 // UpsertRun inserts the run if it does not exist, or updates the

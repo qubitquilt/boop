@@ -23,31 +23,31 @@ const (
 // overview header. Counts and ratios are computed in SQL; the
 // "current streak" fields are computed in Go because the streak
 // is a function of the run's chronological order, not a single
-// aggregate.
+// aggregate. JSON tags added for stable /api/stats wire format.
 type SummaryStats struct {
-	TotalRuns        int64
-	SucceededRuns    int64
-	FailedRuns       int64
-	RunningRuns      int64
-	SuccessRate      float64
-	TotalCostUSD     float64
-	TotalTokens      int64
-	AvgDurationMS    int64
-	P50DurationMS    int64
-	P95DurationMS    int64
-	UniqueRepos      int64
-	UniqueInstalls   int64
+	TotalRuns      int64   `json:"total_runs"`
+	SucceededRuns  int64   `json:"succeeded_runs"`
+	FailedRuns     int64   `json:"failed_runs"`
+	RunningRuns    int64   `json:"running_runs"`
+	SuccessRate    float64 `json:"success_rate"`
+	TotalCostUSD   float64 `json:"total_cost_usd"`
+	TotalTokens    int64   `json:"total_tokens"`
+	AvgDurationMS  int64   `json:"avg_duration_ms"`
+	P50DurationMS  int64   `json:"p50_duration_ms"`
+	P95DurationMS  int64   `json:"p95_duration_ms"`
+	UniqueRepos    int64   `json:"unique_repos"`
+	UniqueInstalls int64   `json:"unique_installs"`
 }
 
 // BucketPoint is one bar on the time-series chart.
 type BucketPoint struct {
-	BucketStart     time.Time
-	Runs            int64
-	Succeeded       int64
-	Failed          int64
-	CostUSD         float64
-	InputTokens     int64
-	OutputTokens    int64
+	BucketStart  time.Time `json:"bucket_start"`
+	Runs         int64     `json:"runs"`
+	Succeeded    int64     `json:"succeeded"`
+	Failed       int64     `json:"failed"`
+	CostUSD      float64   `json:"cost_usd"`
+	InputTokens  int64     `json:"input_tokens"`
+	OutputTokens int64     `json:"output_tokens"`
 }
 
 // GroupBy selects the dimension for per-bucket aggregation. The
@@ -55,8 +55,8 @@ type BucketPoint struct {
 type GroupBy string
 
 const (
-	GroupByRepo   GroupBy = "repo"
-	GroupByModel  GroupBy = "model"
+	GroupByRepo  GroupBy = "repo"
+	GroupByModel GroupBy = "model"
 )
 
 // GroupBucketPoint is a BucketPoint tagged with the group key.
@@ -303,14 +303,14 @@ func (s *Store) GroupedBucketSeries(ctx context.Context, from, to time.Time, buc
 // least one completed run in the window; an "all-time" call with
 // a wide window is the right shape for the side panel.
 type RepoRollup struct {
-	Owner         string
-	Repo          string
-	Runs          int64
-	Succeeded     int64
-	Failed        int64
-	SuccessRate   float64
-	TotalCostUSD  float64
-	LastRunAt     time.Time
+	Owner        string    `json:"owner"`
+	Repo         string    `json:"repo"`
+	Runs         int64     `json:"runs"`
+	Succeeded    int64     `json:"succeeded"`
+	Failed       int64     `json:"failed"`
+	SuccessRate  float64   `json:"success_rate"`
+	TotalCostUSD float64   `json:"total_cost_usd"`
+	LastRunAt    time.Time `json:"last_run_at"`
 }
 
 // PerRepo returns one RepoRollup per repo, ordered by total runs
@@ -367,11 +367,11 @@ func (s *Store) PerRepo(ctx context.Context, from, to time.Time, limit int) ([]R
 // RepoRollup; the dashboard renders these as a stacked-bar chart
 // on the cost page.
 type ModelRollup struct {
-	Model        string
-	Runs         int64
-	TotalCostUSD float64
-	InputTokens  int64
-	OutputTokens int64
+	Model        string  `json:"model"`
+	Runs         int64   `json:"runs"`
+	TotalCostUSD float64 `json:"total_cost_usd"`
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
 }
 
 // PerModel returns the per-model rollup. Pulled from the
