@@ -34,6 +34,11 @@ const baseCtx = {
   isReReview: false,
   diffRange: "main...0123456789abcdef0123456789abcdef01234567",
   paths: { repoDir: "/work/repo" },
+  // QUB-117: the walkthrough resolves the model name from
+  // ctx.openrouterModel via stripOpenRouterPrefix; the test
+  // fixtures must set it so the resolved name reaches
+  // callOpenRouter.
+  openrouterModel: "test-model",
 };
 
 function recordingCallOpenRouter(responses) {
@@ -151,4 +156,42 @@ test("generateWalkthrough truncates responses longer than MAX_WALKTHROUGH_CHARS"
   const out = await generateWalkthrough(baseCtx, deps);
   assert.ok(out.walkthrough.length <= 8000, "walkthrough should be capped at MAX_WALKTHROUGH_CHARS");
   assert.ok(out.walkthrough.length > 0);
+});
+
+// QUB-117: the walkthrough call must pass a non-empty
+// `model` to callOpenRouter. The single-LLM path resolves
+// the model name from `ctx.openrouterModel` via
+// stripOpenRouterPrefix; the walkthrough inherits the same
+// path. The pre-fix bug used `deps.model` (never populated)
+// and the SDK rejected every walkthrough call with
+// `callOpenRouter: model is required`. The walkthrough
+// swallows the error and returns a placeholder, so the bug
+// was silent — this test pins the contract.
+test("generateWalkthrough passes a non-empty model to callOpenRouter (QUB-117)", async () => {
+  const { calls, fn } = recordingCallOpenRouter([
+    { text: "## What the PR does\n\n- bullet 1\n- bullet 2" },
+  ]);
+  const deps = makeDeps(fn);
+  // The resolved model name is the bare form (no
+  // `openrouter/` prefix) so the SDK accepts it.
+  const ctx = { ...baseCtx, openrouterModel: "minimax/minimax-m3" };
+  await generateWalkthrough(ctx, deps);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].opts.model, "minimax/minimax-m3");
+});
+
+// QUB-117: a prefixed model id (the openrouter/<id> form
+// opencode used internally before QUB-98) must be stripped
+// before reaching callOpenRouter. The single-LLM path uses
+// the same stripOpenRouterPrefix helper; the walkthrough
+// must match.
+test("generateWalkthrough strips the openrouter/ prefix from ctx.openrouterModel (QUB-117)", async () => {
+  const { calls, fn } = recordingCallOpenRouter([
+    { text: "## What the PR does\n\n- bullet 1\n- bullet 2" },
+  ]);
+  const deps = makeDeps(fn);
+  const ctx = { ...baseCtx, openrouterModel: "openrouter/minimax/minimax-m3" };
+  await generateWalkthrough(ctx, deps);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].opts.model, "minimax/minimax-m3");
 });

@@ -31,6 +31,8 @@
 // themselves are deterministic per call (no shared state
 // across retries), so re-attempts are safe.
 
+import { stripOpenRouterPrefix } from "./openrouter.mjs";
+
 // pickExperts is the orchestrator. Maps a PR type to a
 // list of expert names. The default mapping is a starting
 // point; a future PR can tune it based on real PR traffic.
@@ -230,7 +232,14 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   try {
     callResult = await callOpenRouter(userPrompt, {
       ...deps,
-      model: deps.model,
+      // QUB-117: the dispatch must forward a non-empty model
+      // name to the SDK call. The single-LLM path resolves the
+      // model name from `ctx.openrouterModel` and strips the
+      // OpenRouter prefix (openrouter.mjs:44); the multi-expert
+      // dispatch must do the same. `deps.model` is never set in
+      // production; using it here was the bug that crashed every
+      // expert dispatch with `callOpenRouter: model is required`.
+      model: stripOpenRouterPrefix(ctx.openrouterModel),
       timeoutMs: EXPERT_TIMEOUT_MS,
       system: lensBody, // the lens file as the system prompt
     });

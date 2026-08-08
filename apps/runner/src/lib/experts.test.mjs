@@ -250,15 +250,21 @@ test("defaultExpert falls back to imported callOpenRouter when deps has none", a
         "# test lens\nYou are a test expert. Return JSON {findings:[]}.",
     },
     postStatus: async () => {},
-    model: "test-model",
     env: {},
     log: () => {},
     errlog: () => {},
   };
+  // QUB-117: the dispatch resolves the model from
+  // `ctx.openrouterModel`; without it, callOpenRouter
+  // throws "model is required" before reaching the API-key
+  // check. Provide a model so the test exercises the same
+  // failure shape production sees (missing API key).
+  const ctx = {
+    paths: { configSrc: "/tmp" },
+    openrouterModel: "test-model",
+  };
   try {
-    await runExperts(["regression-hunter"], {
-      paths: { configSrc: "/tmp" },
-    }, deps);
+    await runExperts(["regression-hunter"], ctx, deps);
     // If we got here, the SDK call unexpectedly succeeded
     // (e.g. an env-level API key was set). Skip rather than
     // fail so CI doesn't get flaky on a developer's machine.
@@ -276,4 +282,97 @@ test("defaultExpert falls back to imported callOpenRouter when deps has none", a
       `expected an SDK-call error after fallback, got: ${msg}`,
     );
   }
+});
+
+// QUB-117: every expert dispatch must pass a non-empty
+// `model` to callOpenRouter. The single-LLM path resolves the
+// model name from `ctx.openrouterModel` via stripOpenRouterPrefix
+// (openrouter.mjs:44); the expert dispatch inherits the same
+// path. The pre-fix bug passed `deps.model` (never populated)
+// and crashed every dispatch with `callOpenRouter: model is
+// required`. The test pins the contract even when `deps.model`
+// is unset — the production deps never set it.
+test("defaultExpert passes a non-empty model to callOpenRouter (QUB-117)", async () => {
+  const calls = [];
+  const deps = {
+    // A fake callOpenRouter that captures every invocation.
+    // The fake returns a JSON string the default expert
+    // parses into { findings: [] }.
+    callOpenRouter: async (_prompt, opts) => {
+      calls.push(opts);
+      return {
+        text: '{"findings": []}',
+        model: opts?.model ?? "test-model",
+        usage: { prompt_tokens: 0, completion_tokens: 0, cost: 0 },
+      };
+    },
+    fs: {
+      readFile: async () =>
+        "# test lens\nYou are a test expert. Return JSON {findings:[]}.",
+    },
+    postStatus: async () => {},
+    // Intentionally do NOT set `deps.model`. The pre-fix
+    // bug relied on `deps.model` and crashed when it was
+    // unset. The fix reads from `ctx.openrouterModel`
+    // instead.
+    env: {},
+    log: () => {},
+    errlog: () => {},
+  };
+  // Bare model id (no prefix). The dispatch must pass the
+  // resolved name through to the SDK call unchanged.
+  await runExperts(
+    ["regression-hunter"],
+    { paths: { configSrc: "/tmp" }, openrouterModel: "minimax/minimax-m3" },
+    deps,
+  );
+  assert.equal(calls.length, 1, "expert dispatch must invoke callOpenRouter exactly once");
+  assert.ok(calls[0], "expert dispatch must capture opts");
+  assert.equal(
+    calls[0].model,
+    "minimax/minimax-m3",
+    "expert dispatch must pass the resolved model name to callOpenRouter",
+  );
+  assert.ok(
+    typeof calls[0].model === "string" && calls[0].model.length > 0,
+    "model must be a non-empty string",
+  );
+});
+
+// QUB-117: a prefixed model id (the openrouter/<id> form
+// opencode used internally before QUB-98) must be stripped
+// before reaching callOpenRouter. The single-LLM path uses
+// the same stripOpenRouterPrefix helper; the expert path
+// must match.
+test("defaultExpert strips the openrouter/ prefix from ctx.openrouterModel (QUB-117)", async () => {
+  const calls = [];
+  const deps = {
+    callOpenRouter: async (_prompt, opts) => {
+      calls.push(opts);
+      return {
+        text: '{"findings": []}',
+        model: opts?.model ?? "test-model",
+        usage: { prompt_tokens: 0, completion_tokens: 0, cost: 0 },
+      };
+    },
+    fs: {
+      readFile: async () =>
+        "# test lens\nYou are a test expert. Return JSON {findings:[]}.",
+    },
+    postStatus: async () => {},
+    env: {},
+    log: () => {},
+    errlog: () => {},
+  };
+  await runExperts(
+    ["regression-hunter"],
+    { paths: { configSrc: "/tmp" }, openrouterModel: "openrouter/minimax/minimax-m3" },
+    deps,
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].model,
+    "minimax/minimax-m3",
+    "expert dispatch must strip the openrouter/ prefix",
+  );
 });

@@ -23,7 +23,7 @@
 // as a defense against an LLM that runs long; the LLM is asked
 // to be terse, not the runner.
 
-import { buildTelemetry } from "./openrouter.mjs";
+import { buildTelemetry, stripOpenRouterPrefix } from "./openrouter.mjs";
 
 const MAX_WALKTHROUGH_CHARS = 8000;
 
@@ -132,9 +132,16 @@ export async function generateWalkthrough(ctx, deps) {
       ...deps,
       // Trim the model override: the walkthrough is small
       // and a smaller model handles it fine. Operators
-      // can still override via deps.openrouterModel if
+      // can still override via deps.walkthroughModel if
       // they need a specific model for the walkthrough.
-      model: deps.walkthroughModel || deps.model,
+      // QUB-117: resolve the model name from
+      // ctx.openrouterModel via the same stripOpenRouterPrefix
+      // helper the single-LLM path uses (openrouter.mjs:44).
+      // The previous `deps.model` was never populated and the
+      // walkthrough swallowed the SDK error and returned a
+      // placeholder; cleaning the latent bug so neither module
+      // leaks past a future refactor.
+      model: deps.walkthroughModel || stripOpenRouterPrefix(ctx.openrouterModel),
       timeoutMs: WALKTHROUGH_TIMEOUT_MS,
       // The walkthrough call does not need the lenses in
       // context; buildBoopPrompt is for the full review.
