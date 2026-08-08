@@ -6,9 +6,10 @@
 // `.git/config`, or `ps aux`.
 //
 // All `git` invocations are scoped to this Job's throwaway config via
-// `-c` flags so the host's `/etc/gitconfig` cannot pull in a
-// system-wide credential helper. `--` is the canonical "stop parsing
-// options" marker; everything after it is a positional ref. The
+// `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_NOSYSTEM` so the host's
+// `/etc/gitconfig` cannot pull in a system-wide credential helper.
+// `--` is the canonical "stop parsing options" marker; everything
+// after it is a positional ref. The
 // refnames have already been regex-validated by the caller.
 
 // CleanupRegistry is the small helper every other module uses to
@@ -68,9 +69,10 @@ async function writeNetrc(token, fs, cleanup, paths) {
 // clone URL is the only way to authenticate, which leaves the token
 // visible in .git/config and `ps aux`.
 async function writeGitconfig(fs, cleanup, paths) {
-  // `-c credential.helper=` is the explicit "no inherited helper"
-  // form; combined with `url.<url>.insteadOf` below we get a fully
-  // scoped, throwaway auth chain. The config file is consumed only
+  // The store helper is the only credential helper in the chain — no
+  // `-c credential.helper=` override will suppress it. Combined with
+  // GIT_CONFIG_GLOBAL / GIT_CONFIG_NOSYSTEM we get a fully scoped,
+  // throwaway auth chain. The config file is consumed only
   // for this Job and unlinked in cleanup.
   const body = [
     "[credential]",
@@ -112,10 +114,11 @@ export async function cloneRepo(ctx, deps) {
   await writeNetrc(ctx.installationToken, fs, cleanup, paths);
   await writeGitconfig(fs, cleanup, paths);
 
-  // All git invocations are scoped to this Job's throwaway config via
-  // `-c` flags so the host's /etc/gitconfig cannot pull in a
-  // system-wide credential helper. `--` is the canonical "stop parsing
-  // options" marker; everything after it is a positional ref.
+  // All git invocations use GIT_CONFIG_GLOBAL / GIT_CONFIG_NOSYSTEM to
+  // scope auth to this Job's throwaway config, so the host's
+  // /etc/gitconfig cannot pull in a system-wide credential helper.
+  // `--` is the canonical "stop parsing options" marker; everything
+  // after it is a positional ref.
   const gitEnv = {
     ...process.env,
     GIT_CONFIG_GLOBAL: paths.gitconfig,
@@ -130,7 +133,6 @@ export async function cloneRepo(ctx, deps) {
   await execFile(
     "git",
     [
-      "-c", "credential.helper=",
       "-c", "protocol.version=2",
       "clone",
       "--depth", "50",
@@ -163,7 +165,6 @@ export async function cloneRepo(ctx, deps) {
   await execFile(
     "git",
     [
-      "-c", "credential.helper=",
       "fetch",
       "--depth", "200",
       "origin",
@@ -175,7 +176,6 @@ export async function cloneRepo(ctx, deps) {
   await execFile(
     "git",
     [
-      "-c", "credential.helper=",
       "checkout",
       headSha,
     ],
