@@ -588,6 +588,17 @@ async function handshakeStage(ctx, deps, overrides, state) {
   );
   state.installationToken = installationToken;
   state.openrouterApiKey = OPENROUTER_API_KEY;
+  // QUB-120: thread the key through deps.env so the
+  // multi-expert dispatch (experts.mjs:233) forwards it
+  // to callOpenRouter via { ...deps }. The single-LLM
+  // path (openrouter.mjs:75) keeps its explicit env
+  // override. Without this, callOpenRouter defaults to
+  // process.env and OPENROUTER_API_KEY is unset (the
+  // runner loads the key from a file, not env), tripping
+  // the guard at openrouter.mjs:188-191 on every expert
+  // dispatch. The walkthrough stage (walkthrough.mjs:131)
+  // also spreads ...deps and picks up the same env.
+  deps.env = { OPENROUTER_API_KEY: OPENROUTER_API_KEY };
   state.octokit = overrides.makeOctokit
     ? overrides.makeOctokit(installationToken)
     : makeOctokit(installationToken);
