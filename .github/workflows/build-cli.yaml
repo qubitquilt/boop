@@ -64,13 +64,14 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
+          flavor: |
+            latest=auto
           tags: |
             type=raw,value=latest
             type=semver,pattern=v{{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=stable
-            flavor: latest=auto
 
       - name: Set VERSION arg
         id: version
