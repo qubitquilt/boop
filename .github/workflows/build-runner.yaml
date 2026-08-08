@@ -4,16 +4,14 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths-ignore:
-      - 'apps/k8s/**'
-      - '.github/workflows/sync-image-digests.yaml'
-      - 'docs/**'
+    paths:
+      - 'apps/runner/**'
+      - '.github/workflows/build-runner.yaml'
   pull_request:
     branches: [main]
-    paths-ignore:
-      - 'apps/k8s/**'
-      - '.github/workflows/sync-image-digests.yaml'
-      - 'docs/**'
+    paths:
+      - 'apps/runner/**'
+      - '.github/workflows/build-runner.yaml'
 
 env:
   IMAGE: ghcr.io/qubitquilt/boop-runner
