@@ -35,3 +35,9 @@ apps/receiver/vendor/
 apps/receiver/*.exe
 apps/receiver/*.test
 apps/receiver/*.out
+
+# Go (apps/cli)
+apps/cli/bin/
+apps/cli/vendor/
+apps/cli/*.exe
+apps/cli/*.test

@@ -1,0 +1,91 @@
+name: build-cli
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore:
+      - 'apps/k8s/**'
+      - 'apps/receiver/**'
+      - 'apps/runner/**'
+      - '.github/workflows/sync-image-digests.yaml'
+      - 'docs/**'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'apps/k8s/**'
+      - 'apps/receiver/**'
+      - 'apps/runner/**'
+      - '.github/workflows/sync-image-digests.yaml'
+      - 'docs/**'
+
+env:
+  IMAGE: ghcr.io/qubitquilt/boop-cli
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build + test (vet + tests in builder stage)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: apps/cli
+          platforms: linux/amd64
+          load: true
+          build-args: VERSION=test
+          tags: boop-cli:ci
+
+  build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
+    needs: test
+    runs-on: boop-runner-set
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          driver: kubernetes
+          driver-opts: |
+            namespace=buildx-builder
+            loadbalance=sticky
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=semver,pattern=v{{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=stable
+            flavor: latest=auto
+
+      - name: Set VERSION arg
+        id: version
+        run: |
+          if [ -n "${GITHUB_REF_NAME}" ]; then
+            echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and Push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: apps/cli
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: VERSION=${{ steps.version.outputs.VERSION }}

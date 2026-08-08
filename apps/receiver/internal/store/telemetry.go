@@ -31,18 +31,20 @@ var ErrUnknownRun = errors.New("store: unknown run")
 // Field names mirror the OpenCode step_finish event shape so the
 // JSON the runner POSTs maps 1:1 onto the struct. The runner is
 // the only writer.
+// Field names mirror the receiver's wire format (snake_case JSON
+// tags) so the CLI and other API consumers get stable keys.
 type Telemetry struct {
-	RunID            string
-	Model            string
-	Provider         string
-	InputTokens      int64
-	OutputTokens     int64
-	ReasoningTokens  int64
-	CacheReadTokens  int64
-	CacheWriteTokens int64
-	CostUSD          float64
-	StepCount        int
-	RecordedAt       time.Time
+	RunID            string    `json:"run_id"`
+	Model            string    `json:"model"`
+	Provider         string    `json:"provider,omitempty"`
+	InputTokens      int64     `json:"input_tokens"`
+	OutputTokens     int64     `json:"output_tokens"`
+	ReasoningTokens  int64     `json:"reasoning_tokens"`
+	CacheReadTokens  int64     `json:"cache_read_tokens"`
+	CacheWriteTokens int64     `json:"cache_write_tokens"`
+	CostUSD          float64   `json:"cost_usd"`
+	StepCount        int       `json:"step_count"`
+	RecordedAt       time.Time `json:"recorded_at"`
 }
 
 // RecordTelemetry inserts or replaces the telemetry row for a run.

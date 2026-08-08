@@ -15,18 +15,17 @@ import (
 // server's clock (Phase 2's load-bearing correctness rule:
 // every stage timestamp is on one clock, never the runner's).
 //
-// The Meta blob is the per-stage escape hatch: comment_post
-// stores {"path": "...", "line": N}, lens stages store
-// {"model": "...", "tokens": N}. Indexed queries (the
-// waterfall) never read Meta; the dashboard does.
+// JSON tags added for the /api/runs response (the dashboard's
+// waterfall reads stages via the store, not the API; this is
+// forward-looking for the CLI).
 type RunStage struct {
-	ID         int64
-	RunID      string
-	Stage      string
-	StartedAt  time.Time
-	EndedAt    *time.Time
-	DurationMS *int64
-	Meta       string
+	ID         int64      `json:"id"`
+	RunID      string     `json:"run_id"`
+	Stage      string     `json:"stage"`
+	StartedAt  time.Time  `json:"started_at"`
+	EndedAt    *time.Time `json:"ended_at,omitempty"`
+	DurationMS *int64     `json:"duration_ms,omitempty"`
+	Meta       string     `json:"meta,omitempty"`
 }
 
 // UpsertRunStage records the start or end of a stage. The
@@ -250,11 +249,11 @@ func (s *Store) ListRefunds(ctx context.Context, runID string) ([]Refund, error)
 	var out []Refund
 	for rows.Next() {
 		var (
-			r       Refund
-			runID   string
-			lens    string
-			tok     int64
-			refAt   string
+			r     Refund
+			runID string
+			lens  string
+			tok   int64
+			refAt string
 		)
 		if err := rows.Scan(&r.ID, &runID, &lens, &tok, &refAt, &r.RefundedBy); err != nil {
 			return nil, fmt.Errorf("store: scan refund: %w", err)

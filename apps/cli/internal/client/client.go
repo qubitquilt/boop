@@ -2,7 +2,7 @@
 //
 // It is intentionally minimal: it knows how to speak to the receiver's
 // JSON endpoints, retry on transient failures, and translate HTTP error
-// bodies into typed errors so the CLI's cobra commands can render
+// bodies into typed errors so the CLI's command layer can render
 // human-readable messages without re-parsing.
 //
 // The receiver returns plain text ("kube error", "store error") on
@@ -19,6 +19,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -67,6 +68,11 @@ type Client struct {
 	token      string
 	http       *http.Client
 	maxRetries int
+	// retryPOSTPrefixes holds path prefixes for which POST requests
+	// are retried on 5xx (same as GET retry behaviour). Only
+	// idempotent POST endpoints should be added here — rerun is
+	// idempotent because the receiver de-dupes on run ID.
+	retryPOSTPrefixes []string
 }
 
 // New constructs a Client from a base URL and optional runner token.
@@ -98,12 +104,38 @@ func (c *Client) WithRetries(n int) *Client {
 	return &cc
 }
 
-// do is the retry-backed request runner. Retries only GETs on 5xx or
-// net errors; records the last error (or 200 body) on success.
+// WithIdempotentPOST returns a copy of the client that retries
+// POST requests whose path starts with one of the given prefixes
+// on 5xx errors. The rerun endpoint is the primary use case.
+func (c *Client) WithIdempotentPOST(prefixes ...string) *Client {
+	cc := *c
+	cc.retryPOSTPrefixes = append([]string{}, prefixes...)
+	return &cc
+}
+
+// do is the retry-backed request runner. Retries GETs on 5xx or
+// net errors. Also retries POST requests whose path matches a
+// registered idempotent prefix. Records the last error (or 200
+// body) on success. On exhaustion it returns an *ErrAPI built
+// from the last response so the command layer sees a consistent
+// error shape.
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
 	u := c.baseURL + path
-	var lastErr error
-	for attempt := 0; attempt < c.maxRetries; attempt++ {
+	var (
+		lastErr   error
+		lastResp  *http.Response
+		retryable bool
+	)
+	if method == http.MethodGet {
+		retryable = true
+	} else if method == http.MethodPost && c.isIdempotentPOST(path) {
+		retryable = true
+	}
+	max := c.maxRetries
+	if max <= 0 {
+		max = 1
+	}
+	for attempt := 0; attempt < max; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, method, u, body)
 		if err != nil {
 			return nil, err
@@ -118,26 +150,36 @@ func (c *Client) do(ctx context.Context, method, path string, body io.Reader) (*
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
-			if method == http.MethodGet && isTransientErr(err) {
-				// Brief backoff before retrying. No backoff
-				// beyond this because the receiver is a
-				// local service and exponential backoff
-				// adds latency a human will notice.
+			if retryable && isTransientErr(err) {
+				fmt.Fprintf(os.Stderr, "boop: retry %s %s (attempt %d/%d): %v\n", method, path, attempt+1, max, err)
 				time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
 				continue
 			}
 			return nil, err
 		}
-		if resp.StatusCode < 500 || method != http.MethodGet {
+		lastResp = resp
+		if resp.StatusCode < 500 || !retryable {
 			return resp, nil
 		}
-		// Transient 5xx on a GET: retry.
-		lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+		// Transient 5xx on a GET: retry. We replace lastResp
+		// with a no-body placeholder so the loop's next resp
+		// assignment doesn't leak the prior body; the actual
+		// *ErrAPI is reconstructed from the drained body.
+		lastErr = buildStatusErr(resp)
+		fmt.Fprintf(os.Stderr, "boop: retry %s %s (attempt %d/%d, status=%d)\n", method, path, attempt+1, max, resp.StatusCode)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+		lastResp = nil
 		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
 	}
+	// Retries exhausted. Surface the last response (if any) as a
+	// typed ErrAPI so callers get the body + status, not a generic
+	// "HTTP 500".
+	if lastResp != nil {
+		return nil, handleErr(lastResp)
+	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("exhausted %d retries", c.maxRetries)
+		lastErr = fmt.Errorf("exhausted %d retries", max)
 	}
 	return nil, lastErr
 }
@@ -157,9 +199,22 @@ func isTransientErr(err error) bool {
 		strings.Contains(msg, "no such host")
 }
 
-// handleErr unwraps a non-2xx response into an *ErrAPI with the body
-// preserved. The caller returns this so cobra renders a clean message.
-func handleErr(resp *http.Response) error {
+// isIdempotentPOST reports whether the given path is a registered
+// idempotent POST endpoint. These are safe to retry on 5xx because
+// the receiver de-dupes on the run ID.
+func (c *Client) isIdempotentPOST(path string) bool {
+	for _, p := range c.retryPOSTPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildStatusErr reads a non-2xx response and returns an *ErrAPI.
+// It drains the body so the caller can close or discard the
+// response without leaking.
+func buildStatusErr(resp *http.Response) *ErrAPI {
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	return &ErrAPI{
@@ -167,6 +222,12 @@ func handleErr(resp *http.Response) error {
 		Status:     resp.Status,
 		Body:       strings.TrimSpace(string(body)),
 	}
+}
+
+// handleErr unwraps a non-2xx response into an *ErrAPI with the body
+// preserved. The caller returns this so cobra renders a clean message.
+func handleErr(resp *http.Response) error {
+	return buildStatusErr(resp)
 }
 
 // decodeJSON is the happy-path decoder shared by every endpoint. On
@@ -183,14 +244,23 @@ func (c *Client) decodeJSON(ctx context.Context, method, path string, body io.Re
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// Health checks GET /health. Used by `boop health`.
+// Health checks GET /health. The receiver returns the plain-text body
+// "ok" (not JSON), so we read the body as text and synthesize the
+// api.Health struct. On non-2xx we return handleErr.
 func (c *Client) Health(ctx context.Context) (*api.Health, error) {
-	var h api.Health
-	if err := c.decodeJSON(ctx, http.MethodGet, "/health", nil, &h); err != nil {
+	resp, err := c.do(ctx, http.MethodGet, "/health", nil)
+	if err != nil {
 		return nil, err
 	}
-	h.Status = "ok"
-	return &h, nil
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, handleErr(resp)
+	}
+	// The receiver returns "ok" as plain text. Any 2xx is treated
+	// as healthy; we don't validate the exact body to tolerate
+	// future shape changes.
+	h := &api.Health{Status: "ok"}
+	return h, nil
 }
 
 // ListReviews does GET /api/reviews.
@@ -292,6 +362,15 @@ func (c *Client) Stats(ctx context.Context, o StatsOpts) (*api.StatsResponse, er
 	return &out, nil
 }
 
+// GetRun does GET /api/runs/{id}. Returns a single run with telemetry.
+func (c *Client) GetRun(ctx context.Context, runID string) (*api.RunWithTelemetry, error) {
+	var out api.RunWithTelemetry
+	if err := c.decodeJSON(ctx, http.MethodGet, "/api/runs/"+url.PathEscape(runID), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // RerunPreview does GET /api/runs/{id}/rerun-preview.
 func (c *Client) RerunPreview(ctx context.Context, runID string) (*api.RerunPreviewResponse, error) {
 	var out api.RerunPreviewResponse
@@ -315,21 +394,4 @@ func (c *Client) Rerun(ctx context.Context, runID, reason string) (*api.RerunRes
 		return nil, err
 	}
 	return &out, nil
-}
-
-// FetchPodLogs does a best-effort GET of the run's pod logs via the
-// dashboard's on-demand fetcher. The receiver does not expose a public
-// /api/runs/{id}/logs endpoint; this is a placeholder that the CLI
-// implements by shelling out to kubectl when the user is port-forwarded
-// in. (The receiver's FetchPodLogs is wired to the dashboard package,
-// not the public API.) Returned as a string so the CLI can tee it to
-// stdout.
-//
-// NOTE: This is intentionally a no-op stub in the client — the CLI's
-// `runs logs` command shells out to kubectl directly (it needs the
-// kube client which the receiver holds, not a public endpoint). This
-// method exists for signature symmetry and may be revisited if the
-// receiver gains a logs endpoint.
-func (c *Client) FetchPodLogs(ctx context.Context, jobName string) (string, error) {
-	return "", errors.New("client: pod logs are fetched via `kubectl logs`, not the API")
 }

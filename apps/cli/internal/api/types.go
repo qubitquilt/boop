@@ -8,11 +8,11 @@ package api
 
 import "time"
 
-// Health is the body of GET /health. The receiver always returns this
-// as plain text ("ok"). We unmarshal defensively so a non-200 body
-// surfaces as a typed error to the CLI's error mapper.
+// Health is the CLI's synthesized representation of GET /health.
+// The receiver returns the plain-text body "ok" (not JSON), so the
+// CLI builds this struct with Status set to "ok" on any 2xx.
 type Health struct {
-	Status string `json:"-"`
+	Status string `json:"status"`
 }
 
 // Review is one row in the /api/reviews response. The receiver's
@@ -52,7 +52,7 @@ type Installation struct {
 	InstalledAt         time.Time `json:"installed_at,omitempty"`
 	FetchedAt           time.Time `json:"fetched_at"`
 	Paused              bool      `json:"paused"`
-	LensOptOut          []string  `json:"lens_opt_out"`
+	LensOptOut          []string  `json:"lens_opt_out,omitempty"`
 }
 
 // InstallationsResponse is the body of GET /api/installations.
@@ -90,30 +90,30 @@ type Telemetry struct {
 // LensTelemetry is one lens's contribution to a run's aggregate
 // telemetry.
 type LensTelemetry struct {
-	ID              int64     `json:"id"`
-	RunID           string    `json:"run_id"`
-	Lens            string    `json:"lens"`
-	Model           string    `json:"model,omitempty"`
-	Provider        string    `json:"provider,omitempty"`
-	InputTokens     int64     `json:"input_tokens"`
-	OutputTokens    int64     `json:"output_tokens"`
-	ReasoningTokens int64     `json:"reasoning_tokens"`
-	CacheReadTokens int64     `json:"cache_read_tokens"`
-	CacheWriteTokens int64    `json:"cache_write_tokens"`
-	CostUSD         float64   `json:"cost_usd"`
-	StepCount       int       `json:"step_count"`
-	RecordedAt      time.Time `json:"recorded_at"`
+	ID               int64     `json:"id"`
+	RunID            string    `json:"run_id"`
+	Lens             string    `json:"lens"`
+	Model            string    `json:"model,omitempty"`
+	Provider         string    `json:"provider,omitempty"`
+	InputTokens      int64     `json:"input_tokens"`
+	OutputTokens     int64     `json:"output_tokens"`
+	ReasoningTokens  int64     `json:"reasoning_tokens"`
+	CacheReadTokens  int64     `json:"cache_read_tokens"`
+	CacheWriteTokens int64     `json:"cache_write_tokens"`
+	CostUSD          float64   `json:"cost_usd"`
+	StepCount        int       `json:"step_count"`
+	RecordedAt       time.Time `json:"recorded_at"`
 }
 
 // RunStage is one row in the run_stages table.
 type RunStage struct {
-	ID         int64     `json:"id"`
-	RunID      string    `json:"run_id"`
-	Stage      string    `json:"stage"`
-	StartedAt  time.Time `json:"started_at"`
-	EndedAt    time.Time `json:"ended_at,omitempty"`
-	DurationMS int64     `json:"duration_ms,omitempty"`
-	Meta       string    `json:"meta,omitempty"`
+	ID         int64      `json:"id"`
+	RunID      string     `json:"run_id"`
+	Stage      string     `json:"stage"`
+	StartedAt  time.Time  `json:"started_at"`
+	EndedAt    *time.Time `json:"ended_at,omitempty"`
+	DurationMS *int64     `json:"duration_ms,omitempty"`
+	Meta       string     `json:"meta,omitempty"`
 }
 
 // Run is one review row. Mirrors store.Run.
@@ -129,11 +129,11 @@ type Run struct {
 	InstallationID  int64      `json:"installation_id"`
 	Status          RunStatus  `json:"status"`
 	StartedAt       time.Time  `json:"started_at"`
-	EndedAt         time.Time  `json:"ended_at,omitempty"`
-	DurationMS      int64      `json:"duration_ms,omitempty"`
+	EndedAt         *time.Time `json:"ended_at,omitempty"`
+	DurationMS      *int64     `json:"duration_ms,omitempty"`
 	Error           string     `json:"error,omitempty"`
 	FailureClass    string     `json:"failure_class,omitempty"`
-	LastHeartbeatAt time.Time  `json:"last_heartbeat_at,omitempty"`
+	LastHeartbeatAt *time.Time `json:"last_heartbeat_at,omitempty"`
 	ParentRunID     string     `json:"parent_run_id,omitempty"`
 	SupersededByID  string     `json:"superseded_by_id,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
@@ -143,7 +143,7 @@ type Run struct {
 // RunWithTelemetry pairs a Run with its Telemetry, if any. Mirrors
 // the receiver's dashboard.go RunWithTelemetry.
 type RunWithTelemetry struct {
-	Run       Run       `json:"run"`
+	Run                 // anonymous embed; JSON fields promoted to top level
 	Telemetry Telemetry `json:"telemetry,omitempty"`
 }
 
@@ -191,13 +191,13 @@ type BucketPoint struct {
 
 // RepoRollup is one row of the per-repo leaderboard.
 type RepoRollup struct {
-	Owner        string  `json:"owner"`
-	Repo         string  `json:"repo"`
-	Runs         int64   `json:"runs"`
-	Succeeded    int64   `json:"succeeded"`
-	Failed       int64   `json:"failed"`
-	SuccessRate  float64 `json:"success_rate"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
+	Owner        string    `json:"owner"`
+	Repo         string    `json:"repo"`
+	Runs         int64     `json:"runs"`
+	Succeeded    int64     `json:"succeeded"`
+	Failed       int64     `json:"failed"`
+	SuccessRate  float64   `json:"success_rate"`
+	TotalCostUSD float64   `json:"total_cost_usd"`
 	LastRunAt    time.Time `json:"last_run_at"`
 }
 
@@ -212,13 +212,13 @@ type ModelRollup struct {
 
 // StatsResponse is the body of GET /api/stats.
 type StatsResponse struct {
-	From    time.Time      `json:"from"`
-	To      time.Time      `json:"to"`
-	Bucket  StatsBucket    `json:"bucket"`
-	Summary SummaryStats   `json:"summary"`
-	Buckets []BucketPoint  `json:"buckets"`
-	ByRepo  []RepoRollup   `json:"by_repo"`
-	ByModel []ModelRollup  `json:"by_model"`
+	From    time.Time     `json:"from"`
+	To      time.Time     `json:"to"`
+	Bucket  StatsBucket   `json:"bucket"`
+	Summary SummaryStats  `json:"summary"`
+	Buckets []BucketPoint `json:"buckets"`
+	ByRepo  []RepoRollup  `json:"by_repo"`
+	ByModel []ModelRollup `json:"by_model"`
 }
 
 // RerunPreviewRun is the per-run slice of the rerun preview.

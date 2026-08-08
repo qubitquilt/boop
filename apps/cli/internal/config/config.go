@@ -91,9 +91,9 @@ func Load() (FileConfig, error) {
 	if cfg.APIURL == "" {
 		cfg.APIURL = DefaultAPIURL
 	}
-	// Normalize: strip trailing slash so URL joins in the
-	// HTTP client don't emit double slashes.
-	cfg.APIURL = filepath.ToSlash(cfg.APIURL)
+	// Strip trailing slashes so URL joins don't emit double slashes.
+	// (We intentionally do NOT call filepath.ToSlash here — that is a
+	// filesystem-path operation and is semantically wrong on a URL.)
 	for len(cfg.APIURL) > 0 && cfg.APIURL[len(cfg.APIURL)-1] == '/' {
 		cfg.APIURL = cfg.APIURL[:len(cfg.APIURL)-1]
 	}

@@ -50,8 +50,9 @@ reaction mode the 🐾 comment never appears and the 👀 becomes 🦴 or ❌.
 6. **[skills.md](./skills.md)** — Boop review skill (orchestrator + seven lenses).
 7. **[deployment.md](./deployment.md)** — K8s overlays, CI, image tags, ArgoCD, release lifecycle.
 8. **[secrets.md](./secrets.md)** — GitHub App credentials, OpenBao secret store.
-9. **[development.md](./development.md)** — local dev, build, test.
-10. **[workflow-engine.md](./workflow-engine.md)** — engine choice for the staged PR review (QUB-87).
+   9. **[development.md](./development.md)** — local dev, build, test.
+   10. **[cli.md](./cli.md)** — `boop` CLI reference (receiver API client).
+   11. **[workflow-engine.md](./workflow-engine.md)** — engine choice for the staged PR review (QUB-87).
 
 The component READMEs (`apps/receiver/README.md`, `apps/runner/README.md`,
 `apps/k8s/base/runner-config/README.md`) are scoped to that component and stay
@@ -135,11 +136,12 @@ cross-component, end-to-end view.
 │   │       │   #   migrations, telemetry/stats aggregations
 │   │       └── github/        # GitHub App client (token mint, PR fetch)
 │   ├── runner/                # Node: PR reviewer (boop skill runner)
-│   │   ├── src/               # index.mjs, review-header.mjs, tests
-│   │   │   #   lib/config, log, security, git, github, dashboard,
-│   │   │   #   classify, walkthrough, experts, ste-lint, rtk, workflow
-│   │   ├── rtk/               # rtk config.toml + filters.toml (baked)
-│   │   └── Dockerfile         # ubuntu 24.04 + node 22 + rtk 0.44.2
+│   ├── cli/                   # Go: `boop` CLI for API investigation (agent + human)
+│   │   ├── cmd/boop/          # entrypoint
+│   │   ├── internal/          # api/, client/, config/, render/
+│   │   ├── Dockerfile         # golang → distroless/static
+│   │   ├── Makefile           # build/test/vet
+│   │   └── README.md
 │   └── k8s/
 │       ├── base/              # cluster-agnostic manifests
 │       │   └── runner-config/ # OpenCode config + skills (ConfigMap)
@@ -147,7 +149,7 @@ cross-component, end-to-end view.
 │       └── overlays/
 │           └── pugquilt/      # home cluster overlay
 ├── .github/workflows/         # build-receiver.yaml, build-runner.yaml,
-│                              #   sync-image-digests.yaml
+│                              #   build-cli.yaml, sync-image-digests.yaml
 └── docs/                      # this directory
 ```
 

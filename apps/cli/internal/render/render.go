@@ -99,7 +99,7 @@ func renderInstallations(w io.Writer, r *api.InstallationsResponse) error {
 			repoSel = "all"
 		}
 		_, err := tab.row(
-			spr(ins.ID), ins.AccountLogin, ins.AccountType, repoSel,
+			spr64(ins.ID), ins.AccountLogin, ins.AccountType, repoSel,
 			boolStr(ins.Paused), tFormatter(ins.InstalledAt), tFormatter(ins.FetchedAt),
 		)
 		if err != nil {
@@ -119,8 +119,8 @@ func renderRuns(w io.Writer, r *api.ListRunsResponse) error {
 			costStr = fmt.Sprintf("$%0.2f (%s)", rw.Telemetry.CostUSD, rw.Telemetry.Model)
 		}
 		var durStr string
-		if rw.Run.DurationMS > 0 {
-			durStr = (time.Duration(rw.Run.DurationMS) * time.Millisecond).Round(time.Second).String()
+		if rw.Run.DurationMS != nil && *rw.Run.DurationMS > 0 {
+			durStr = (time.Duration(*rw.Run.DurationMS) * time.Millisecond).Round(time.Second).String()
 		}
 		_, err := tab.row(
 			rw.Run.ID, string(rw.Run.Status), repo,
@@ -157,8 +157,8 @@ func renderRunWithTelemetry(w io.Writer, rw *api.RunWithTelemetry) error {
 	if !rw.Run.StartedAt.IsZero() {
 		fmt.Fprintf(w, "  started: %s\n", rw.Run.StartedAt.UTC().Format(time.RFC3339))
 	}
-	if rw.Run.DurationMS > 0 {
-		fmt.Fprintf(w, "  duration: %s\n", (time.Duration(rw.Run.DurationMS)*time.Millisecond).Round(time.Second))
+	if rw.Run.DurationMS != nil && *rw.Run.DurationMS > 0 {
+		fmt.Fprintf(w, "  duration: %s\n", (time.Duration(*rw.Run.DurationMS) * time.Millisecond).Round(time.Second))
 	}
 	if rw.Telemetry.Model != "" {
 		fmt.Fprintf(w, "  model:  %s ($%0.4f)\n", rw.Telemetry.Model, rw.Telemetry.CostUSD)
@@ -197,7 +197,7 @@ func renderRerunRun(w io.Writer, r *api.RerunPreviewRun, indent string) {
 		fmt.Fprintf(w, "%sstarted: %s\n", indent, r.StartedAt)
 	}
 	if r.Duration > 0 {
-		fmt.Fprintf(w, "%sduration: %s\n", indent, (time.Duration(r.Duration)*time.Millisecond).Round(time.Second))
+		fmt.Fprintf(w, "%sduration: %s\n", indent, (time.Duration(r.Duration) * time.Millisecond).Round(time.Second))
 	}
 }
 
@@ -230,8 +230,8 @@ func renderStats(w io.Writer, s *api.StatsResponse) error {
 		for _, b := range s.Buckets {
 			_, err := tab.row(
 				b.BucketStart.UTC().Format("2006-01-02 15:04"),
-				spr(b.Runs), spr(b.Succeeded), spr(b.Failed),
-				fmt.Sprintf("$%0.2f", b.CostUSD), comma(b.InputTokens+b.OutputTokens),
+				spr64(b.Runs), spr64(b.Succeeded), spr64(b.Failed),
+				fmt.Sprintf("$%0.2f", b.CostUSD), formatComma(fmt.Sprint(b.InputTokens+b.OutputTokens)),
 			)
 			if err != nil {
 				return err
@@ -248,7 +248,7 @@ func renderStats(w io.Writer, s *api.StatsResponse) error {
 		for _, r := range s.ByRepo {
 			_, err := tab.row(
 				r.Owner+"/"+r.Repo,
-				spr(r.Runs), spr(r.Succeeded), spr(r.Failed),
+				spr64(r.Runs), spr64(r.Succeeded), spr64(r.Failed),
 				fmt.Sprintf("%.1f%%", r.SuccessRate*100),
 				fmt.Sprintf("$%0.2f", r.TotalCostUSD),
 			)
@@ -266,8 +266,8 @@ func renderStats(w io.Writer, s *api.StatsResponse) error {
 		tab := newTable("MODEL", "RUNS", "COST", "IN", "OUT")
 		for _, m := range s.ByModel {
 			_, err := tab.row(
-				m.Model, spr(m.Runs), fmt.Sprintf("$%0.2f", m.TotalCostUSD),
-				comma(m.InputTokens), comma(m.OutputTokens),
+				m.Model, spr64(m.Runs), fmt.Sprintf("$%0.2f", m.TotalCostUSD),
+				formatComma(fmt.Sprint(m.InputTokens)), formatComma(fmt.Sprint(m.OutputTokens)),
 			)
 			if err != nil {
 				return err
@@ -318,22 +318,7 @@ func durStr(ms int64) string {
 }
 
 func comma(n int64) string {
-	s := fmt.Sprint(n)
-	if len(s) <= 3 {
-		return s
-	}
-	var out []string
-	for i := 0; i < len(s); i += 3 {
-		if i > 0 {
-			out = append([]string{","}, out...)
-		}
-		// Not the most efficient, but only used for display of
-		// token counts which fit in int64.
-		_ = i
-	}
-	// Use a simple reverse-chunked formatter instead of the
-	// broken loop above.
-	return formatComma(s)
+	return formatComma(fmt.Sprint(n))
 }
 
 func formatComma(s string) string {
@@ -354,6 +339,8 @@ func spr(i int) string {
 	}
 	return fmt.Sprint(i)
 }
+
+func spr64(i int64) string { return formatComma(fmt.Sprint(i)) }
 
 // minTable is a tiny fixed-column-width table writer. Each row is
 // stored as a slice of strings; flush computes the column widths in

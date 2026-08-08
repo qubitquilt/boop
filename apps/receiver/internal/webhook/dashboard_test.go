@@ -370,3 +370,62 @@ func TestInstallation_WireShape(t *testing.T) {
 		t.Errorf("wire shape: %s", string(b))
 	}
 }
+
+func TestGetRun_Found(t *testing.T) {
+	h := newTestHandlerWithStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := h.store.UpsertRun(ctx, store.Run{
+		ID: "boop-test-1-abc1234", Owner: "o", Repo: "r", PRNumber: 1,
+		CommitSHA: "abc1234", Status: store.StatusSucceeded,
+		StartedAt: now, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/runs/{id}", h.GetRun)
+	req := httptest.NewRequest("GET", "/api/runs/boop-test-1-abc1234", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var resp RunWithTelemetry
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.ID != "boop-test-1-abc1234" {
+		t.Errorf("id = %q, want boop-test-1-abc1234", resp.ID)
+	}
+	if resp.Status != store.StatusSucceeded {
+		t.Errorf("status = %q, want succeeded", resp.Status)
+	}
+}
+
+func TestGetRun_NotFound(t *testing.T) {
+	h := newTestHandlerWithStore(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/runs/{id}", h.GetRun)
+	req := httptest.NewRequest("GET", "/api/runs/nonexistent", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != 404 {
+		t.Fatalf("status = %d, want 404; body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestGetRun_NoStore(t *testing.T) {
+	h := &Handler{
+		logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		store:  nil,
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/runs/{id}", h.GetRun)
+	req := httptest.NewRequest("GET", "/api/runs/x", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != 503 {
+		t.Fatalf("status = %d, want 503", rr.Code)
+	}
+}
