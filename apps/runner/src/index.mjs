@@ -425,15 +425,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       prNumber: ctx.prNumber || "?",
       prHeadSha: ctx.prHeadSha || "?",
     });
-    log.errlog("fatal", "boop runner failed", { error: String(err?.message ?? err) });
-    const fatalOctokit = deps.getOctokit();
-    if (fatalOctokit && ctx.statusCommentId) {
-      await postStatus("failed", String(err?.message ?? err), ctx, {
-        log: log.log,
-        errlog: log.errlog,
-        octokit: fatalOctokit,
-      });
+    try {
+      log.errlog("fatal", "boop runner failed", { error: String(err?.message ?? err) });
+    } finally {
+      process.exit(1);
     }
-    process.exit(1);
   });
 }
