@@ -4,11 +4,9 @@ ARG VERSION=dev
 COPY go.mod ./
 RUN go mod download
 COPY . .
-# Run vet before the binary so a failing vet fails the build.
-# Tests run in the CI test job natively; skip here because the
-# multi-arch builder stage may run under QEMU emulation where
-# net/http/httptest can produce runtime panics.
-RUN go vet ./...
+# Vet and tests run in the CI test job natively. The builder stage
+# may run under QEMU emulation for multi-arch builds, where Go's
+# module indexer can segfault. Only build here.
 RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION}" \
     -o /out/boop ./cmd/boop
