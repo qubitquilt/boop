@@ -52,8 +52,17 @@ import (
 // returns an error so the dashboard can render a 503-style
 // "not configured" page rather than silently dropping the
 // action.
+//
+// FetchPodLogs is the on-demand log fetcher the run-detail
+// page uses to surface the runner's K8s pod logs. Returns the
+// raw log bytes (the runner emits one JSON line per stage
+// transition, so the dashboard renders them verbatim) and a
+// not-found-style error if the Job's pod is already TTL'd out
+// of the namespace. The dashboard treats any error from this
+// callback as "logs unavailable" rather than 5xx-ing the page.
 type Actions struct {
 	CreateRerunJob func(ctx context.Context, prior store.Run, reason string) (newRunID string, err error)
+	FetchPodLogs   func(ctx context.Context, jobName string) (logs string, err error)
 }
 
 //go:embed templates/*.html
@@ -298,12 +307,26 @@ func (h *Handler) serveRunDetail(w http.ResponseWriter, r *http.Request, id stri
 	stages, _ := h.store.ListRunStages(r.Context(), id)
 	lenses, _ := h.store.ListLensTelemetry(r.Context(), id)
 	lineage, _ := h.store.WalkLineage(r.Context(), id, 32)
+
+	// K8s pod logs (best-effort). The Job is GC'd 1h
+	// after CompletionTime, so for older runs the
+	// callback returns "" and the dashboard renders
+	// "logs unavailable" rather than failing the page.
+	// Any error from the callback is logged at Debug
+	// and treated as no-logs-available; the page still
+	// renders with the structured stages + error string.
+	logs, logsErr := h.fetchLogs(r.Context(), id)
+
 	data := runDetailView{
 		Nav:     "runs",
 		Run:     runView{Run: run},
 		Stages:  renderWaterfall(stages),
 		Lenses:  lenses,
 		Lineage: lineage,
+		Logs:    logs,
+	}
+	if logsErr != nil {
+		data.LogsErr = logsErr.Error()
 	}
 	data.Run.Status = string(run.Status)
 	if !run.StartedAt.IsZero() {
@@ -315,7 +338,27 @@ func (h *Handler) serveRunDetail(w http.ResponseWriter, r *http.Request, id stri
 			data.Run.Duration = dur.Round(time.Second).String()
 		}
 	}
+	// PR link: only meaningful when the row carries
+	// owner/repo/pr_number (every webhook-created row
+	// does; the synthetic "orphaned" rows from
+	// MarkOrphanedRuns do too). Compose the URL on
+	// the server side so the template doesn't have to
+	// know about GitHub's URL shape.
+	if run.Owner != "" && run.Repo != "" && run.PRNumber > 0 {
+		data.Run.PRURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", run.Owner, run.Repo, run.PRNumber)
+	}
 	h.renderPage(w, "run_detail.html", data)
+}
+
+// fetchLogs wraps the Actions.FetchPodLogs callback so the
+// handler doesn't have to nil-check it on every render. A
+// nil callback (a read-only deploy without K8s) renders the
+// "logs unavailable" path the same way a TTL'd Job does.
+func (h *Handler) fetchLogs(ctx context.Context, jobName string) (string, error) {
+	if h.actions.FetchPodLogs == nil {
+		return "", fmt.Errorf("pod log fetcher not configured")
+	}
+	return h.actions.FetchPodLogs(ctx, jobName)
 }
 
 type runDetailView struct {
@@ -324,6 +367,8 @@ type runDetailView struct {
 	Stages  []stageRow
 	Lenses  []store.LensTelemetry
 	Lineage store.Lineage
+	Logs    string
+	LogsErr string
 }
 type runView struct {
 	store.Run
@@ -331,12 +376,16 @@ type runView struct {
 	StartedAt string
 	EndedAt   string
 	Duration  string
+	PRURL     string
 }
 type stageRow struct {
 	Stage     string
 	Duration  int64
 	OffsetPct float64
 	WidthPct  float64
+	Meta      string
+	StartedAt string
+	EndedAt   string
 }
 
 // renderWaterfall converts the per-stage rows into
@@ -369,7 +418,12 @@ func renderWaterfall(stages []store.RunStage) []stageRow {
 		w := 100.0 / float64(len(stages))
 		out := make([]stageRow, len(stages))
 		for i, s := range stages {
-			out[i] = stageRow{Stage: s.Stage, Duration: durMS(s), OffsetPct: float64(i) * w, WidthPct: w}
+			out[i] = fillStageRow(stageRow{
+				Stage:     s.Stage,
+				Duration:  durMS(s),
+				OffsetPct: float64(i) * w,
+				WidthPct:  w,
+			}, s)
 		}
 		return out
 	}
@@ -384,9 +438,27 @@ func renderWaterfall(stages []store.RunStage) []stageRow {
 		if width < 0.5 {
 			width = 0.5 // floor so <1s stages are still visible
 		}
-		out = append(out, stageRow{Stage: s.Stage, Duration: durMS(s), OffsetPct: offset, WidthPct: width})
+		out = append(out, fillStageRow(stageRow{
+			Stage:     s.Stage,
+			Duration:  durMS(s),
+			OffsetPct: offset,
+			WidthPct:  width,
+		}, s))
 	}
 	return out
+}
+
+// fillStageRow decorates a stageRow with the timestamps and
+// Meta blob the run-detail template renders next to each
+// stage bar. Kept as a helper so renderWaterfall's two
+// branches stay symmetric.
+func fillStageRow(r stageRow, s store.RunStage) stageRow {
+	r.StartedAt = s.StartedAt.Format("15:04:05.000")
+	if s.EndedAt != nil {
+		r.EndedAt = s.EndedAt.Format("15:04:05.000")
+	}
+	r.Meta = s.Meta
+	return r
 }
 
 func durMS(s store.RunStage) int64 {
