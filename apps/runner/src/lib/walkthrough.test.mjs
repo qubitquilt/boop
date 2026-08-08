@@ -195,3 +195,48 @@ test("generateWalkthrough strips the openrouter/ prefix from ctx.openrouterModel
   assert.equal(calls.length, 1);
   assert.equal(calls[0].opts.model, "minimax/minimax-m3");
 });
+
+// QUB-120: the walkthrough call must forward
+// OPENROUTER_API_KEY to callOpenRouter. The runner loads the
+// key from a mounted Secret file into state.openrouterApiKey
+// (workflow.mjs:590) and threads it through deps.env
+// (workflow.mjs:601). The walkthrough spreads ...deps into
+// callOpenRouter (walkthrough.mjs:131), so deps.env lands in
+// the SDK call. Without this, callOpenRouter defaults to
+// process.env (openrouter.mjs:172) and the key is unset — the
+// runner never exports the file-loaded secret into the
+// process environment. The walkthrough catches the error and
+// falls back to a placeholder, so the bug was silent here.
+// This test pins the contract: whatever the runner puts on
+// deps.env.OPENROUTER_API_KEY reaches callOpenRouter verbatim.
+test("generateWalkthrough forwards deps.env.OPENROUTER_API_KEY to callOpenRouter (QUB-120)", async () => {
+  const { calls, fn } = recordingCallOpenRouter([
+    { text: "## What the PR does\n\n- bullet 1\n- bullet 2" },
+  ]);
+  const deps = {
+    callOpenRouter: fn,
+    // Simulate what the handshake stage does: thread the
+    // file-loaded key through deps.env so the walkthrough
+    // spread picks it up.
+    env: { OPENROUTER_API_KEY: "test-key-from-secret-file" },
+    log: () => {},
+    errlog: () => {},
+  };
+  await generateWalkthrough(baseCtx, deps);
+  assert.equal(calls.length, 1, "walkthrough must invoke callOpenRouter exactly once");
+  assert.ok(calls[0].opts, "walkthrough must capture opts");
+  assert.ok(
+    calls[0].opts.env && typeof calls[0].opts.env === "object",
+    "walkthrough must forward an env object to callOpenRouter",
+  );
+  assert.equal(
+    calls[0].opts.env.OPENROUTER_API_KEY,
+    "test-key-from-secret-file",
+    "walkthrough must forward deps.env.OPENROUTER_API_KEY verbatim",
+  );
+  assert.ok(
+    typeof calls[0].opts.env.OPENROUTER_API_KEY === "string" &&
+      calls[0].opts.env.OPENROUTER_API_KEY.length > 0,
+    "OPENROUTER_API_KEY must be a non-empty string",
+  );
+});

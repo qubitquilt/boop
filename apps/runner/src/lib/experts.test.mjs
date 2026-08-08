@@ -376,3 +376,62 @@ test("defaultExpert strips the openrouter/ prefix from ctx.openrouterModel (QUB-
     "expert dispatch must strip the openrouter/ prefix",
   );
 });
+
+// QUB-120: the multi-expert dispatch must forward
+// OPENROUTER_API_KEY to callOpenRouter. The runner loads the
+// key from a mounted Secret file into state.openrouterApiKey
+// (workflow.mjs:590) and threads it through deps.env
+// (workflow.mjs:591-600). The expert dispatch spreads ...deps
+// into callOpenRouter (experts.mjs:233), so deps.env lands in
+// the SDK call. Without this, callOpenRouter defaults to
+// process.env (openrouter.mjs:172) and the key is unset — the
+// runner never exports the file-loaded secret into the
+// process environment — so the guard at openrouter.mjs:188-191
+// fires on every expert dispatch. This test pins the contract:
+// whatever the runner puts on deps.env.OPENROUTER_API_KEY
+// reaches callOpenRouter verbatim.
+test("defaultExpert forwards deps.env.OPENROUTER_API_KEY to callOpenRouter (QUB-120)", async () => {
+  const calls = [];
+  const deps = {
+    callOpenRouter: async (_prompt, opts) => {
+      calls.push(opts);
+      return {
+        text: '{"findings": []}',
+        model: opts?.model ?? "test-model",
+        usage: { prompt_tokens: 0, completion_tokens: 0, cost: 0 },
+      };
+    },
+    fs: {
+      readFile: async () =>
+        "# test lens\nYou are a test expert. Return JSON {findings:[]}.",
+    },
+    postStatus: async () => {},
+    // Simulate what the handshake stage does: thread the
+    // file-loaded key through deps.env so the multi-expert
+    // spread picks it up.
+    env: { OPENROUTER_API_KEY: "test-key-from-secret-file" },
+    log: () => {},
+    errlog: () => {},
+  };
+  await runExperts(
+    ["regression-hunter"],
+    { paths: { configSrc: "/tmp" }, openrouterModel: "minimax/minimax-m3" },
+    deps,
+  );
+  assert.equal(calls.length, 1, "expert dispatch must invoke callOpenRouter exactly once");
+  assert.ok(calls[0], "expert dispatch must capture opts");
+  assert.ok(
+    calls[0].env && typeof calls[0].env === "object",
+    "expert dispatch must forward an env object to callOpenRouter",
+  );
+  assert.equal(
+    calls[0].env.OPENROUTER_API_KEY,
+    "test-key-from-secret-file",
+    "expert dispatch must forward deps.env.OPENROUTER_API_KEY verbatim",
+  );
+  assert.ok(
+    typeof calls[0].env.OPENROUTER_API_KEY === "string" &&
+      calls[0].env.OPENROUTER_API_KEY.length > 0,
+    "OPENROUTER_API_KEY must be a non-empty string",
+  );
+});
