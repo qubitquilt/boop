@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, realpathSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import { createCleanupRegistry, cloneRepo } from "./git.mjs";
 
@@ -110,15 +114,6 @@ test("cloneRepo runs clone, fetch, and checkout in order", async () => {
   assert.ok(op(2).includes("checkout"));
 });
 
-test("cloneRepo passes `-c credential.helper=` to every git invocation", async () => {
-  const deps = makeDeps();
-  await cloneRepo(makeCtx(), deps);
-  for (const call of deps.execFile.calls) {
-    const args = call[1];
-    assert.deepEqual(args.slice(0, 2), ["-c", "credential.helper="]);
-  }
-});
-
 test("cloneRepo uses `git fetch origin -- <refs>` (positional refs after `--`)", async () => {
   const deps = makeDeps();
   await cloneRepo(makeCtx(), deps);
@@ -151,7 +146,6 @@ test("cloneRepo checks out the head SHA", async () => {
   // interprets the SHA as a filesystem path, not a commit ref. The
   // checkout command is therefore `git checkout <sha>` — no `--`.
   assert.deepEqual(checkoutArgs, [
-    "-c", "credential.helper=",
     "checkout",
     "0123456789abcdef0123456789abcdef01234567",
   ]);
@@ -234,5 +228,46 @@ test("cloneRepo rejects unsafe head SHA", async () => {
   await assert.rejects(
     () => cloneRepo(makeCtx({ prHeadSha: "not-a-sha" }), deps),
     /unsafe PR_HEAD_SHA/,
+  );
+});
+
+// --- E2E credential helper regression (QUB-116) ------------------------
+
+test("credential.helper from gitconfig is active without -c override (regression: QUB-116)", async (t) => {
+  const tmp = realpathSync(mkdtempSync(join(tmpdir(), "qub-116-")));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  const gitconfig = join(tmp, "gitconfig");
+  const netrc = join(tmp, "netrc");
+
+  writeFileSync(gitconfig, `[credential]\n\thelper = store --file=${netrc}\n`, "utf8");
+  writeFileSync(netrc, "https://x-access-token:ghs_magic@github.com\n", "utf8");
+
+  const env = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: gitconfig,
+    GIT_CONFIG_NOSYSTEM: "1",
+    HOME: tmp,
+  };
+
+  // Without `-c credential.helper=`, git must find the store helper and
+  // return the stored credentials from the gitconfig.
+  const ok = execFileSync("git", ["credential", "fill"], {
+    env,
+    input: "url=https://github.com\n\n",
+    encoding: "utf8",
+  });
+  assert.match(ok, /password=ghs_magic/, "gitconfig helper must be active without -c override");
+
+  // With `-c credential.helper=`, git must suppress the gitconfig helper
+  // and fail when it falls through to terminal prompting.
+  assert.throws(
+    () => execFileSync("git", ["-c", "credential.helper=", "credential", "fill"], {
+      env,
+      input: "url=https://github.com\n\n",
+      encoding: "utf8",
+    }),
+    /could not read/i,
+    "-c credential.helper= must suppress the gitconfig helper",
   );
 });
