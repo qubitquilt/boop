@@ -27,7 +27,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build + test (vet + tests in builder stage)
+      - uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+        with:
+          go-version: '1.26'
+          cache-dependency-path: apps/cli/go.sum
+      - name: Vet + test
+        working-directory: apps/cli
+        run: go vet ./... && go test ./...
+      - name: Build image (smoke test)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: apps/cli
