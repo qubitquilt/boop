@@ -2,20 +2,20 @@
 
 > Full documentation: [`docs/cli.md`](../../docs/cli.md)
 
-A command-line client for the boop receiver API. Designed for two
-audiences:
+A command-line client for the boop receiver API.
 
 - **AI agents** (primary): `--json` flag, env-driven config, no
-  interactive prompts, predictable exit codes.
-- **Humans** doing ad-hoc investigation: human-readable tables by
-  default, with `--json` as an escape hatch for piping to `jq`.
+  interactive prompts, predictable exit codes. Errors print as
+  `{"error":{"status":N,"body":"..."}}` in JSON mode.
+- **Humans**: human-readable tables by default, with `--json` for
+  piping to `jq`.
 
 ## Install
 
 ```sh
 cd apps/cli
-make build        # → bin/boop
-make install      #   or copy to $GOPATH/bin/boop
+make build        # -> bin/boop
+make install      # or copy to $GOPATH/bin/boop
 ```
 
 Or via Docker:
@@ -35,7 +35,7 @@ Config resolves from three layers, lowest to highest precedence:
    `boop config write`.
 3. Environment variables: `BOOP_API_URL`, `BOOP_RUNNER_TOKEN`,
    `BOOP_DASHBOARD_TOKEN`. These always win. Empty env vars are
-   no-ops (they don't blank a populated file).
+   no-ops (they do not blank a populated file).
 
 Inspect the resolved config:
 
@@ -50,6 +50,9 @@ Write a config file (e.g. for a local dev receiver behind a port-forward):
 boop config write --api-url http://localhost:8080 --runner-token $(kubectl get secret boop-secrets -o jsonpath='{.data.runner-token}' | base64 -d)
 ```
 
+Config write validates `--api-url` and rejects strings without a
+scheme + host.
+
 ## Usage
 
 ### `boop health`
@@ -57,17 +60,18 @@ boop config write --api-url http://localhost:8080 --runner-token $(kubectl get s
 Check the receiver is up.
 
 ```sh
-boop health              # → boop receiver: ok
-boop health --json       # → {"status":"ok"}
+boop health              # -> boop receiver: ok
+boop health --json       # -> {"status":"ok"}
 ```
 
 ### `boop reviews`
 
-Snapshot of review Jobs in the receiver's namespace, bucketed into
+Snapshot of review Jobs in the receiver namespace, bucketed into
 active / recent / failed (K8s view, same shape as `/api/reviews`).
 
 ```sh
 boop reviews
+boop reviews --json
 ```
 
 ### `boop installations`
@@ -87,7 +91,7 @@ Paginated, filterable run history. Query params match `/api/runs`:
 |-----------------|----------------------------------------------|
 | `--owner`       | Filter by owner (exact match)                |
 | `--repo`        | Filter by repo (exact match)                 |
-| `--status`      | `pending\|running\|succeeded\|failed`        |
+| `--status`      | `pending|running|succeeded|failed`           |
 | `--installation`| Filter by installation id                    |
 | `--from` / `--to`| Inclusive RFC3339 bounds on `started_at`   |
 | `--cursor`      | Paginated cursor from a previous `next_cursor`|
@@ -100,21 +104,22 @@ boop runs list --owner qubitquilt --repo boop --json | jq '.runs[-1]'
 
 ### `boop runs get <run-id>`
 
-Show a single run (id = the K8s Job name, e.g.
-`boop-qubitquilt-boop-42-a1b2c3d`) plus its telemetry. The receiver
-has no `GET /api/runs/{id}` endpoint, so this lists client-side
-and filters. Use `--json` for the raw `RunWithTelemetry` shape.
+Show a single run by id (the K8s Job name, e.g.
+`boop-qubitquilt-boop-42-a1b2c3d`) plus its telemetry. Uses the
+dedicated `GET /api/runs/{id}` endpoint (not a client-side filter).
 
 ```sh
 boop runs get boop-qubitquilt-boop-42-a1b2c3d
+boop runs get boop-qubitquilt-boop-42-a1b2c3d --json
 ```
 
 ### `boop runs rerun <run-id>`
 
-Re-run a terminal run (QUB-110). Without `--yes`, prints a
-`RerunPreviewResponse` diff and the exact command to confirm with.
-Requires `--reason` (free text, logged to the audit trail) and the
-runner token.
+Re-run a terminal run. Without `--yes`, prints a
+`RerunPreviewResponse` diff and the exact command to confirm.
+Requires `--reason` (free text, logged to the audit trail) and
+the runner token. POST requests for rerun are retried on
+transient 5xx errors.
 
 ```sh
 boop runs rerun boop-qubitquilt-boop-42-a1b2c3d --reason "fixed the lint failure"
@@ -130,7 +135,7 @@ Query params match `/api/stats`:
 |----------|--------------------------------|
 | `--from` | Inclusive RFC3339 lower bound  |
 | `--to`   | Inclusive RFC3339 upper bound  |
-| `--bucket`| `hour\|day\|week` (default day)|
+| `--bucket`| `hour|day|week` (default day)|
 
 ```sh
 boop stats --from 2026-07-01T00:00:00Z
@@ -139,11 +144,16 @@ boop stats --bucket week --json
 
 ## Global flags
 
-| Flag       | Purpose                              |
-|------------|--------------------------------------|
-| `--json`   | Output raw JSON (machine-readable)   |
-| `--timeout`| Request timeout (default 30s)        |
-| `--version`| Print version and exit               |
+| Flag        | Purpose                              |
+|-------------|--------------------------------------|
+| `--json`    | Output raw JSON (machine-readable)   |
+| `--timeout` | Request timeout (default 30s)        |
+| `--version` | Print version and exit               |
+| `--short`   | With `--version`: print SHA only     |
+
+Flags work in any position. `boop runs --json list` and
+`boop --json runs list` both produce JSON output. Same for
+`--version`.
 
 ## Exit codes
 
@@ -155,11 +165,10 @@ boop stats --bucket week --json
 ## Retries
 
 GET requests are retried (up to 3 times) on transient 5xx / connection
-errors with a short backoff. POST endpoints (`runs rerun`) are not
-retried — the receiver's re-run flow is operator-initiated and
-idempotency is the operator's responsibility.
+errors with a short backoff. The rerun POST endpoint is also retried
+because the receiver de-dupes on run ID, making the request idempotent.
 
 ## Related
 
-- [docs/receiver.md](../receiver.md) — the receiver's HTTP API + types
-- [docs/architecture.md](../architecture.md) — system flow
+- [docs/receiver.md](../../docs/receiver.md) — the receiver HTTP API + types
+- [docs/architecture.md](../../docs/architecture.md) — system flow

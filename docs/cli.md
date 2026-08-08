@@ -1,17 +1,16 @@
 # boop CLI
 
-A command-line client for the `boop-receiver` HTTP API. Designed for two
-audiences:
+A command-line client for the `boop-receiver` HTTP API.
 
 - **AI agents** (primary): `--json` flag, env-driven config, no
-  interactive prompts, predictable exit codes. Agents can `boop runs
-  list --json | jq …` without parsing a table.
-- **Humans** doing ad-hoc investigation: human-readable tables by
-  default, with `--json` as an escape hatch.
+  interactive prompts, predictable exit codes. Errors print as
+  `{"error":{"status":N,"body":"..."}}` in JSON mode.
+- **Humans**: human-readable tables by default, with `--json` for
+  piping to `jq`.
 
 The CLI lives in `apps/cli/` and is a separate Go module
-(`github.com/michaelruelas/boop-cli`) so it can be built, tested, and
-versioned independently of the receiver.
+(`github.com/michaelruelas/boop-cli`). It builds, tests, and
+versions independently of the receiver.
 
 ## Connecting to a receiver
 
@@ -21,8 +20,8 @@ The CLI defaults to the in-cluster service address:
 BOOP_API_URL=http://boop-receiver.dev-tools.svc.cluster.local:8080
 ```
 
-Set this when running the CLI from inside the cluster (e.g. from
-another pod) or from an AI agent colocated in the same K8s context.
+Set this when running from inside the cluster (e.g. from another
+pod) or from an AI agent colocated in the same K8s context.
 
 ### Local (port-forward)
 
@@ -33,20 +32,19 @@ export BOOP_RUNNER_TOKEN=$(kubectl -n dev-tools get secret boop-secrets -o jsonp
 boop health
 ```
 
-The read-only endpoints (`/api/reviews`, `GET /api/runs`, `/api/stats`,
-`/api/installations`) are unauthenticated at the receiver layer and
-leak Job metadata only (no secrets, no PR content). The `POST` routes
-under `/api/runs/{id}/*` (telemetry, status, re-run) require
-`X-BOOP-Runner-Token`. Exposing the API outside the cluster is tracked
-in <https://linear.app/qubit-quilt/issue/QUB-115> — see that ticket
-for the authorization + rate-limiting design.
+The read-only endpoints (`/api/reviews`, `GET /api/runs`,
+`/api/stats`, `/api/installations`) are unauthenticated at the
+receiver layer. They leak Job metadata only (no secrets, no PR
+content). The POST routes under `/api/runs/{id}/*` (telemetry,
+status, re-run) require `X-BOOP-Runner-Token`. Exposing the API
+outside the cluster is tracked in QUB-115.
 
 ## Install
 
 ```sh
 cd apps/cli
-make build        # → bin/boop
-make install      #   or copy to $GOPATH/bin/boop
+make build        # -> bin/boop
+make install      # or copy to $GOPATH/bin/boop
 ```
 
 Or via Docker / distroless:
@@ -86,6 +84,9 @@ boop config write \
   --runner-token "$(kubectl -n dev-tools get secret boop-secrets -o jsonpath='{.data.runner-token}' | base64 -d)"
 ```
 
+`--api-url` is validated at write time. A string without a scheme
+and host is rejected.
+
 ## Global flags
 
 | Flag        | Purpose                              |
@@ -93,6 +94,11 @@ boop config write \
 | `--json`    | Output raw JSON instead of tables    |
 | `--timeout` | Request timeout (default 30s)        |
 | `--version` | Print version and exit               |
+| `--short`   | With `--version`: print SHA only     |
+
+Flags work in any position. `boop runs --json list` and
+`boop --json runs list` both produce JSON output. Same for
+`--version`.
 
 ## Commands
 
@@ -102,17 +108,17 @@ Check the receiver is up. The receiver returns plain text `"ok"` (not
 JSON), so the CLI synthesizes a `{"status":"ok"}` body for `--json`.
 
 ```sh
-boop health              # → boop receiver: ok
-boop health --json       # → {"status":"ok"}
+boop health              # -> boop receiver: ok
+boop health --json       # -> {"status":"ok"}
 ```
 
 ### `boop reviews`
 
-Snapshot of review Jobs in the receiver's namespace, bucketed into
+Snapshot of review Jobs in the receiver namespace, bucketed into
 `active` / `recent` / `failed`. This mirrors
-`GET /api/reviews` exactly — it's a K8s API read, not the SQLite
-data layer. Runs GC'd after the Job TTL (1h) won't appear here even if
-their store row survives.
+`GET /api/reviews` exactly — it is a K8s API read, not the SQLite
+data layer. Runs GCd after the Job TTL (1h) do not appear here even
+if their store row survives.
 
 ```sh
 boop reviews
@@ -127,6 +133,7 @@ min). Columns include `paused` and `lens_opt_out` (QUB-108/QUB-111).
 
 ```sh
 boop installations
+boop installations --json
 ```
 
 ### `boop runs list`
@@ -138,7 +145,7 @@ Paginated, filterable run history. Query params match
 |------------------|-----------------------------------------------|
 | `--owner`        | Filter by owner (exact match)                 |
 | `--repo`         | Filter by repo (exact match)                  |
-| `--status`       | `pending\|running\|succeeded\|failed`          |
+| `--status`       | `pending|running|succeeded|failed`            |
 | `--installation` | Filter by installation id                     |
 | `--from` / `--to`| Inclusive RFC3339 bounds on `started_at`      |
 | `--cursor`       | Paginated cursor from a previous `next_cursor`|
@@ -149,19 +156,14 @@ boop runs list --status failed --from 2026-08-01T00:00:00Z --limit 20
 boop runs list --owner qubitquilt --repo boop --json | jq '.runs[-1]'
 ```
 
-Each row carries its telemetry inline (when recorded), so the cost +
-model shows up without a second call. Use `--json` to drill into the
-`telemetry` block.
+Each row carries its telemetry inline (when recorded). Use `--json`
+to drill into the `telemetry` block.
 
 ### `boop runs get <run-id>`
 
-Show a single run (id = the K8s Job name, e.g.
-`boop-qubitquilt-boop-42-a1b2c3d`) plus its telemetry.
-
-The receiver exposes `GET /api/runs` (paginated list) but no
-`GET /api/runs/{id}`. To honor that endpoint, the CLI lists with
-`limit=1000` and filters client-side. For very active receivers the
-`--cursor` pagination in `runs list` is the escape hatch.
+Show a single run by id (the K8s Job name, e.g.
+`boop-qubitquilt-boop-42-a1b2c3d`) plus its telemetry. Uses the
+dedicated `GET /api/runs/{id}` endpoint for a single-point lookup.
 
 ```sh
 boop runs get boop-qubitquilt-boop-42-a1b2c3d
@@ -174,7 +176,8 @@ Re-run a terminal run (QUB-110). This calls
 `POST /api/runs/{id}/rerun`, which mints a new K8s Job with a
 `-rN` suffix and backfills `parent_run_id` / `superseded_by_id`
 lineage. Requires the runner token and a `--reason` (free text,
-logged to the audit trail).
+logged to the audit trail). The POST is retried on transient
+5xx errors because the receiver de-dupes on run ID.
 
 Without `--yes`, the CLI fetches
 `GET /api/runs/{id}/rerun-preview`, renders the diff (prior run vs.
@@ -186,10 +189,10 @@ boop runs rerun boop-qubitquilt-boop-42-a1b2c3d --reason "retry after infra flap
 ```
 
 Status code mapping:
-- `404` → "run not found" (the Job was GC'd and the store row pruned)
-- `401` → unauthorized (runner token missing or wrong)
-- `409` → "not in a terminal state" (can't re-run an in-flight review)
-- `400` → echoes the receiver's body (e.g. "reason is required")
+- `404` -> "run not found" (the Job was GCd and the store row pruned)
+- `401` -> unauthorized (runner token missing or wrong)
+- `409` -> "not in a terminal state" (cannot re-run an in-flight review)
+- `400` -> echoes the receiver body (e.g. "reason is required")
 
 ### `boop stats`
 
@@ -200,7 +203,7 @@ Query params match `GET /api/stats`:
 |----------|---------------------------------|
 | `--from` | Inclusive RFC3339 lower bound   |
 | `--to`   | Inclusive RFC3339 upper bound   |
-| `--bucket`| `hour\|day\|week` (default day)|
+| `--bucket`| `hour|day|week` (default day)  |
 
 ```sh
 boop stats --from 2026-07-01T00:00:00Z
@@ -209,10 +212,10 @@ boop stats --bucket week --json
 
 ## Retries
 
-GET requests are retried (up to 3 times) on transient 5xx / connection
-errors with a short backoff. POST endpoints (`runs rerun`) are not
-retried — re-runs are operator-initiated and idempotency is the
-operator's concern.
+GET requests are retried (up to 3 times) on transient 5xx or
+connection errors with a short backoff. The rerun POST endpoint is
+also retried because the receiver de-dupes on run ID, making the
+request idempotent. Retry attempts are logged to stderr.
 
 ## Exit codes
 
@@ -230,15 +233,15 @@ that exit 1.
 ## Agent usage notes
 
 - `boop runs list --json | jq -r '.runs[] | select(.run.status=="failed") | .run.id'`
-  → feed into `boop runs get` or `boop runs rerun`.
+  -> feed into `boop runs get` or `boop runs rerun`.
 - The CLI is pure Go with no runtime dependencies beyond the stdlib;
   the distroless Docker image is ~12MB and works in any container
-  that can reach the receiver's `/api/*` endpoints.
+  that can reach the receiver `/api/*` endpoints.
 - For in-cluster use, set `BOOP_API_URL` to the
   `boop-receiver.dev-tools:8080` ClusterIP — no config file needed.
 
 ## Related
 
-- [receiver.md](./receiver.md) — the receiver's HTTP API + types
+- [receiver.md](./receiver.md) — the receiver HTTP API + types
 - [architecture.md](./architecture.md) — system flow
 - [webhook-contract.md](./webhook-contract.md) — events, dedup, status thread
