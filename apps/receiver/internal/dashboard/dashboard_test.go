@@ -706,3 +706,46 @@ func errorSink(err error) error {
 	}
 	return nil
 }
+
+// QUB-128: /dashboard/health must require X-Boop-Dashboard-Token.
+// The bug was that main.go registered /dashboard/health with a
+// bare HandleFunc, bypassing RegisterRoutes' middleware. The
+// fix wraps Health in Middleware(...). This test pins the wrap:
+// Health through Middleware rejects a missing token with 401.
+// The wire shape (handler + middleware) lives in main.go, not
+// in this package, so this test asserts the middleware shape
+// on its own — and trusts the main.go call site to apply it.
+func TestHealth_MiddlewareRejectsMissingToken(t *testing.T) {
+	d := newTestDashboard(t, nil)
+
+	// Health directly, no middleware: returns 200 if the
+	// store is healthy. This is the pre-fix shape.
+	req := httptest.NewRequest("GET", "/dashboard/health", nil)
+	rr := httptest.NewRecorder()
+	d.Health(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("direct Health: code = %d, want 200", rr.Code)
+	}
+
+	// Health through Middleware without a token: 401. This
+	// is the post-fix shape — the wrap in main.go applies
+	// the same middleware to /dashboard/health as to the
+	// rest of /dashboard/*.
+	wrapped := d.Middleware(http.HandlerFunc(d.Health))
+	req = httptest.NewRequest("GET", "/dashboard/health", nil)
+	rr = httptest.NewRecorder()
+	wrapped.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("Health through Middleware (no token): code = %d, want 401", rr.Code)
+	}
+
+	// Health through Middleware with the right token: 200.
+	wrapped = d.Middleware(http.HandlerFunc(d.Health))
+	req = httptest.NewRequest("GET", "/dashboard/health", nil)
+	req.Header.Set("X-Boop-Dashboard-Token", "test-dashboard-token")
+	rr = httptest.NewRecorder()
+	wrapped.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Errorf("Health through Middleware (with token): code = %d, want 200", rr.Code)
+	}
+}

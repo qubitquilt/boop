@@ -228,12 +228,89 @@ func TestRerun_RejectsEmptyConfirm(t *testing.T) {
 	seedTestRun(t, h, store.StatusFailed)
 
 	rr := httptest.NewRecorder()
+	// QUB-127: auth is checked before body validation.
+	// A request with no token gets 401, not 400. The
+	// existing test was written before the auth gate
+	// landed; the new behavior is what we want — an
+	// attacker probing the public surface sees a stable
+	// 401 regardless of payload shape, not a 400 that
+	// confirms the path is reachable.
 	req := httptest.NewRequest("POST", "/api/runs/boop-a-b-1-aaaaaaa/rerun", strings.NewReader(`{"reason":"x"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.SetPathValue("id", "boop-a-b-1-aaaaaaa")
 	h.Rerun(rr, req)
+	if rr.Code != 401 {
+		t.Errorf("status = %d, want 401 (no token)", rr.Code)
+	}
+}
+
+// QUB-127: with a valid token, the body-validation path
+// returns 400 for missing confirm. This is the original
+// CSRF defense the empty-confirm test was supposed to
+// pin; auth now gates it.
+func TestRerun_RejectsEmptyConfirm_WithToken(t *testing.T) {
+	h := newTestHandlerWithStoreAndKube(t)
+	seedTestRun(t, h, store.StatusFailed)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/runs/boop-a-b-1-aaaaaaa/rerun", strings.NewReader(`{"reason":"x"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BOOP-Runner-Token", "test-runner-token")
+	req.SetPathValue("id", "boop-a-b-1-aaaaaaa")
+	h.Rerun(rr, req)
 	if rr.Code != 400 {
 		t.Errorf("status = %d, want 400 (confirm required)", rr.Code)
+	}
+}
+
+// QUB-127: the rerun handler must check X-BOOP-Runner-Token
+// before any work. A POST without the token returns 401
+// without touching the K8s client or the store. The QUB-115
+// public surface would otherwise accept unauthenticated
+// requeues and mint Jobs with the runner image's secrets.
+func TestRerun_RejectsMissingToken(t *testing.T) {
+	h := newTestHandlerWithStoreAndKube(t)
+	seedTestRun(t, h, store.StatusFailed)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/runs/boop-a-b-1-aaaaaaa/rerun", strings.NewReader(`{"reason":"x","confirm":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.SetPathValue("id", "boop-a-b-1-aaaaaaa")
+	h.Rerun(rr, req)
+	if rr.Code != 401 {
+		t.Errorf("status = %d, want 401 (no token)", rr.Code)
+	}
+}
+
+func TestRerun_RejectsWrongToken(t *testing.T) {
+	h := newTestHandlerWithStoreAndKube(t)
+	seedTestRun(t, h, store.StatusFailed)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/runs/boop-a-b-1-aaaaaaa/rerun", strings.NewReader(`{"reason":"x","confirm":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BOOP-Runner-Token", "wrong")
+	req.SetPathValue("id", "boop-a-b-1-aaaaaaa")
+	h.Rerun(rr, req)
+	if rr.Code != 401 {
+		t.Errorf("status = %d, want 401 (wrong token)", rr.Code)
+	}
+}
+
+// QUB-127 happy path: with the right token + confirm + reason,
+// the rerun returns 202. Mirrors the production CLI path.
+func TestRerun_HappyPath(t *testing.T) {
+	h := newTestHandlerWithStoreAndKube(t)
+	seedTestRun(t, h, store.StatusFailed)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/runs/boop-a-b-1-aaaaaaa/rerun", strings.NewReader(`{"reason":"exception dock requeue","confirm":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BOOP-Runner-Token", "test-runner-token")
+	req.SetPathValue("id", "boop-a-b-1-aaaaaaa")
+	h.Rerun(rr, req)
+	if rr.Code != 202 {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 }
 
