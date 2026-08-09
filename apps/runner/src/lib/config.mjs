@@ -13,14 +13,21 @@
 
 // --- paths ---------------------------------------------------------------
 
-export const REPO_DIR = "/work/repo";
+// QUB-<next> Option A local-run support: production runs on a
+// K8s Job that mounts the cloned repo at /work/repo and the
+// runner-config ConfigMap at /home/opencode/.config/opencode.
+// Both paths are sealed on macOS workstations, so the runner
+// accepts BOOP_REPO_DIR / BOOP_CONFIG_SRC env overrides for
+// local dev. Defaults preserve the production contract.
+export const REPO_DIR = process.env.BOOP_REPO_DIR || "/work/repo";
 
 // Source of the read-only runner-config ConfigMap (boop-runner-config).
 // The runner reads skill files (SKILL.md + the seven lens files) from
 // this mount directly. QUB-98 dropped the opencode.json key from the
 // ConfigMap and the opencode CLI entirely; only the skill files mount
 // here now.
-export const CONFIG_SRC = "/home/opencode/.config/opencode";
+export const CONFIG_SRC =
+  process.env.BOOP_CONFIG_SRC || "/home/opencode/.config/opencode";
 
 export const NETRC_PATH = "/tmp/boop-netrc";
 export const GITCONFIG_PATH = "/tmp/boop-gitconfig";
