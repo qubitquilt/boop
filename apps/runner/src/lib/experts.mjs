@@ -211,7 +211,15 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
       `expert "${name}" has no lens file mapped; update LENS_TO_EXPERT in lib/experts.mjs`,
     );
   }
-  const lensPath = `${ctx.paths?.configSrc || "/home/opencode/.config/opencode"}/skills/boop/agents/${lensFile}.md`;
+  // Resolve the skill-mount path. The runner wires `paths.configSrc`
+  // through `deps` (see index.mjs); `ctx` does not carry `paths`.
+  // Reading from `deps` makes the BOOP_CONFIG_SRC env override
+  // take effect (latent bug: pre-fix this read `ctx.paths.configSrc`,
+  // which is always undefined, so the fallback fired — the bug
+  // stayed invisible because the fallback path matches the K8s
+  // production mount).
+  const configSrc = deps?.paths?.configSrc || "/home/opencode/.config/opencode";
+  const lensPath = `${configSrc}/skills/boop/agents/${lensFile}.md`;
   // 2. Apply test override (deps.expertOverrides wins over
   // EXPERT_POOL; both beat the default LLM call).
   const override = deps.expertOverrides?.[name];
