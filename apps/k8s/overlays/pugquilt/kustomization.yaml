@@ -23,7 +23,7 @@ resources:
 # change problem does not apply to it; it stays pinned to :stable.
 images:
   - name: ghcr.io/qubitquilt/boop-receiver
-    digest: sha256:37f778de85ab433bb2f0003bf0df2ca1b7b84fc349a3716c02d21bb0d6b47f2a
+    digest: sha256:b95af1c6a4efa2ca28f926697e4465f7bf329fe883db63cea9cec81ce8273e4e
 
 labels:
   - includeSelectors: false
