@@ -245,7 +245,17 @@ func main() {
 		os.Exit(1)
 	}
 	dash.RegisterRoutes(mux)
-	mux.HandleFunc("GET /dashboard/health", dash.Health)
+	// QUB-128: gate /dashboard/health behind the same
+	// BOOP_DASHBOARD_TOKEN middleware as the rest of
+	// /dashboard/*. The bare HandleFunc below bypasses
+	// RegisterRoutes' middleware (Go's ServeMux picks
+	// the more specific pattern), which means the
+	// public surface (QUB-115) can probe a path that
+	// the dashboard contract says is authenticated.
+	// The K8s liveness probe for the receiver is at
+	// /health (top level, registered above), so this
+	// change does not affect probe wiring.
+	mux.Handle("GET /dashboard/health", dash.Middleware(http.HandlerFunc(dash.Health)))
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,

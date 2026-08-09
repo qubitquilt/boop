@@ -149,6 +149,19 @@ type rerunRequest struct {
 // prior run's id via BOOP_PARENT_RUN_ID so it can reuse
 // the prior review's findings (Phase 4 follow-up).
 func (h *Handler) Rerun(w http.ResponseWriter, r *http.Request) {
+	// QUB-127: auth gate. Every other dashboard POST
+	// handler calls checkRunnerToken(r) before any work.
+	// The rerun handler skipped it, which meant an
+	// unauthenticated POST against the QUB-115 public
+	// surface created a real K8s Job with the runner
+	// image and the secrets that come with it. The
+	// check is constant-time compare on X-BOOP-Runner-Token
+	// against Config.RunnerToken — same pattern as
+	// RecordTelemetry / RecordStatus / RecordStage.
+	if !h.checkRunnerToken(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	if h.store == nil {
 		http.Error(w, "data layer disabled", http.StatusServiceUnavailable)
 		return
