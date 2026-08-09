@@ -30,7 +30,7 @@ import { OpenRouter, stepCountIs } from "@openrouter/agent";
 import { LENS_FILES, OPENCODE_TIMEOUT_MS } from "./config.mjs";
 import { assertSafeRef, shortSha } from "./security.mjs";
 import { lintReview, summarize } from "./ste-lint.mjs";
-import { buildAgentTools } from "./tools.mjs";
+import { buildAgentTools, toolsAvailable } from "./tools.mjs";
 
 // runOpenCodeSkill is the orchestrator over buildBoopPrompt + the
 // OpenRouter SDK call. Returns { summary, inlineComments, confidence }
@@ -748,12 +748,15 @@ export function stripOpenRouterPrefix(model) {
   return model.startsWith("openrouter/") ? model.slice("openrouter/".length) : model;
 }
 
-// isToolsEnabled centralizes the BOOP_TOOLS_ENABLED kill switch
-// check so call sites do not repeat the `ctx.toolsEnabled !== false`
-// pattern. Default `true` so a caller that forgets to set
-// ctx.toolsEnabled still gets the tool set; only an explicit
-// `false` disables. Used by buildBoopPrompt's "What you are
-// receiving" block to switch prompt language.
+// isToolsEnabled is the kill-switch half of the gate. buildBoopPrompt
+// and runOpenCodeSkill both need to know whether to advertise the
+// tool set to the model — they use toolsAvailable(ctx, deps) in
+// tools.mjs, which combines this flag with the deps-readiness
+// check. Calling toolsAvailable directly from the prompt builders
+// means the prompt and the factory read the same answer (a
+// future dep added to the factory shows up in the prompt without
+// a second edit). Exported so tests can pin the kill-switch
+// semantics in isolation.
 export function isToolsEnabled(ctx) {
   return ctx?.toolsEnabled !== false;
 }
@@ -1027,7 +1030,10 @@ export async function buildBoopPrompt(ctx, deps) {
     // Both variants share WHAT_YOU_ARE_RECEIVING_BULLETS + the
     // TEXT_NO_TOOLS_TRAILER; only the opening line and the
     // tool-set paragraph differ.
-    isToolsEnabled(ctx) === false
+    // toolsAvailable mirrors buildAgentTools's gate so the prompt
+    // and the factory read the same answer. A future dep added
+    // to the factory shows up here automatically.
+    !toolsAvailable(ctx, deps)
       ? [
           "## What you are receiving",
           "",
@@ -1155,7 +1161,7 @@ export async function buildBoopPrompt(ctx, deps) {
       "If you need to inspect a file, say what you would run; do not " +
       "pretend to run it.",
     "- Do not emit tool calls in your final text response. " +
-      toolCallsRule(isToolsEnabled(ctx)),
+      toolCallsRule(toolsAvailable(ctx, deps)),
     "- Do not emit raw error strings, build headers, or startup " +
       "output. If the model reports an error, the runner handles it; " +
       "you do not forward it.",

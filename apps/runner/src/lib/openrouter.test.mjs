@@ -1351,7 +1351,7 @@ test("buildBoopPrompt contains H5 instruction-hierarchy markers", async () => {
     [`${paths.configSrc}/skills/boop/agents/review-code-quality.md`]: "---\nfoo: bar\n---\nlens body\n",
   });
   const log = () => {};
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log, ...fastRetries });
 
   for (const marker of [
     "## SYSTEM INSTRUCTIONS (authoritative)",
@@ -1381,7 +1381,7 @@ test("buildBoopPrompt places SYSTEM INSTRUCTIONS before DATA", async () => {
   const fakeFs = makeFakeFs({
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   const systemIdx = prompt.indexOf("## SYSTEM INSTRUCTIONS (authoritative)");
   const dataIdx = prompt.indexOf("DATA (PR-controlled");
   assert.ok(systemIdx > -1, "missing SYSTEM INSTRUCTIONS");
@@ -1406,7 +1406,7 @@ test("buildBoopPrompt inlines lenses in the order they appear in LENS_FILES", as
     [`${paths.configSrc}/skills/boop/agents/review-test-quality.md`]: "MARKER-tq\n",
     [`${paths.configSrc}/skills/boop/agents/review-deep.md`]: "MARKER-dp-deep\n",
   });
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   const positions = [
     "MARKER-cq",
     "MARKER-dp", // first lens whose label starts with "review-design-pattern"
@@ -1432,7 +1432,7 @@ test("buildBoopPrompt uses PR_PREVIOUS_HEAD_SHA on re-reviews (reviewNumber > 1)
   });
   const prompt = await buildBoopPrompt(
     { ...baseCtx, reviewNumber: 3, previousHeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-    { fs: fakeFs, paths, log: () => {}, ...fastRetries },
+    { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries },
   );
   assert.match(prompt, /re-review #3/i);
   assert.match(prompt, /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\.\.\.0123456789abcdef0123456789abcdef01234567/);
@@ -1443,14 +1443,14 @@ test("buildBoopPrompt uses baseRef on first reviews", async () => {
   const fakeFs = makeFakeFs({
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill\n",
   });
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.match(prompt, /main\.\.\.0123456789abcdef0123456789abcdef01234567/);
   assert.match(prompt, /pr_base_ref: main/);
 });
 
 test("buildBoopPrompt tolerates missing SKILL.md (continues without)", async () => {
   const fakeFs = { readFile: async () => { throw new Error("ENOENT"); } };
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.match(prompt, /## SYSTEM INSTRUCTIONS/);
 });
 
@@ -1461,7 +1461,7 @@ test("buildBoopPrompt strips YAML frontmatter from skill and lenses", async () =
     [`${paths.configSrc}/skills/boop/agents/review-code-quality.md`]:
       "---\nname: cq\ndescription: y\n---\nlens body\n",
   });
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.doesNotMatch(prompt, /name: boop/);
   assert.doesNotMatch(prompt, /name: cq/);
   assert.match(prompt, /actual body/);
@@ -1548,6 +1548,7 @@ test("buildBoopPrompt falls back to fs.readFile when deps.rtk is absent", async 
   };
   const prompt = await buildBoopPrompt(baseCtx, {
     fs: countingFs,
+    execFile: () => {},
     paths,
     log: () => {},
     ...fastRetries,
@@ -1570,7 +1571,7 @@ test("buildBoopPrompt omits prior-run context when parentRunId is unset", async 
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
   const ctx = { ...baseCtx, parentRunId: null };
-  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.doesNotMatch(prompt, /Prior run context/);
   assert.doesNotMatch(prompt, /re-run of run/);
 });
@@ -1583,7 +1584,7 @@ test("buildBoopPrompt emits prior-run context when parentRunId is set", async ()
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
   const ctx = { ...baseCtx, parentRunId: "boop-a-b-1-aaaaaaa" };
-  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.match(prompt, /## Prior run context \(QUB-110\)/);
   assert.match(prompt, /re-run of run `boop-a-b-1-aaaaaaa`/);
   assert.match(prompt, /boop-inline: <path>:<line>:<body-hash>/);
@@ -1599,7 +1600,7 @@ test("buildBoopPrompt places prior-run context before DATA fence", async () => {
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
   const ctx = { ...baseCtx, parentRunId: "boop-a-b-1-aaaaaaa" };
-  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   const blockIdx = prompt.indexOf("## Prior run context (QUB-110)");
   const dataIdx = prompt.indexOf("DATA (PR-controlled");
   assert.ok(blockIdx > -1, "missing prior block");
@@ -1865,6 +1866,7 @@ test("buildBoopPrompt has a 'What you are receiving' section (QUB-130)", async (
   });
   const prompt = await buildBoopPrompt(baseCtx, {
     fs: fakeFs,
+    execFile: () => {},
     paths,
     log: () => {},
     ...fastRetries,
@@ -1899,7 +1901,7 @@ test("buildBoopPrompt keeps the no-tools variant when ctx.toolsEnabled === false
   });
   const prompt = await buildBoopPrompt(
     { ...baseCtx, toolsEnabled: false },
-    { fs: fakeFs, paths, log: () => {}, ...fastRetries },
+    { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries },
   );
   assert.match(prompt, /None of the inputs are tool calls/);
   assert.match(prompt, /There are no tools available/);
@@ -1925,11 +1927,12 @@ test("buildBoopPrompt's 'What you are receiving' block names the verification to
   // via read_file / git_diff (the prior contract said "you
   // cannot read the diff"). The block still pins that the
   // walkthrough + findings + lenses are TEXT.
-  const fakeFs = makeFakeFs({
+const fakeFs = makeFakeFs({
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
   const prompt = await buildBoopPrompt(baseCtx, {
     fs: fakeFs,
+    execFile: () => {},
     paths,
     log: () => {},
     ...fastRetries,
