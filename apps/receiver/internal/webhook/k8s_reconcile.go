@@ -124,6 +124,17 @@ func mapWaitingReason(reason string) string {
 // gain. A 30s poll is well below the operator's
 // "I clicked the dashboard and didn't see the OOM yet"
 // patience threshold.
+// orphanGraceSeconds is the floor at which a "running" row with
+// no heartbeat is considered orphaned by the reconciler. The
+// dashboard's admin endpoint uses 5 minutes for its
+// mark-orphaned bulk action; the reconciler needs a longer
+// grace to avoid racing with a healthy in-flight review (a
+// review can take 5-15 minutes to reach the first heartbeat on
+// a slow OpenRouter call). 1 hour matches the K8s Job's
+// TTLSecondsAfterFinished (jobbuilder.go:jobTTLSeconds = 3600),
+// so any run whose Job has been TTL'd out is a candidate.
+const orphanGraceSeconds = 3600
+
 func (h *Handler) StartJobReconciler(ctx context.Context, interval time.Duration) func() {
 	if h.store == nil || h.kube == nil {
 		return func() {}
@@ -134,7 +145,7 @@ func (h *Handler) StartJobReconciler(ctx context.Context, interval time.Duration
 	if interval < 5*time.Second {
 		interval = 5 * time.Second
 	}
-	h.logger.Info("job reconciler starting", "interval", interval)
+	h.logger.Info("job reconciler starting", "interval", interval, "orphan_grace_seconds", orphanGraceSeconds)
 	pollerCtx, cancel := context.WithCancel(ctx)
 	go func() {
 		t := time.NewTimer(15 * time.Second)
@@ -146,6 +157,24 @@ func (h *Handler) StartJobReconciler(ctx context.Context, interval time.Duration
 			case <-t.C:
 			}
 			tickCtx, tickCancel := context.WithTimeout(pollerCtx, 30*time.Second)
+			// QUB-135: a second pass that catches runs whose
+			// K8s Job has TTL'd out. reconcileJobsOnce only
+			// sees Jobs still in the namespace; once the Job
+			// is gone (TTL expired, GC'd, or never created
+			// because the receiver crashed), the run is
+			// orphaned. MarkOrphanedRuns queries the store
+			// directly and marks any "running" row with no
+			// heartbeat and older than the grace as failed
+			// with a synthetic "orphaned" reason. The grace
+			// (1h) matches jobTTLSeconds so a healthy review
+			// that just hasn't heartbeated yet is never
+			// caught.
+			n, err := h.store.MarkOrphanedRuns(tickCtx, orphanGraceSeconds*time.Second)
+			if err != nil {
+				h.logger.Warn("reconcile mark orphaned", "err", err)
+			} else if n > 0 {
+				h.logger.Info("reconciled orphaned runs", "count", n)
+			}
 			h.reconcileJobsOnce(tickCtx)
 			tickCancel()
 			t.Reset(interval)
