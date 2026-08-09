@@ -29,13 +29,35 @@ make docker-build  # ghcr.io/qubitquilt/boop-cli:latest
 Config resolves from three layers, lowest to highest precedence:
 
 1. Built-in default: `api_url` = `http://boop-receiver.dev-tools.svc.cluster.local:8080`
-   (the in-cluster service name).
+   (the in-cluster service name). For a tailnet or public
+   endpoint, set `BOOP_API_URL=https://boop.qubitquilt.dev`.
 2. `$XDG_CONFIG_HOME/boop/config.json` (falls back to
    `~/.config/boop/config.json`). Optional; materialized by
    `boop config write`.
 3. Environment variables: `BOOP_API_URL`, `BOOP_RUNNER_TOKEN`,
    `BOOP_DASHBOARD_TOKEN`. These always win. Empty env vars are
    no-ops (they do not blank a populated file).
+
+### Public surface (QUB-115)
+
+The receiver exposes `/api/*` and `/dashboard/*` on
+`https://boop.qubitquilt.dev` once the IngressRoute is wired
+(see `apps/k8s/overlays/pugquilt/ingressroute.yaml`).
+
+- **Read-only GETs** (`/api/runs`, `/api/runs/{id}`, `/api/stats`,
+  `/api/installations`, `/api/reviews`): rate-limited 60 req/min
+  per source IP. No token. The receiver returns 406 if the
+  `Accept` header is missing or doesn't include `application/json`.
+- **POST endpoints** (`/api/runs/{id}/telemetry`, `/status`,
+  `/stages`, `/heartbeat`, `/lens_telemetry`, `/rerun`):
+  rate-limited + 64 KB body cap. Require `X-BOOP-Runner-Token`.
+  Set `BOOP_RUNNER_TOKEN` to the same value as the receiver's
+  `RUNNER_TOKEN` (read it from `boop-secrets` in the cluster).
+- **Dashboard** (`/dashboard/*`): rate-limited 30 req/min per
+  source IP. Require `X-BOOP-Dashboard-Token` (or the
+  `BOOP_DASHBOARD_TOKEN` token passed as a bearer / cookie).
+- **Webhook** (`/webhook`): HMAC-only, no Ingress auth. GitHub
+  calls this; the receiver verifies `X-Hub-Signature-256`.
 
 Inspect the resolved config:
 
