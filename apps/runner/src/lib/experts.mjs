@@ -114,12 +114,12 @@ const EXPERT_TO_LENS = Object.fromEntries(
 // bullet per finding, no preamble.
 function buildExpertPrompt(name, ctx, deps, walkthrough) {
   const wt = walkthrough || "(walkthrough unavailable — read the diff directly)";
-  const toolsEnabled =
-    ctx.toolsEnabled !== false &&
-    deps &&
-    deps.paths?.repoDir &&
-    deps.execFile &&
-    deps.fs;
+  // buildAgentTools returns [] when ctx.toolsEnabled === false
+  // OR when deps are incomplete — pin both here so the prompt
+  // doesn't mention a tool set the expert can't actually call.
+  const depsReady =
+    deps && deps.paths?.repoDir && deps.execFile && deps.fs;
+  const toolsAvailable = ctx?.toolsEnabled !== false && depsReady;
   return [
     "# Task",
     "",
@@ -144,7 +144,7 @@ function buildExpertPrompt(name, ctx, deps, walkthrough) {
     "```",
     "",
     "Read the diff. Apply your lens checklist. Report findings as JSON.",
-    ...(toolsEnabled
+    ...(toolsAvailable
       ? [
           "",
           "# Tools available for verification",
@@ -266,13 +266,11 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   // findings; the design-pattern / readability experts can use
   // `read_file` / `git_diff` to ground line numbers. The walkthrough
   // stays tool-free (no tools passed in walkthrough.mjs).
-  // QUB-<next>: experts honor the BOOP_TOOLS_ENABLED kill switch
-  // the same way the narrator does. ctx.toolsEnabled === false
-  // means the operator flipped the env var off — we ship an empty
-  // tool array so the expert runs as a single-shot chat. The
-  // walkthrough stays single-shot regardless (it never had tools).
-  const toolsEnabled = ctx.toolsEnabled !== false;
-  const expertTools = toolsEnabled ? buildAgentTools(ctx, deps) : [];
+  // buildAgentTools centralizes the toolsEnabled check + the
+  // deps-completeness check, so we just call it. It returns []
+  // when ctx.toolsEnabled === false (BOOP_TOOLS_ENABLED=0) OR
+  // when deps are missing.
+  const expertTools = buildAgentTools(ctx, deps);
   let callResult;
   try {
     callResult = await callOpenRouter(userPrompt, {

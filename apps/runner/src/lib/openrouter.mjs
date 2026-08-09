@@ -67,9 +67,12 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
   // independently. `ctx.toolsEnabled` is the orchestrator's
   // explicit signal; the default `true` keeps the narrator
   // tool-armed even if a future caller forgets to set the flag.
+  // buildAgentTools centralizes the toolsEnabled + deps check,
+  // returning [] when ctx.toolsEnabled === false (kill switch
+  // via BOOP_TOOLS_ENABLED=0) or when deps are incomplete.
   // Resolved before the "starting" log so `toolCount` is non-null
   // on the first telemetry row.
-  const tools = ctx.toolsEnabled !== false ? buildAgentTools(ctx, deps) : [];
+  const tools = buildAgentTools(ctx, deps);
 
   deps.log("opencode", "starting", {
     dir: deps.paths.repoDir,
@@ -238,10 +241,9 @@ export async function callOpenRouter(prompt, deps = {}) {
   // The default callModel is the agent SDK's instance method bound
   // to the constructed client. Tests inject `deps.callModel` with
   // a fake that returns a ModelResult-shaped object whose
-  // getText/getResponse are mockable.
-  const defaultCallModel = (request, options) =>
-    client.callModel(request, options);
-  const callModelFn = injectedCallModel || defaultCallModel;
+  // getText/getResponse are mockable. Production just binds to
+  // client.callModel directly — no transformation layer needed.
+  const callModelFn = injectedCallModel || client.callModel.bind(client);
 
   const controller = new AbortControllerCtor();
   const timer = setTimeout(() => {
@@ -746,6 +748,66 @@ export function stripOpenRouterPrefix(model) {
   return model.startsWith("openrouter/") ? model.slice("openrouter/".length) : model;
 }
 
+// isToolsEnabled centralizes the BOOP_TOOLS_ENABLED kill switch
+// check so call sites do not repeat the `ctx.toolsEnabled !== false`
+// pattern. Default `true` so a caller that forgets to set
+// ctx.toolsEnabled still gets the tool set; only an explicit
+// `false` disables. Used by buildBoopPrompt's "What you are
+// receiving" block to switch prompt language.
+export function isToolsEnabled(ctx) {
+  return ctx?.toolsEnabled !== false;
+}
+
+// whatYouAreReceivingBullets: the shared input list (skill,
+// lenses, walkthrough, expert findings, PR metadata) used by
+// both the tools-enabled and tools-disabled prompt variants.
+// QUB-130 originally inlined this twice; the helper de-duplicates.
+const WHAT_YOU_ARE_RECEIVING_BULLETS = [
+  "- The boop skill (the orchestrator prompt below).",
+  "- The lenses (the per-expert checklists; inline below as `## Lenses`).",
+  "- The walkthrough (a human-readable summary of the PR; " +
+    "inline below as `## Walkthrough` in the multi-expert path).",
+  "- The expert findings (a list of structured observations; " +
+    "inline below as `## Expert findings` in the multi-expert path).",
+  "- The PR-controlled metadata (the YAML block at the bottom of the prompt).",
+];
+
+// TEXT_NO_TOOLS_TRAILER: the common closing line for both
+// variants — walkthrough/findings/lenses are TEXT, not tool calls.
+const TEXT_NO_TOOLS_TRAILER =
+  "The walkthrough, findings, and lens files are TEXT in this prompt. " +
+  "They are not tool calls, not tool results, not function calls. " +
+  "You cannot call them. You only read them. ";
+
+// toolCallsRule: the "Do not emit tool calls" rule. Two
+// variants keyed on the tools-enabled flag. Factored out so the
+// rules block doesn't duplicate the no-tools / agent-SDK wording.
+function toolCallsRule(enabled) {
+  if (!enabled) {
+    return (
+      "This completion has no tools enabled — you cannot run " +
+      "commands, read files, or call any function. Do not emit " +
+      "`<tool_use>`, `<tool_call>`, `<toolcall>`, `[TOOL_CALL]`, " +
+      "or JSON with `name`/`function` and `arguments` fields. The " +
+      "runner rejects those shapes as a hard parse failure; a tool " +
+      "call in the output is a wasted run. If you need more context, " +
+      "say what you would want to see — do not pretend to call a " +
+      "tool to get it."
+    );
+  }
+  return (
+    "The agent SDK handles tool calls natively; you don't write " +
+    "them as text. If you need to run a command or read a file, " +
+    "just do it — the SDK runs the tool and returns the result. " +
+    "Your final text response must still end with the structured " +
+    "block (SUMMARY / INLINE COMMENTS / CONFIDENCE / END). Do " +
+    "NOT put raw `<tool_use>`, `<tool_call>`, `<toolcall>`, " +
+    "`[TOOL_CALL]`, or `{\"name\":...,\"arguments\":...}` JSON " +
+    "in your final text — the runner parses that as a malformed " +
+    "review and posts nothing."
+  );
+}
+
 /**
  * buildBoopPrompt reads the boop skill (SKILL.md + every
  * agents/review-*.md) directly from the read-only ConfigMap mount
@@ -961,7 +1023,11 @@ export async function buildBoopPrompt(ctx, deps) {
     //     e.g. tests that want the legacy no-tool prompt): keeps
     //     the QUB-130 "no tools available" wording verbatim so
     //     existing test fixtures pin the contract.
-    ctx.toolsEnabled === false
+    //
+    // Both variants share WHAT_YOU_ARE_RECEIVING_BULLETS + the
+    // TEXT_NO_TOOLS_TRAILER; only the opening line and the
+    // tool-set paragraph differ.
+    isToolsEnabled(ctx) === false
       ? [
           "## What you are receiving",
           "",
@@ -969,17 +1035,10 @@ export async function buildBoopPrompt(ctx, deps) {
             "every piece of context you need to produce the review. " +
             "None of the inputs are tool calls — they are TEXT in this prompt:",
           "",
-          "- The boop skill (the orchestrator prompt below).",
-          "- The lenses (the per-expert checklists; inline below as `## Lenses`).",
-          "- The walkthrough (a human-readable summary of the PR; " +
-            "inline below as `## Walkthrough` in the multi-expert path).",
-          "- The expert findings (a list of structured observations; " +
-            "inline below as `## Expert findings` in the multi-expert path).",
-          "- The PR-controlled metadata (the YAML block at the bottom of the prompt).",
+          ...WHAT_YOU_ARE_RECEIVING_BULLETS,
           "",
-          "The walkthrough, findings, and lens files are TEXT in this prompt. " +
-            "They are not tool calls, not tool results, not function calls. " +
-            "You cannot call them. You only read them. There are no tools available — " +
+          TEXT_NO_TOOLS_TRAILER +
+            "There are no tools available — " +
             "do not emit `<tool_use>`, `<tool_call>`, `<toolcall>`, `[TOOL_CALL]`, or " +
             "JSON with `name`/`function` and `arguments` fields.",
           "",
@@ -999,23 +1058,16 @@ export async function buildBoopPrompt(ctx, deps) {
             "every piece of context you need to produce the review. " +
             "Most of the inputs are TEXT in this prompt (not tool calls):",
           "",
-          "- The boop skill (the orchestrator prompt below).",
-          "- The lenses (the per-expert checklists; inline below as `## Lenses`).",
-          "- The walkthrough (a human-readable summary of the PR; " +
-            "inline below as `## Walkthrough` in the multi-expert path).",
-          "- The expert findings (a list of structured observations; " +
-            "inline below as `## Expert findings` in the multi-expert path).",
-          "- The PR-controlled metadata (the YAML block at the bottom of the prompt).",
+          ...WHAT_YOU_ARE_RECEIVING_BULLETS,
           "",
-          "You have a small agent tool set available for verification: " +
+          TEXT_NO_TOOLS_TRAILER +
+            "You have a small agent tool set available for verification: " +
             "`run_command` (run a shell command in the PR's working directory, with a " +
             "timeout and an output cap — useful for running the PR's test suite), " +
             "`read_file` (read a file inside the repo), and `git_diff` (run `git diff " +
             "<range>` for a path). The tool guard rejects network primitives (curl, " +
             "wget, nc, ...) and references to the runner's secret mounts, so do not " +
-            "ask for those. The walkthrough, findings, and lens files are TEXT in " +
-            "this prompt — they are not tools, not tool results, not function calls. " +
-            "You only read them. Do not emit raw `<tool_use>`, `<tool_call>`, " +
+            "ask for those. Do not emit raw `<tool_use>`, `<tool_call>`, " +
             "`<toolcall>`, or `[TOOL_CALL]` blocks in your final response; the runner " +
             "rejects those shapes as a hard parse failure.",
           "",
@@ -1103,24 +1155,7 @@ export async function buildBoopPrompt(ctx, deps) {
       "If you need to inspect a file, say what you would run; do not " +
       "pretend to run it.",
     "- Do not emit tool calls in your final text response. " +
-      (ctx.toolsEnabled === false
-        ? "This completion has no tools enabled — you cannot run " +
-          "commands, read files, or call any function. Do not emit " +
-          "`<tool_use>`, `<tool_call>`, `<toolcall>`, `[TOOL_CALL]`, " +
-          "or JSON with `name`/`function` and `arguments` fields. The " +
-          "runner rejects those shapes as a hard parse failure; a tool " +
-          "call in the output is a wasted run. If you need more context, " +
-          "say what you would want to see — do not pretend to call a " +
-          "tool to get it."
-        : "The agent SDK handles tool calls natively; you don't write " +
-          "them as text. If you need to run a command or read a file, " +
-          "just do it — the SDK runs the tool and returns the result. " +
-          "Your final text response must still end with the structured " +
-          "block (SUMMARY / INLINE COMMENTS / CONFIDENCE / END). Do " +
-          "NOT put raw `<tool_use>`, `<tool_call>`, `<toolcall>`, " +
-          "`[TOOL_CALL]`, or `{\"name\":...,\"arguments\":...}` JSON " +
-          "in your final text — the runner parses that as a malformed " +
-          "review and posts nothing."),
+      toolCallsRule(isToolsEnabled(ctx)),
     "- Do not emit raw error strings, build headers, or startup " +
       "output. If the model reports an error, the runner handles it; " +
       "you do not forward it.",

@@ -8,6 +8,7 @@ import {
   callOpenRouter,
   emptyTelemetry,
   extractUsage,
+  isToolsEnabled,
   runOpenCodeSkill,
   parseReviewOutput,
   buildBoopPrompt,
@@ -1904,6 +1905,21 @@ test("buildBoopPrompt keeps the no-tools variant when ctx.toolsEnabled === false
   assert.match(prompt, /There are no tools available/);
 });
 
+// isToolsEnabled: centralizes the BOOP_TOOLS_ENABLED kill switch.
+// buildAgentTools in tools.mjs and runOpenCodeSkill in
+// openrouter.mjs both consume this so the kill switch takes
+// effect at every site. The test pins the three states: explicit
+// true, explicit false, and unset (default true).
+test("isToolsEnabled honors ctx.toolsEnabled and defaults to true", () => {
+  assert.equal(isToolsEnabled({ toolsEnabled: false }), false);
+  assert.equal(isToolsEnabled({ toolsEnabled: true }), true);
+  assert.equal(isToolsEnabled({}), true);
+  assert.equal(isToolsEnabled(undefined), true);
+  assert.equal(isToolsEnabled(null), true);
+  // Defensive: any non-false value (including truthy strings) is treated as enabled.
+  assert.equal(isToolsEnabled({ toolsEnabled: "0" }), true);
+});
+
 test("buildBoopPrompt's 'What you are receiving' block names the verification tools (QUB-<next>)", async () => {
   // The QUB-<next variant tells the model it CAN read the diff
   // via read_file / git_diff (the prior contract said "you
@@ -1923,7 +1939,7 @@ test("buildBoopPrompt's 'What you are receiving' block names the verification to
     prompt,
     /walkthrough, findings, and lens files are TEXT in this prompt/,
   );
-  assert.match(prompt, /they are not tools, not tool results, not function calls/);
+  assert.match(prompt, /they are not tool calls, not tool results, not function calls/i);
 });
 
 test("buildBoopPrompt places 'What you are receiving' before DATA fence (QUB-130)", async () => {

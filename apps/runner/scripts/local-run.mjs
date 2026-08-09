@@ -177,8 +177,9 @@ await run(env, {
   cloneRepo: async (ctx, deps) => {
     await deps.postStatus("clone");
   },
-  // Stage retries off so a failed stage doesn't loop us through
-  // backoff during a smoke run.
-  stageMaxAttempts: 1,
+  // Allow a couple of retries on transient stages (e.g. an
+  // expert's tool loop hitting the 90s budget on a slow model).
+  // Production uses the QUB-91 default of 3 attempts.
+  stageMaxAttempts: 3,
   sleep: async () => {},
 });

@@ -30,6 +30,7 @@ import {
   _INTERNAL,
   RUN_COMMAND_TIMEOUT_MS,
   RUN_COMMAND_OUTPUT_CAP_BYTES,
+  RUN_COMMAND_MAX_CHARS,
   READ_FILE_CAP_BYTES,
   GIT_DIFF_TIMEOUT_MS,
   GIT_DIFF_OUTPUT_CAP_BYTES,
@@ -54,7 +55,7 @@ test("assertSafeCommand rejects empty / non-string input", () => {
 });
 
 test("assertSafeCommand rejects commands longer than 4096 chars", () => {
-  const cmd = "echo " + "a".repeat(4097);
+  const cmd = "echo " + "a".repeat(RUN_COMMAND_MAX_CHARS + 1);
   assert.throws(() => assertSafeCommand(cmd), /exceeds 4096/);
 });
 
@@ -633,4 +634,5 @@ test("caps are exported so operators can tune the budgets", () => {
   assert.equal(typeof GIT_DIFF_OUTPUT_CAP_BYTES, "number");
   assert.ok(RUN_COMMAND_TIMEOUT_MS > 0);
   assert.ok(READ_FILE_CAP_BYTES > 0);
+  assert.ok(RUN_COMMAND_MAX_CHARS > 0);
 });

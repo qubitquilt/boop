@@ -68,6 +68,12 @@ export const GIT_DIFF_OUTPUT_CAP_BYTES = 50_000;
 // keeps `curl` from matching inside `--no-curl` flag names; the
 // inline-exec forms are matched as substrings because they don't
 // have a clean token boundary.
+
+// Per-command character cap. Bounds the worst-case prompt that a
+// long command produces; commands longer than this are rejected
+// before tokenization so the runner can't be tricked into a
+// regex-DoS on a 100KB string.
+export const RUN_COMMAND_MAX_CHARS = 4096;
 const NETWORK_TOKENS = [
   "curl",
   "wget",
@@ -152,8 +158,10 @@ function assertSafeCommand(cmd) {
   if (typeof cmd !== "string" || cmd.length === 0) {
     throw new Error("run_command: command is required");
   }
-  if (cmd.length > 4096) {
-    throw new Error("run_command: command exceeds 4096 chars");
+  if (cmd.length > RUN_COMMAND_MAX_CHARS) {
+    throw new Error(
+      `run_command: command exceeds ${RUN_COMMAND_MAX_CHARS} chars`,
+    );
   }
   const tokens = tokenizeForGuard(cmd);
   const lower = cmd.toLowerCase();
@@ -163,14 +171,16 @@ function assertSafeCommand(cmd) {
       throw new Error(`run_command: blocked network primitive '${blockedNetwork}'`);
     }
     const l = t.toLowerCase();
-    // The secret-token check matches as a substring on the
-    // token (not whole-token) because secret references
-    // commonly appear inside a token like `--secret=/secrets/...`
-    // or `cat /secrets/github-app-private-key`. We still want
-    // a flag like `--no-secrets` to slip through (the substring
-    // check rejects it, so the prompt hierarchy stays the
-    // primary control — the runner rejects anything that
-    // *mentions* /secrets in any token).
+    // The secret-token check matches as a case-insensitive
+    // substring on each token. Secret references commonly appear
+    // inside a single token like `--secret=/secrets/...` or
+    // `cat /secrets/github-app-private-key`. The match is anchored
+    // on the literal string (e.g. `/secrets` requires the leading
+    // slash), so a flag like `--no-secrets` slips through — it
+    // contains "secrets" but not "/secrets". The prompt hierarchy
+    // stays the primary control; the guard is the belt-and-suspenders
+    // catch for any token that *explicitly mentions* the runner's
+    // secret mount or key names.
     if (SECRET_TOKENS.some((s) => l.includes(s.toLowerCase()))) {
       throw new Error(`run_command: blocked secret reference '${t}'`);
     }
@@ -360,18 +370,33 @@ async function runGitDiff(execFile, repoDir, range, p, caps) {
 //   - caps:            optional override map for the per-tool
 //                      budgets (used by tests)
 //
-// Returns an empty array when any required dep is missing — callers
-// that want tools must wire the deps explicitly. The walkthrough
-// (no tools) just doesn't call this; experts + narrator pass the
-// result to callModel.
+// Returns an empty array when tools are disabled via
+// ctx.toolsEnabled === false (BOOP_TOOLS_ENABLED=0) OR when any
+// required dep is missing — callers that want tools must wire the
+// deps explicitly. The walkthrough (no tools) just doesn't call
+// this; experts + narrator pass the result to callModel.
+//
+// Centralising the gate in buildAgentTools means call sites do
+// not repeat the `ctx.toolsEnabled !== false` check (pre-fix
+// the experts path forgot the check, so BOOP_TOOLS_ENABLED=0
+// disabled only the narrator — caught by the PR #191 review).
 export function buildAgentTools(ctx, deps) {
+  if (ctx?.toolsEnabled === false) {
+    return [];
+  }
   if (!deps || !deps.paths?.repoDir || !deps.execFile || !deps.fs) {
     return [];
   }
   const repoDir = deps.paths.repoDir;
   const execFile = deps.execFile;
   const fs = deps.fs;
-  const range = ctx?.diffRange || deps.diffRange;
+  // diffRange precedence: ctx wins over deps. ctx is the runner's
+  // validated review range (assertSafeRef'd at loadConfig time);
+  // deps.diffRange is an optional fallback for callers that
+  // build the tool set without a full ctx. Explicit precedence so
+  // a future caller reading this code doesn't have to guess
+  // which source wins when both are set.
+  const range = ctx?.diffRange ?? deps.diffRange;
   const caps = {
     runCommand: {
       timeoutMs:
