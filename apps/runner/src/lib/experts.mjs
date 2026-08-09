@@ -32,7 +32,7 @@
 // across retries), so re-attempts are safe.
 
 import { emptyTelemetry, stripOpenRouterPrefix } from "./openrouter.mjs";
-import { buildAgentTools } from "./tools.mjs";
+import { buildAgentTools, toolsAvailable } from "./tools.mjs";
 
 // pickExperts is the orchestrator. Maps a PR type to a
 // list of expert names. The default mapping is a starting
@@ -114,12 +114,12 @@ const EXPERT_TO_LENS = Object.fromEntries(
 // bullet per finding, no preamble.
 function buildExpertPrompt(name, ctx, deps, walkthrough) {
   const wt = walkthrough || "(walkthrough unavailable — read the diff directly)";
-  // buildAgentTools returns [] when ctx.toolsEnabled === false
-  // OR when deps are incomplete — pin both here so the prompt
-  // doesn't mention a tool set the expert can't actually call.
-  const depsReady =
-    deps && deps.paths?.repoDir && deps.execFile && deps.fs;
-  const toolsAvailable = ctx?.toolsEnabled !== false && depsReady;
+  // toolsAvailable is the single source of truth for "should
+  // this prompt mention the tool set?". It mirrors
+  // buildAgentTools's gate (BOOP_TOOLS_ENABLED + deps readiness),
+  // so a future dep added to the factory shows up here
+  // automatically and the prompt + factory stay in lockstep.
+  const toolsOn = toolsAvailable(ctx, deps);
   return [
     "# Task",
     "",
@@ -144,7 +144,7 @@ function buildExpertPrompt(name, ctx, deps, walkthrough) {
     "```",
     "",
     "Read the diff. Apply your lens checklist. Report findings as JSON.",
-    ...(toolsAvailable
+    ...(toolsOn
       ? [
           "",
           "# Tools available for verification",

@@ -27,6 +27,7 @@ import assert from "node:assert/strict";
 
 import {
   buildAgentTools,
+  toolsAvailable,
   _INTERNAL,
   RUN_COMMAND_TIMEOUT_MS,
   RUN_COMMAND_OUTPUT_CAP_BYTES,
@@ -559,6 +560,40 @@ test("buildAgentTools returns [] when deps is missing fs", () => {
 
 test("buildAgentTools returns [] when deps is undefined", () => {
   assert.deepEqual(buildAgentTools({}, undefined), []);
+});
+
+// toolsAvailable mirrors buildAgentTools's gate so prompt
+// builders can render the right "Tools available" section
+// without duplicating the same checks. The test pins the four
+// states: explicit false, no ctx, complete deps, incomplete deps.
+test("toolsAvailable mirrors the buildAgentTools gate", () => {
+  // Kill switch: toolsEnabled === false always disables,
+  // even when deps are complete.
+  assert.equal(
+    toolsAvailable({ toolsEnabled: false }, {
+      paths: { repoDir: "/work/repo" },
+      execFile: () => {},
+      fs: {},
+    }),
+    false,
+  );
+  // No ctx / no deps → no tools.
+  assert.equal(toolsAvailable({}, {}), false);
+  assert.equal(toolsAvailable(undefined, undefined), false);
+  assert.equal(toolsAvailable(null, {}), false);
+  // Complete deps → tools.
+  assert.equal(
+    toolsAvailable(
+      {},
+      { paths: { repoDir: "/work/repo" }, execFile: () => {}, fs: {} },
+    ),
+    true,
+  );
+  // Incomplete deps → no tools, even when ctx.toolsEnabled is true.
+  assert.equal(
+    toolsAvailable({ toolsEnabled: true }, { paths: { repoDir: "/work/repo" } }),
+    false,
+  );
 });
 
 test("buildAgentTools returns three tools when deps is complete", () => {

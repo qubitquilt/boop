@@ -380,11 +380,21 @@ async function runGitDiff(execFile, repoDir, range, p, caps) {
 // not repeat the `ctx.toolsEnabled !== false` check (pre-fix
 // the experts path forgot the check, so BOOP_TOOLS_ENABLED=0
 // disabled only the narrator — caught by the PR #191 review).
+//
+// toolsAvailable returns the boolean the gate decision so
+// prompt builders (experts.mjs) can render the right "Tools
+// available" section without duplicating the same checks. The
+// prompt and the factory read the same answer — a future dep
+// added here shows up automatically.
+export function toolsAvailable(ctx, deps) {
+  if (ctx?.toolsEnabled === false) return false;
+  return Boolean(
+    deps && deps.paths?.repoDir && deps.execFile && deps.fs,
+  );
+}
+
 export function buildAgentTools(ctx, deps) {
-  if (ctx?.toolsEnabled === false) {
-    return [];
-  }
-  if (!deps || !deps.paths?.repoDir || !deps.execFile || !deps.fs) {
+  if (!toolsAvailable(ctx, deps)) {
     return [];
   }
   const repoDir = deps.paths.repoDir;
