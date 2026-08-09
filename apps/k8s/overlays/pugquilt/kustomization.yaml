@@ -7,6 +7,7 @@ namespace: dev-tools
 resources:
   - ../../base
   - ingressroute.yaml
+  - middlewares.yaml
 
 # Pin the receiver image to a digest. The sync-image-digests workflow
 # updates this whenever a new image is pushed, so the deployed

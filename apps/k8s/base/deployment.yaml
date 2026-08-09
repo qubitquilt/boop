@@ -199,6 +199,17 @@ spec:
                   name: boop-secrets
                   key: RUNNER_TOKEN
                   optional: true
+            # QUB-115: public URL the receiver advertises at
+            # startup. Unset = in-cluster only (port-forward).
+            # The Tailscale node IP / public DNS goes here when
+            # the IngressRoute is wired. The value is logged
+            # at startup so an operator can confirm the
+            # surface from `kubectl logs deploy/boop-receiver`
+            # without curling /api/runs. The receiver does not
+            # validate the URL — the operator is responsible
+            # for the value.
+            - name: PUBLIC_API_URL
+              value: "https://boop.qubitquilt.dev"
             # QUB-106: model id forwarded to every runner
             # Job as OPENROUTER_MODEL. The receiver's
             # main.go reads this and puts it on every

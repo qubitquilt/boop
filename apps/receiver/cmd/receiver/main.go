@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +19,48 @@ import (
 	boopgithub "github.com/michaelruelas/boop-receiver/internal/github"
 	"github.com/michaelruelas/boop-receiver/internal/webhook"
 )
+
+// acceptsJSON reports whether the Accept header is
+// missing, is `*/*`, or contains `application/json` or
+// `application/*`. The two permissive cases (missing
+// header, `*/*`) match curl's default behavior: a client
+// that does not pick a content type is implicitly
+// consenting to anything, and JSON is the only thing on
+// offer. A browser that hits the URL with `Accept:
+// text/html,...` is rejected with 406, which is the
+// right answer for an API that has no HTML surface to
+// render. The CLI and any tailnet agent that sets
+// `Accept: application/json` pass.
+func acceptsJSON(accept string) bool {
+	if accept == "" || accept == "*/*" {
+		return true
+	}
+	for _, part := range strings.Split(accept, ",") {
+		mediaType := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		if mediaType == "application/json" || mediaType == "application/*" {
+			return true
+		}
+	}
+	return false
+}
+
+// enforceJSONAccept wraps a handler so a GET request
+// without an Accept header that includes application/json
+// is rejected with 406. POSTs pass through unchanged
+// (the body shape is a request contract, not a response
+// shape). The /webhook and /health routes are not gated
+// — the former because GitHub does not send Accept, the
+// latter because cluster probers usually omit it.
+func enforceJSONAccept(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && !acceptsJSON(r.Header.Get("Accept")) {
+			w.Header().Set("Accept", "application/json")
+			http.Error(w, "Accept: application/json required", http.StatusNotAcceptable)
+			return
+		}
+		next(w, r)
+	}
+}
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -118,15 +161,37 @@ func main() {
 	} else {
 		logger.Info("OPENROUTER_MODEL", "value", cfg.OpenRouterModel)
 	}
+	// QUB-115: log the public surface so an operator can
+	// confirm the Ingress is wired correctly without
+	// `curl /api/runs` from a tailnet node. The URL comes
+	// from PUBLIC_API_URL on the receiver Deployment; if
+	// unset we fall back to the in-cluster address (no
+	// public exposure). The receiver does not validate the
+	// URL — the operator is responsible for the value.
+	if publicURL := os.Getenv("PUBLIC_API_URL"); publicURL != "" {
+		logger.Info("public api", "url", publicURL)
+	} else {
+		logger.Info("public api", "url", "(unset — /api/* and /dashboard/* are in-cluster only; reach them via port-forward)")
+	}
 
+	// QUB-115: wrap the public API surface in a small
+	// middleware that enforces `Accept: application/json`
+	// on GETs. The CLI and a tailnet agent both send the
+	// header by default; a browser that hits the URL
+	// directly does not, and a 406 keeps the contract
+	// explicit. The /webhook path is GitHub's HMAC; we do
+	// not gate the webhook on Accept (GitHub does not send
+	// it). The /health path is internal liveness; it also
+	// does not require Accept (cluster probers usually omit
+	// it).
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", h.HandleWebhook)
 	mux.HandleFunc("GET /health", h.Health)
-	mux.HandleFunc("GET /api/reviews", h.ListReviews)
-	mux.HandleFunc("GET /api/installations", h.ListInstallations)
-	mux.HandleFunc("GET /api/runs", h.ListRuns)
-	mux.HandleFunc("GET /api/runs/{id}", h.GetRun)
-	mux.HandleFunc("GET /api/stats", h.Stats)
+	mux.HandleFunc("GET /api/reviews", enforceJSONAccept(h.ListReviews))
+	mux.HandleFunc("GET /api/installations", enforceJSONAccept(h.ListInstallations))
+	mux.HandleFunc("GET /api/runs", enforceJSONAccept(h.ListRuns))
+	mux.HandleFunc("GET /api/runs/{id}", enforceJSONAccept(h.GetRun))
+	mux.HandleFunc("GET /api/stats", enforceJSONAccept(h.Stats))
 	mux.HandleFunc("POST /api/runs/{id}/telemetry", h.RecordTelemetry)
 	mux.HandleFunc("POST /api/runs/{id}/status", h.RecordStatus)
 	// QUB-109: runner instrumentation. Stage POSTs (the

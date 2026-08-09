@@ -1,3 +1,34 @@
+# QUB-115: public API surface for the boop CLI and a tailnet
+# AI agent. The receiver was previously in-cluster only
+# (port-forward / VPN); the CLI on a tailnet node, or an
+# agent running alongside the developer, could not reach
+# /api/* or /dashboard/* without a tunnel.
+#
+# Three surfaces, three middleware chains:
+#
+# 1. /webhook  — GitHub HMAC-authed, no Ingress auth needed.
+#                Stays open. Existing rule.
+# 2. /api/*    — read-only GETs are unauthenticated at the
+#                receiver layer (they leak Job metadata only
+#                — review_number, model, token counts). The
+#                CLI hits them in a steady loop. Rate limit
+#                is the protection.
+#                POSTs require X-BOOP-Runner-Token; the
+#                receiver already enforces it on the
+#                handler. The Ingress forwards the header
+#                (Traefik passes custom headers through by
+#                default). Body size cap protects against
+#                oversize requests.
+# 3. /dashboard/* — shared-secret gate (BOOP_DASHBOARD_TOKEN)
+#                enforced by the receiver. Per-user identity
+#                (Cloudflare Access / OAuth) is a follow-up
+#                ticket; the shared token is the bootstrap.
+#
+# Method-based routing splits GETs from POSTs so the body
+# cap applies only where a body exists. The webhook path
+# gets neither cap (GitHub's payload is the largest legiti-
+# mate body in the system and a different size policy lives
+# there).
 ---
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
@@ -8,9 +39,44 @@ spec:
   entryPoints:
     - websecure
   routes:
+    # GitHub webhook: HMAC-authed by the receiver, stays open
     - kind: Rule
       match: Host(`boop.qubitquilt.dev`) && PathPrefix(`/webhook`)
       services:
         - name: boop-receiver
           port: http
+
+    # Read-only public API: rate limit only, no body cap
+    - kind: Rule
+      match: (Host(`boop.qubitquilt.dev`) || Host(`api.boop.qubitquilt.dev`)) && PathPrefix(`/api/`) && Method(`GET`)
+      middlewares:
+        - name: rate-limit-api
+      services:
+        - name: boop-receiver
+          port: http
+
+    # Write API: rate limit + 64 KB body cap. Token is
+    # enforced at the receiver handler (X-BOOP-Runner-Token
+    # check). The Ingress forwards the header.
+    - kind: Rule
+      match: (Host(`boop.qubitquilt.dev`) || Host(`api.boop.qubitquilt.dev`)) && PathPrefix(`/api/`)
+      middlewares:
+        - name: rate-limit-api
+        - name: body-limit
+      services:
+        - name: boop-receiver
+          port: http
+
+    # Dashboard: rate limit + body cap. Shared-secret
+    # auth at the receiver (BOOP_DASHBOARD_TOKEN). Per-user
+    # identity is a follow-up.
+    - kind: Rule
+      match: Host(`boop.qubitquilt.dev`) && PathPrefix(`/dashboard/`)
+      middlewares:
+        - name: rate-limit-dashboard
+        - name: body-limit
+      services:
+        - name: boop-receiver
+          port: http
+
   tls: {}
