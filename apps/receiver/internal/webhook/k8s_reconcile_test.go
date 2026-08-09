@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -176,6 +177,106 @@ func TestReconcileJobsOnce_LeavesRunnerFinalisedRowsAlone(t *testing.T) {
 	}
 	if got.Error != "runner said done" {
 		t.Errorf("error overwritten: %q", got.Error)
+	}
+}
+
+// QUB-135: StartJobReconciler now also calls MarkOrphanedRuns
+// on each tick to catch runs whose K8s Job has TTL'd out (or
+// was never created). The reconciler loop itself is a
+// goroutine and not directly testable here, but the
+// MarkOrphanedRuns branch is exercised by the store tests in
+// store_test.go; this test pins the integration: a "running"
+// row older than the orphan grace (1h, matching the K8s Job
+// TTL) with no heartbeat must be marked failed with the
+// synthetic orphan reason, even when the K8s Job is gone
+// from the namespace.
+func TestReconcileJobsOnce_OrphanJobGoneFromNamespace(t *testing.T) {
+	ctx := context.Background()
+
+	st := openTestStore(t)
+	runID := "boop-a-b-1-aaaaaaa"
+	if _, err := st.UpsertRun(ctx, store.Run{
+		ID:        runID,
+		Owner:     "a",
+		Repo:      "b",
+		PRNumber:  1,
+		CommitSHA: "aaaaaaa",
+		BaseRef:   "main",
+		Status:    store.StatusRunning,
+		// Older than the orphan grace. The K8s Job that
+		// created this row TTL'd out 1h after completion;
+		// it is no longer in the namespace. Use real
+		// time so the cutoff (now - 1h) lands where
+		// MarkOrphanedRuns's `time.Now()` will compare
+		// against.
+		StartedAt: time.Now().Add(-2 * time.Hour),
+	}); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+
+	// No K8s Job seeded (the fake clientset has no Jobs).
+	// The reconciler's per-Job pass has nothing to do.
+	h := newReconcileTestHandler(t, st)
+
+	// The new branch: call MarkOrphanedRuns directly. The
+	// reconciler loop now does this on every tick.
+	n, err := h.store.MarkOrphanedRuns(ctx, orphanGraceSeconds*time.Second)
+	if err != nil {
+		t.Fatalf("mark orphaned: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("marked = %d, want 1", n)
+	}
+
+	got, err := st.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.Status != store.StatusFailed {
+		t.Errorf("status = %q, want failed", got.Status)
+	}
+	if !strings.Contains(got.Error, "orphaned") {
+		t.Errorf("error = %q, want to contain 'orphaned'", got.Error)
+	}
+}
+
+// QUB-135: a healthy in-flight review (last_heartbeat_at set
+// or younger than the grace) must NOT be marked orphaned. A
+// slow OpenRouter call can take 5-15 minutes; a review that
+// is 30 seconds old and just heartbeated is healthy.
+func TestReconcileJobsOnce_YoungOrHeartbeatingRunLeftAlone(t *testing.T) {
+	ctx := context.Background()
+
+	st := openTestStore(t)
+	runID := "boop-a-b-1-aaaaaaa"
+	if _, err := st.UpsertRun(ctx, store.Run{
+		ID:        runID,
+		Owner:     "a",
+		Repo:      "b",
+		PRNumber:  1,
+		CommitSHA: "aaaaaaa",
+		BaseRef:   "main",
+		Status:    store.StatusRunning,
+		StartedAt: time.Now().Add(-30 * time.Second),
+	}); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+
+	h := newReconcileTestHandler(t, st)
+	n, err := h.store.MarkOrphanedRuns(ctx, orphanGraceSeconds*time.Second)
+	if err != nil {
+		t.Fatalf("mark orphaned: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("marked = %d, want 0 (young running row)", n)
+	}
+
+	got, err := st.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.Status != store.StatusRunning {
+		t.Errorf("status = %q, want running", got.Status)
 	}
 }
 
