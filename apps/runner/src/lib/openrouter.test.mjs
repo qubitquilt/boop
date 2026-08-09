@@ -1618,3 +1618,104 @@ test("runOpenCodeSkill throws when the stripped model is empty", async () => {
     /OPENROUTER_MODEL is unset or empty/,
   );
 });
+
+// --- QUB-130: prompt hardening against narrator hallucination --------
+//
+// The narrator has been observed to hallucinate about the
+// prompt structure on small PRs (the model claims the diff
+// is not visible and the walkthrough is a tool call). The
+// prompt adds a "What you are receiving" section that names
+// every input explicitly so the model does not have to guess
+// what it is seeing. The block lands BEFORE the "## Task"
+// section so the model reads the description before the
+// task framing.
+
+test("buildBoopPrompt has a 'What you are receiving' section (QUB-130)", async () => {
+  const fakeFs = makeFakeFs({
+    [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
+  });
+  const prompt = await buildBoopPrompt(baseCtx, {
+    fs: fakeFs,
+    paths,
+    log: () => {},
+    ...fastRetries,
+  });
+  // The marker is the section header. The body explicitly
+  // names the inputs (skill, lenses, walkthrough, findings,
+  // metadata) so the model does not have to guess what it
+  // is seeing.
+  assert.match(prompt, /## What you are receiving/);
+  assert.match(prompt, /None of the inputs are tool calls/);
+  // The four input names are listed as bullet points.
+  assert.match(prompt, /The boop skill/);
+  assert.match(prompt, /The lenses/);
+  assert.match(prompt, /The walkthrough/);
+  assert.match(prompt, /The expert findings/);
+});
+
+test("buildBoopPrompt's 'What you are receiving' block says the diff is unreadable (QUB-130)", async () => {
+  // The model is told the diff is in the working directory
+  // but it has no tools to read it. The block is explicit
+  // so the model does not pretend to read the diff or call
+  // a tool to get more context.
+  const fakeFs = makeFakeFs({
+    [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
+  });
+  const prompt = await buildBoopPrompt(baseCtx, {
+    fs: fakeFs,
+    paths,
+    log: () => {},
+    ...fastRetries,
+  });
+  assert.match(
+    prompt,
+    /This completion has no shell and no file-reading tools .* you cannot read the diff/,
+  );
+  assert.match(prompt, /do not pretend to read the diff or to call a tool/);
+});
+
+test("buildBoopPrompt's 'What you are receiving' block says walkthrough + findings are NOT tool calls (QUB-130)", async () => {
+  // The narrator has been observed to treat the walkthrough
+  // as a tool call. The block explicitly says the inputs
+  // are TEXT in this prompt, not tool calls, not tool
+  // results, not function calls.
+  const fakeFs = makeFakeFs({
+    [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
+  });
+  const prompt = await buildBoopPrompt(baseCtx, {
+    fs: fakeFs,
+    paths,
+    log: () => {},
+    ...fastRetries,
+  });
+  assert.match(
+    prompt,
+    /walkthrough, findings, and lens files are TEXT in this prompt/,
+  );
+  assert.match(prompt, /They are not tool calls, not tool results, not function calls/);
+  assert.match(prompt, /You cannot call them. You only read them/);
+});
+
+test("buildBoopPrompt places 'What you are receiving' before DATA fence (QUB-130)", async () => {
+  // The block must land in the SYSTEM INSTRUCTIONS section,
+  // not the PR-controlled DATA section. A hostile metadata
+  // string should not be able to inject its own
+  // "what you are receiving" framing.
+  const fakeFs = makeFakeFs({
+    [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
+  });
+  const prompt = await buildBoopPrompt(baseCtx, {
+    fs: fakeFs,
+    paths,
+    log: () => {},
+    ...fastRetries,
+  });
+  const blockIdx = prompt.indexOf("## What you are receiving");
+  const dataIdx = prompt.indexOf("DATA (PR-controlled");
+  assert.ok(blockIdx > -1, "missing 'What you are receiving' block");
+  assert.ok(dataIdx > -1, "missing DATA fence");
+  assert.ok(
+    blockIdx < dataIdx,
+    "the 'What you are receiving' block must precede the DATA fence",
+  );
+});

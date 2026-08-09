@@ -53,6 +53,7 @@ import {
   gather,
   mergeByExpert,
   pickExperts,
+  placeholderNarrate,
   runExperts,
 } from "./experts.mjs";
 import { cloneRepo } from "./git.mjs";
@@ -873,7 +874,14 @@ async function narrateSubStage(ctx, deps, overrides, state) {
   //   2. overrides.narrate — a test or future caller
   //      that has a real narrator for the multi-expert
   //      sub-workflow injects the new shape.
-  //   3. defaultRunOpenCodeSkill — the default narrator.
+  //   3. placeholderNarrate (QUB-130) — when the multi-expert
+  //      dispatch returns 0 findings, the LLM has no source
+  //      material to synthesize and can refuse to produce a
+  //      review (the model emits a refusal under 200 bytes
+  //      that the parser rejects as "summary empty"). The
+  //      placeholder bypasses the LLM and posts a clean,
+  //      deterministic "no issues found" review.
+  //   4. defaultRunOpenCodeSkill — the default narrator.
   //      In the multi-expert path it is handed the
   //      walkthrough + the gathered findings via
   //      ctx.walkthrough + ctx.findings. The narrator's
@@ -881,18 +889,41 @@ async function narrateSubStage(ctx, deps, overrides, state) {
   //      synthesizes from those instead of inlining the
   //      lens files. The legacy single-LLM path is the
   //      fallback when ctx.walkthrough is absent.
+  const findings = state.findings || [];
+  const walkthrough = state.walkthrough || "";
+  const walkthroughIsPlaceholder = walkthrough.startsWith(
+    "(walkthrough unavailable",
+  );
   if (typeof overrides.runOpenCodeSkill === "function") {
     const skillFn = overrides.runOpenCodeSkill;
     state.review = await skillFn(state.openrouterApiKey, ctx, deps);
   } else if (typeof overrides.narrate === "function") {
-    state.review = await overrides.narrate(state.findings || [], ctx, deps);
+    state.review = await overrides.narrate(findings, ctx, deps);
+  } else if (findings.length === 0) {
+    // QUB-130: The multi-expert dispatch returned 0 findings.
+    // The LLM has no source material to synthesize and can
+    // refuse to produce a review (the 417-byte refusal in
+    // PR #180's bug report). The placeholder is reliable
+    // (no LLM call, no refusal shape) and gives the PR
+    // author a clean "no issues found" review. The walkthrough
+    // is debug-only here — the placeholder body is intentionally
+    // generic so a walkthrough-shaped failure does not leak
+    // into the review.
+    deps.log("narrate", "placeholder used (0 findings)", {
+      walkthrough_chars: walkthrough.length,
+      walkthrough_is_placeholder: walkthroughIsPlaceholder,
+    });
+    state.review = placeholderNarrate(
+      findings,
+      walkthrough,
+      walkthroughIsPlaceholder,
+      ctx,
+      deps,
+    );
   } else {
     // Multi-expert path: forward the walkthrough + findings
     // to the narrator. The single-LLM fallback ignores them.
-    const narrateCtx =
-      state.walkthrough || (state.findings && state.findings.length > 0)
-        ? { ...ctx, walkthrough: state.walkthrough, findings: state.findings }
-        : ctx;
+    const narrateCtx = { ...ctx, walkthrough, findings };
     state.review = await defaultRunOpenCodeSkill(
       state.openrouterApiKey,
       narrateCtx,

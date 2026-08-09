@@ -1629,3 +1629,232 @@ test("every status header line (STATUS map) carries the same emoji (QUB-93)", as
     );
   }
 });
+
+// --- QUB-130: placeholder narrate on 0 findings -----------------------
+//
+// The narrator can refuse to produce a review on small PRs
+// when the multi-expert dispatch returns 0 findings AND the
+// walkthrough is short (PR #180's bug report: 417-byte refusal
+// with `summary empty` parse failure). The narrate sub-stage
+// now bypasses the LLM and uses a deterministic placeholder
+// when findings is empty. The placeholder produces a clean
+// "no issues found" review that passes the parser's shape
+// check and posts to the PR.
+
+test("QUB-130: narrate uses placeholder when findings is empty and no override is provided", async () => {
+  // The narrate sub-stage's fourth precedence is the
+  // placeholder. When state.findings is empty AND no override
+  // (runOpenCodeSkill or narrate) is provided, the LLM is
+  // bypassed and the placeholder review is used. The test
+  // does NOT pass runOpenCodeSkill or narrate overrides so
+  // the placeholder path is the only one that can run.
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+    walkthrough: "(walkthrough unavailable — experts are reading the diff directly)",
+    findings: [],
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+    },
+    state,
+  );
+  // The placeholder was applied.
+  assert.match(state.review.summary, /No blocking issues found/);
+  // The review shape passes the parser's looksLikeReviewShape
+  // gate (heading + ≥ 200 bytes + no refusal patterns).
+  assert.match(state.review.summary, /## TL;DR/);
+  assert.match(state.review.summary, /## Findings/);
+  assert.equal(state.review.confidence, "high");
+  assert.equal(state.review.inlineComments.length, 0);
+  // The placeholder telemetry stamps stepCount: 0 so the
+  // dashboard can distinguish a placeholder review from a
+  // successful LLM review.
+  assert.equal(state.review.telemetry.stepCount, 0);
+  // The placeholder path was logged so operators can see
+  // why the LLM was bypassed.
+  const placeholderLog = deps.calls.log.find(
+    (c) => c.stage === "narrate" && c.msg === "placeholder used (0 findings)",
+  );
+  assert.ok(placeholderLog, "expected a placeholder log entry");
+  assert.equal(placeholderLog.extra.walkthrough_is_placeholder, true);
+});
+
+test("QUB-130: narrate uses placeholder even when walkthrough is real but findings is empty", async () => {
+  // The walkthrough is real (a self-review LLM produced a
+  // 10-sentence summary) but the experts found nothing to
+  // flag. The placeholder is used regardless of the
+  // walkthrough's substance — the LLM is bypassed when the
+  // experts concluded nothing to flag.
+  const deps = recordingDeps();
+  const realWalkthrough =
+    "This PR fixes an authentication bug in the OAuth callback handler. " +
+    "It tightens the session validation to reject expired tokens earlier, " +
+    "adds a unit test for the new validation path, and updates the changelog.";
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+    walkthrough: realWalkthrough,
+    findings: [],
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => ({ type: "bug-fix", confidence: "high" }),
+      // Override generateWalkthrough so the walkthrough
+      // sub-stage does not overwrite state.walkthrough with
+      // the real-LLM placeholder. The workflow reads
+      // overrides.generateWalkthrough directly (the
+      // recordingDeps's generateWalkthrough is a no-op for
+      // the workflow's read path).
+      generateWalkthrough: async () => ({
+        walkthrough: realWalkthrough,
+        telemetry: null,
+      }),
+    },
+    state,
+  );
+  assert.match(state.review.summary, /No blocking issues found/);
+  // The walkthrough is real, so the placeholder log flags
+  // this as a non-placeholder walkthrough (operators can
+  // tell the difference between a healthy "no findings" run
+  // and a walkthrough failure).
+  const placeholderLog = deps.calls.log.find(
+    (c) => c.stage === "narrate" && c.msg === "placeholder used (0 findings)",
+  );
+  assert.ok(placeholderLog);
+  assert.equal(placeholderLog.extra.walkthrough_is_placeholder, false);
+  assert.ok(placeholderLog.extra.walkthrough_chars > 200);
+});
+
+test("QUB-130: overrides.runOpenCodeSkill wins over the placeholder when findings is empty", async () => {
+  // The lib-split hook (overrides.runOpenCodeSkill) is the
+  // highest precedence. A test or legacy caller that
+  // injects a canned review still wins even when the
+  // findings are empty — the placeholder is the fallback
+  // for the production path, not a hard override.
+  let skillCalled = false;
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+    walkthrough: "(walkthrough unavailable — experts are reading the diff directly)",
+    findings: [],
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      runOpenCodeSkill: async () => {
+        skillCalled = true;
+        return fakeReview();
+      },
+    },
+    state,
+  );
+  assert.equal(skillCalled, true, "overrides.runOpenCodeSkill wins over the placeholder");
+  assert.match(state.review.summary, /Looks good/);
+});
+
+test("QUB-130: overrides.narrate wins over the placeholder when findings is empty", async () => {
+  // Precedence 2: overrides.narrate beats the placeholder.
+  // A test that injects a real (or canned) narrator still
+  // wins even when the findings are empty.
+  const deps = recordingDeps();
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+    walkthrough: "(walkthrough unavailable — experts are reading the diff directly)",
+    findings: [],
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      narrate: async () => ({
+        summary: "## TL;DR\nnarrate override",
+        inlineComments: [],
+        confidence: "medium",
+        telemetry: null,
+      }),
+    },
+    state,
+  );
+  assert.equal(state.review.summary, "## TL;DR\nnarrate override");
+});
+
+test("QUB-130: when findings is non-empty, the LLM is called (no placeholder)", async () => {
+  // Placeholder is the fallback for the empty-findings case.
+  // When the experts returned findings, the LLM is called
+  // with the walkthrough + findings in the prompt. The
+  // runOpenCodeSkill hook is the test seam; the assertion
+  // is that the hook was called.
+  let skillCalled = false;
+  const deps = recordingDeps();
+  const realWalkthrough = "real walkthrough body";
+  const state = {
+    passed: [],
+    sub: {},
+    _subWorkflowOf: "sniff",
+    openrouterApiKey: "fake",
+    walkthrough: realWalkthrough,
+    findings: [
+      {
+        id: "f1",
+        expert: "test-quality",
+        severity: "info",
+        title: "T",
+        body: "b",
+        path: "src/x.ts",
+        line: 1,
+      },
+    ],
+  };
+  await runSubWorkflow(
+    REVIEW_SUB_STAGES,
+    fakeCtx,
+    deps,
+    {
+      classify: async () => ({ type: "feature", confidence: "high" }),
+      // The narrate sub-stage reads runOpenCodeSkill off
+      // overrides, not off deps. The recordingDeps-level
+      // override is the no-op for the sub-stage's read path.
+      runOpenCodeSkill: async () => {
+        skillCalled = true;
+        return fakeReview();
+      },
+      // Override generateWalkthrough so the walkthrough
+      // sub-stage does not overwrite state.walkthrough.
+      generateWalkthrough: async () => ({
+        walkthrough: realWalkthrough,
+        telemetry: null,
+      }),
+    },
+    state,
+  );
+  assert.equal(skillCalled, true, "LLM is called when findings is non-empty");
+  // The placeholder log was NOT emitted.
+  const placeholderLog = deps.calls.log.find(
+    (c) => c.stage === "narrate" && c.msg === "placeholder used (0 findings)",
+  );
+  assert.equal(placeholderLog, undefined);
+});
