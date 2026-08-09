@@ -906,6 +906,14 @@ export async function buildBoopPrompt(ctx, deps) {
     "- Do not emit shell transcripts, command output, or stack traces. " +
       "If you need to inspect a file, say what you would run; do not " +
       "pretend to run it.",
+    "- Do not emit tool calls. This completion has no tools " +
+      "enabled — you cannot run commands, read files, or " +
+      "call any function. Do not emit `<tool_use>`, `<tool_call>`, " +
+      "`<toolcall>`, `[TOOL_CALL]`, or JSON with `name`/`function` " +
+      "and `arguments` fields. The runner rejects those shapes as " +
+      "a hard parse failure; a tool call in the output is a " +
+      "wasted run. If you need more context, say what you would " +
+      "want to see — do not pretend to call a tool to get it.",
     "- Do not emit raw error strings, build headers, or startup " +
       "output. If the model reports an error, the runner handles it; " +
       "you do not forward it.",
@@ -1129,6 +1137,39 @@ function looksLikeReviewShape(s) {
   }
   if (/^>\s*build\s*·/m.test(s) && !/^##/m.test(s)) {
     return { ok: false, reason: "build header (no markdown heading)" };
+  }
+  // Tool-call hallucination. The narrator LLM sometimes emits a
+  // tool invocation (opencode / Claude / OpenAI / Anthropic shapes)
+  // as its "summary" body, either as bare JSON or wrapped in
+  // <tool_use> / <tool_call> / [TOOL_CALL] blocks. The narrator is
+  // a single chat completion with no tools enabled, so any tool
+  // call is a hallucination. The "no structured block" parse
+  // path already catches the bare-JSON case when it has no
+  // `=== SUMMARY ===` marker, but the LLM can also wrap the
+  // hallucination inside the markers and pass the regex while
+  // still not being a review. Match both the wrapped and the
+  // bare forms so the runner fails loud instead of posting a
+  // tool call to the PR.
+  //
+  // The bare-JSON patterns are matched at the "name"/"arguments"
+  // string level (not balanced-brace level) so the regex stays
+  // simple and the nested `{}` in the arguments value does not
+  // trip it. The shapes pinned here mirror the four most common
+  // tool-call serialization formats observed across the model
+  // family.
+  if (
+    // opencode / Claude: "name": "tool_id", "arguments": { ... }
+    /"name"\s*:\s*"[a-z_][a-z0-9_]*"\s*,\s*"arguments"\s*:/i.test(s) ||
+    // OpenAI: "function": { "name": "tool_id", "arguments": { ... } }
+    /"function"\s*:\s*\{\s*"name"\s*:\s*"[a-z_][a-z0-9_]*"\s*,\s*"arguments"/i.test(s) ||
+    // Anthropic <tool_use>...</tool_use>
+    /<tool[_-]?use[\s>]/i.test(s) ||
+    // opencode <tool_call>...</tool_call> XML
+    /<\/?tool[_-]?call>/i.test(s) ||
+    // Bracket wrapper
+    /\[TOOL_CALL\]/i.test(s)
+  ) {
+    return { ok: false, reason: "tool-call hallucination" };
   }
   // Length sanity check. A real review is at least 200 bytes —
   // a short TL;DR plus a one-row finding table is comfortably above
