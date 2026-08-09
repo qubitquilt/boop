@@ -335,12 +335,22 @@ export async function run(env = process.env, overrides = {}) {
     // otherwise the dashboard cannot distinguish a QUB-102
     // abort from a sniff-parse failure (both reach the
     // receiver as stage="failed").
+    //
+    // QUB-131: even on a parseFailed run, post telemetry and
+    // lens_telemetry if the narrator/lenses produced them. The
+    // narrator ran successfully (only the summary gate tripped),
+    // so the cost + token rollup is real. Without this, the
+    // dashboard's cost column stays at zero for every soft
+    // failure. Best-effort — failures inside the post helpers
+    // are swallowed by postWithRetry.
     if (state.parseFailed) {
-      await postDashboardStatus("failed", ctx, {
-        log: log.log,
-        fetchImpl: deps.fetchImpl,
-        reason: state.failureReason,
-      });
+      await postRunnerTelemetryIfAny(state, ctx, deps);
+      await postDashboardStatus(
+        "failed",
+        ctx,
+        { log: log.log, fetchImpl: deps.fetchImpl },
+        state.failureReason,
+      );
       return;
     }
 
@@ -357,17 +367,11 @@ export async function run(env = process.env, overrides = {}) {
     // sums them on display; we POST the narrator's telemetry
     // as the primary row here. A future PR can roll the
     // per-stage telemetry into a single shape before posting.
-    if (state.review && state.review.telemetry) {
-      await postTelemetry(state.review.telemetry, ctx, { log: log.log, fetchImpl: deps.fetchImpl });
-    }
-    // QUB-109: per-lens rollup. The runner accumulates one
-    // entry per lens as the orchestrator emits `lens: <name>`
-    // markers; this batch lands once at the end of the run
-    // (or skipped entirely on a sniff-parse failure, which
-    // has no lens attribution yet).
-    if (state.lensTelemetry && state.lensTelemetry.length > 0) {
-      await postLensTelemetry(state.lensTelemetry, ctx, { log: log.log, fetchImpl: deps.fetchImpl });
-    }
+    //
+    // QUB-131: the helper is shared with the parseFailed branch
+    // and the top-level catch (both reach a terminal state with
+    // a usable telemetry row).
+    await postRunnerTelemetryIfAny(state, ctx, deps);
     await postDashboardStatus("done", ctx, { log: log.log, fetchImpl: deps.fetchImpl });
     await deps.postStatus("done");
     // QUB-114: in reaction mode (issue_comment-triggered
@@ -387,12 +391,19 @@ export async function run(env = process.env, overrides = {}) {
     // status PATCH (deps.postStatus) also fails. The reason
     // mirrors the GitHub-commented reason so the operator's
     // primary view matches the source of truth.
+    //
+    // QUB-131: a stage throw (clone, sniff, narrate, etc.)
+    // may have left a partial telemetry row behind. Forward
+    // it so the dashboard still gets the cost rollup for the
+    // LLM calls that did succeed before the throw.
+    await postRunnerTelemetryIfAny(state, ctx, deps);
     const reason = state.failureReason || String(err?.message ?? err);
-    await postDashboardStatus("failed", ctx, {
-      log: log.log,
-      fetchImpl: deps.fetchImpl,
+    await postDashboardStatus(
+      "failed",
+      ctx,
+      { log: log.log, fetchImpl: deps.fetchImpl },
       reason,
-    });
+    );
     await deps.postStatus("failed", reason);
     if (ctx.noStatusComment) {
       await postFinalReaction("failed", ctx, deps);
@@ -407,6 +418,42 @@ export async function run(env = process.env, overrides = {}) {
     // them so a future `git fetch` against the in-memory state
     // cannot read the token.
     await cleanup.runAll();
+  }
+}
+
+// QUB-131: shared telemetry-poster for the three terminal
+// states (success, parseFailed, top-level catch). The
+// happy path, the parseFailed branch, and the catch all need
+// to land the narrator's cost + token rollup so the dashboard's
+// cost column is non-zero for soft failures. Both post helpers
+// no-op when state has nothing to send, so this is safe to
+// call unconditionally.
+//
+// `state.review.telemetry` is the narrator's row (the last LLM
+// call in the multi-expert pipeline). `state.lensTelemetry` is
+// the per-lens rollup the orchestrator builds during the
+// walkthrough + experts stages. Both may be undefined on a
+// run that died before the narrator (clone failure, etc.) —
+// the guards below handle that case.
+async function postRunnerTelemetryIfAny(state, ctx, deps) {
+  if (state.review && state.review.telemetry) {
+    await postTelemetry(state.review.telemetry, ctx, {
+      log: deps.log,
+      fetchImpl: deps.fetchImpl,
+    });
+  }
+  // QUB-109: per-lens rollup. The runner accumulates one
+  // entry per lens as the orchestrator emits `lens: <name>`
+  // markers; this batch lands once at the end of the run.
+  // (Previously this only fired on the happy path; on a
+  // parseFailed run the lens attribution was already complete
+  // but the batch never landed. QUB-131 unifies the paths so
+  // soft failures still surface per-lens cost.)
+  if (state.lensTelemetry && state.lensTelemetry.length > 0) {
+    await postLensTelemetry(state.lensTelemetry, ctx, {
+      log: deps.log,
+      fetchImpl: deps.fetchImpl,
+    });
   }
 }
 

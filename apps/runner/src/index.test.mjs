@@ -1121,6 +1121,199 @@ test("run is exported as a named function from index.mjs", async () => {
   assert.equal(typeof mod.run, "function");
 });
 
+// --- QUB-131: telemetry on the failure paths ----------------------------
+//
+// QUB-131 closed the gap where a parseFailed (summary empty) or
+// thrown-stage run reached the dashboard's "failed" status row
+// but never posted the cost + token rollup, leaving the
+// dashboard's cost column at zero for every soft failure. The
+// orchestrator must forward `state.review.telemetry` on every
+// terminal path (success, parseFailed, top-level catch).
+//
+// The standard fetchImpl in this file is fakeFetchToken, which
+// only stubs GitHub's /access_tokens endpoint. The dashboard
+// POSTs go to boop-receiver; we swap to a recording fetch and
+// assert on the recorded calls.
+
+function recordingFetch() {
+  const calls = [];
+  const fn = async (url, opts) => {
+    calls.push({ url, opts });
+    if (url.includes("/access_tokens")) {
+      return { ok: true, json: async () => ({ token: "ghs_install_token" }) };
+    }
+    return { ok: true, json: async () => ({}), text: async () => "" };
+  };
+  fn.calls = calls;
+  return fn;
+}
+
+function dashboardEnv(extra = {}) {
+  return {
+    ...env,
+    BOOP_DASHBOARD_URL: "http://boop-receiver:8080",
+    BOOP_DASHBOARD_TOKEN: "test-token",
+    BOOP_JOB_NAME: "boop-test-job-1",
+    ...extra,
+  };
+}
+
+function parseFailedReview() {
+  // summaryGate returns {ok: false} when summary is empty →
+  // state.parseFailed = true in workflow.mjs. The narrator's
+  // telemetry still rides on the review object; QUB-131 wants
+  // that row to land on the dashboard.
+  return {
+    summary: "",
+    inlineComments: [],
+    confidence: "low",
+    parseError: "summary empty",
+    telemetry: {
+      model: "test/model",
+      inputTokens: 100,
+      outputTokens: 50,
+      totalTokens: 150,
+      costUsd: 0.001234,
+      costPromptUsd: 0.0009,
+      costCompletionUsd: 0.000334,
+      costUpstreamUsd: 0.001234,
+      isByok: false,
+      stepCount: 1,
+      durationMs: 1234,
+      requestId: "gen-test",
+    },
+  };
+}
+
+test("run: parseFailed (summary empty) posts telemetry + lens_telemetry (QUB-131)", async () => {
+  const fetch = recordingFetch();
+  const overrides = standardOverrides({
+    fetchImpl: fetch,
+    runOpenCodeSkill: async () => parseFailedReview(),
+  });
+  await run(dashboardEnv(), overrides);
+
+  const telemetryPost = fetch.calls.find((c) =>
+    c.url.includes("/api/runs/boop-test-job-1/telemetry"),
+  );
+  assert.ok(
+    telemetryPost,
+    "expected telemetry POST in the parseFailed path (QUB-131 fix)",
+  );
+  const telemetryBody = JSON.parse(telemetryPost.opts.body);
+  assert.equal(telemetryBody.model, "test/model");
+  assert.equal(telemetryBody.total_tokens, 150);
+  assert.equal(telemetryBody.cost_usd, 0.001234);
+
+  // status=failed must still land — QUB-102 carries the reason.
+  const statusPosts = fetch.calls.filter((c) =>
+    c.url.includes("/api/runs/boop-test-job-1/status"),
+  );
+  const failedStatus = statusPosts.find(
+    (c) => JSON.parse(c.opts.body).stage === "failed",
+  );
+  assert.ok(failedStatus, "expected dashboard status=failed post");
+  assert.match(JSON.parse(failedStatus.opts.body).error, /summary parse failed/);
+});
+
+test("run: parseFailed without telemetry is a no-op for the telemetry POST (QUB-131)", async () => {
+  // A run that dies before the narrator (e.g., a parseFailed
+  // in a sub-stage that doesn't touch state.review) must not
+  // throw on the telemetry POST — the helper no-ops when
+  // state.review.telemetry is undefined.
+  const fetch = recordingFetch();
+  const overrides = standardOverrides({
+    fetchImpl: fetch,
+    runOpenCodeSkill: async () => ({
+      // No summary, no telemetry — pre-narrator failure shape.
+      summary: "",
+      inlineComments: [],
+      confidence: "low",
+    }),
+  });
+  await run(dashboardEnv(), overrides);
+  const telemetryPost = fetch.calls.find((c) =>
+    c.url.includes("/telemetry"),
+  );
+  assert.equal(
+    telemetryPost,
+    undefined,
+    "telemetry POST must be skipped when no telemetry row exists",
+  );
+  // status=failed still lands.
+  const statusPosts = fetch.calls.filter((c) => c.url.includes("/status"));
+  assert.ok(
+    statusPosts.some((c) => JSON.parse(c.opts.body).stage === "failed"),
+    "status=failed must still land in this path",
+  );
+});
+
+test("run: parseFailed skips lens_telemetry POST when state.lensTelemetry is unset (QUB-131)", async () => {
+  // The orchestrator never populates state.lensTelemetry today
+  // (the lens-rollup attribution is a QUB-109 future-shape; the
+  // helper guard is in place for when it does). This test pins
+  // the no-op contract: an unset `state.lensTelemetry` means no
+  // /lens_telemetry POST. The lens-batch code path itself is
+  // exercised by the dashboard.test.mjs unit tests; here we
+  // just verify the orchestrator doesn't accidentally POST an
+  // empty payload when the lens array is missing.
+  const fetch = recordingFetch();
+  const overrides = standardOverrides({
+    fetchImpl: fetch,
+    runOpenCodeSkill: async () => parseFailedReview(),
+  });
+  await run(dashboardEnv(), overrides);
+  const lensPost = fetch.calls.find((c) =>
+    c.url.includes("/api/runs/boop-test-job-1/lens_telemetry"),
+  );
+  assert.equal(
+    lensPost,
+    undefined,
+    "lens_telemetry POST must be skipped when state.lensTelemetry is unset",
+  );
+  // Telemetry POST still lands.
+  const telemetryPost = fetch.calls.find((c) =>
+    c.url.includes("/api/runs/boop-test-job-1/telemetry"),
+  );
+  assert.ok(telemetryPost, "expected telemetry POST alongside lens_telemetry");
+});
+
+test("run: stage throw before narrator posts status=failed and skips telemetry (QUB-131)", async () => {
+  // The top-level catch must (a) post status=failed with the
+  // thrown error as the reason, and (b) skip the telemetry POST
+  // because state.review was never populated. runOpenCodeSkill
+  // throws before assigning to state.review, so the helper
+  // no-ops on undefined telemetry and only the status POST lands.
+  const fetch = recordingFetch();
+  const overrides = standardOverrides({
+    fetchImpl: fetch,
+    runOpenCodeSkill: async () => { throw new Error("review-skill blew up"); },
+  });
+  await assert.rejects(() => run(dashboardEnv(), overrides), /review-skill blew up/);
+  const statusPosts = fetch.calls.filter((c) => c.url.includes("/status"));
+  const failedStatus = statusPosts.find(
+    (c) => JSON.parse(c.opts.body).stage === "failed",
+  );
+  assert.ok(
+    failedStatus,
+    "status=failed must still land in the top-level catch",
+  );
+  // QUB-131 fix: the reason is now passed as the 4th positional
+  // arg, so the `error` field actually lands on the dashboard.
+  assert.match(
+    JSON.parse(failedStatus.opts.body).error,
+    /review-skill blew up/,
+    "top-level catch must forward the thrown error as the dashboard error field",
+  );
+  // No telemetry POST because state.review was never populated.
+  const telemetryPost = fetch.calls.find((c) => c.url.includes("/telemetry"));
+  assert.equal(
+    telemetryPost,
+    undefined,
+    "no telemetry POST when state.review is unset",
+  );
+});
+
 // Reference createCleanupRegistry to keep the import live even if
 // other tests move. The dependency is used through the lib chain.
 test("createCleanupRegistry still importable from index.test", () => {
