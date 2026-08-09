@@ -439,6 +439,78 @@ test("defaultExpert forwards deps.env.OPENROUTER_API_KEY to callOpenRouter (QUB-
   );
 });
 
+// QUB-<next> local-run regression: the lens file path must be
+// resolved from deps.paths.configSrc, NOT ctx.paths.configSrc
+// (ctx never carries `paths` — only deps does). The pre-fix code
+// read ctx.paths.configSrc, which is always undefined, so the
+// hard-coded "/home/opencode/.config/opencode" fallback always
+// fired. The K8s production mount happens to match that path,
+// so the bug stayed invisible until BOOP_CONFIG_SRC env-override
+// local runs redirected the mount elsewhere — every expert then
+// failed with ENOENT against /home/opencode.
+//
+// The test pins that a custom deps.paths.configSrc is honored
+// (so the local run reads /tmp/boop-runner/skills/boop/...),
+// and that the fallback fires when deps.paths.configSrc is absent.
+test("defaultExpert reads lens path from deps.paths.configSrc (QUB-<next>)", async () => {
+  // Capture the path the expert tried to read. fs.readFile is the
+  // ground-truth source the expert uses (the rtk adapter falls
+  // back to fs when its CLI call fails).
+  const reads = [];
+  const baseDeps = (configSrc) => ({
+    callOpenRouter: async () => ({
+      text: '{"findings": []}',
+      model: "test-model",
+      usage: { prompt_tokens: 0, completion_tokens: 0, cost: 0 },
+    }),
+    fs: {
+      readFile: async (p) => {
+        reads.push(p);
+        return "# test lens\nReturn {findings:[]}.";
+      },
+    },
+    paths: { configSrc },
+    postStatus: async () => {},
+    env: { OPENROUTER_API_KEY: "test-key" },
+    log: () => {},
+    errlog: () => {},
+  });
+
+  // Case 1: a custom configSrc (the BOOP_CONFIG_SRC override) must
+  // be honored. The expert reads from /tmp/boop-runner/skills,
+  // not from the production mount.
+  reads.length = 0;
+  await runExperts(
+    ["regression-hunter"],
+    { openrouterModel: "minimax/minimax-m3" },
+    baseDeps("/tmp/boop-runner"),
+  );
+  assert.ok(
+    reads.some((p) => p.includes("/tmp/boop-runner/skills/boop/")),
+    `expert must read from custom configSrc; got reads: ${JSON.stringify(reads)}`,
+  );
+  assert.ok(
+    !reads.some((p) => p.startsWith("/home/opencode")),
+    `expert must NOT fall back to production mount; got reads: ${JSON.stringify(reads)}`,
+  );
+
+  // Case 2: when deps.paths.configSrc is absent, the expert
+  // falls back to the production mount (preserves the pre-fix
+  // behavior for any caller that doesn't thread paths through).
+  reads.length = 0;
+  const depsNoPaths = baseDeps("/some/other/path");
+  delete depsNoPaths.paths;
+  await runExperts(
+    ["regression-hunter"],
+    { openrouterModel: "minimax/minimax-m3" },
+    depsNoPaths,
+  );
+  assert.ok(
+    reads.some((p) => p.startsWith("/home/opencode/.config/opencode/")),
+    `expert must fall back to /home/opencode when deps.paths.configSrc is absent; got: ${JSON.stringify(reads)}`,
+  );
+});
+
 // --- QUB-130: placeholderNarrate ---------------------------------------
 //
 // When the multi-expert dispatch returns 0 findings, the
