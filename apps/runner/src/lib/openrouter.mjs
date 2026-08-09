@@ -16,6 +16,7 @@
 // "openrouter" because that's the single provider now.
 
 import { OpenRouter } from "@openrouter/sdk";
+import { chatSend as defaultChatSend } from "@openrouter/sdk/funcs/chatSend.js";
 import { LENS_FILES, OPENCODE_TIMEOUT_MS } from "./config.mjs";
 import { assertSafeRef, shortSha } from "./security.mjs";
 import { lintReview, summarize } from "./ste-lint.mjs";
@@ -77,7 +78,7 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
   } catch (err) {
     const elapsed = Date.now() - startMs;
     // The SDK uses AbortError for our timeout path (we pass
-    // controller.signal into client.chat.send). Anything else is
+    // controller.signal into chatSend). Anything else is
     // a genuine SDK failure — 4xx, 5xx, network, etc. — and
     // should surface in the error pipeline, not the info one.
     const isAbort = err?.name === "AbortError";
@@ -162,7 +163,7 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
  * is raised and the runner treats it as a clean failure.
  *
  * @param {string} prompt  the boop review prompt (see buildBoopPrompt)
- * @param {object} deps  { model, env, client, AbortControllerCtor, timeoutMs, log }
+ * @param {object} deps  { model, env, client, chatSend, AbortControllerCtor, timeoutMs, log, errlog }
  * @returns {Promise<{ text: string, usage: { prompt_tokens: number, completion_tokens: number, cost: number, cached_tokens?: number, reasoning_tokens?: number }, model: string }>}
  * @throws when the SDK returns a non-ok result, when the call is aborted,
  *         or when the response carries no assistant text.
@@ -172,6 +173,7 @@ export async function callOpenRouter(prompt, deps = {}) {
     model,
     env = process.env,
     client: injectedClient,
+    chatSend = defaultChatSend,
     AbortControllerCtor = globalThis.AbortController,
     timeoutMs = OPENCODE_TIMEOUT_MS,
     log = () => {},
@@ -202,7 +204,8 @@ export async function callOpenRouter(prompt, deps = {}) {
   });
 
   try {
-    const result = await client.chat.send(
+    const result = await chatSend(
+      client,
       {
         chatRequest: {
           model,
@@ -215,6 +218,15 @@ export async function callOpenRouter(prompt, deps = {}) {
 
     if (!result.ok) {
       const err = result.error;
+      // Abort signals from our timeout must propagate as
+      // AbortError so runOpenCodeSkill's handler can
+      // distinguish timeouts from genuine SDK failures.
+      // chatSend returns the abort as a Result (does not
+      // throw), unlike client.chat.send which throws via
+      // unwrapAsync.
+      if (err?.name === "AbortError") {
+        throw err;
+      }
       // Capture every field the SDK exposes so the runner's
       // error log has the full picture. The previous shape
       // dropped the body when the error message was empty

@@ -14,23 +14,24 @@ import {
 } from "./openrouter.mjs";
 import { LENS_FILES, loadConfig } from "./config.mjs";
 
-// A fake OpenRouter client. Mirrors the shape that the real SDK's
-// `client.chat.send` returns: an `APIPromise` that resolves to a
-// `Result<value, error>`. Tests construct one of these per case
+// A fake chatSend standalone function. Mirrors the shape that the real
+// SDK's `chatSend(client, request, options)` returns: a `Result<value,
+// error>` discriminated union. Tests construct one of these per case
 // to drive `callOpenRouter` deterministically without touching the
-// network.
-function makeFakeClient({ value, error, abortable = false } = {}) {
+// network. The fake is injected via `deps.chatSend`; the `client` is
+// still constructed (for the API key path) but the fake ignores it.
+function makeFakeChatSend({ value, error, abortable = false } = {}) {
   let abortSignal = null;
   const sent = { calls: [] };
-  const send = async (request, options) => {
-    sent.calls.push({ request, options });
+  const fn = async (client, request, options) => {
+    sent.calls.push({ client, request, options });
     if (abortable && options?.abortSignal) {
       abortSignal = options.abortSignal;
     }
     if (error) return { ok: false, error };
     return { ok: true, value };
   };
-  return { chat: { send }, sent, abortSignal: () => abortSignal };
+  return { fn, sent, abortSignal: () => abortSignal };
 }
 
 function makeAssistantResponse({
@@ -79,10 +80,10 @@ const baseDeps = () => ({
 
 test("callOpenRouter returns text, usage, and model on success", async () => {
   const value = makeAssistantResponse();
-  const client = makeFakeClient({ value });
+  const { fn: chatSend } = makeFakeChatSend({ value });
   const result = await callOpenRouter("review this", {
     ...baseDeps(),
-    client,
+    chatSend,
   });
   assert.equal(result.text, "hello from the model");
   assert.equal(result.model, "minimax/minimax-m3");
@@ -98,8 +99,8 @@ test("callOpenRouter surfaces cached and reasoning tokens when present", async (
     cachedTokens: 5,
     reasoningTokens: 9,
   });
-  const client = makeFakeClient({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), client });
+  const { fn: chatSend } = makeFakeChatSend({ value });
+  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
   assert.equal(result.usage.cached_tokens, 5);
   assert.equal(result.usage.reasoning_tokens, 9);
 });
@@ -121,8 +122,8 @@ test("callOpenRouter concatenates structured content parts", async () => {
       },
     ],
   };
-  const client = makeFakeClient({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), client });
+  const { fn: chatSend } = makeFakeChatSend({ value });
+  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
   assert.equal(result.text, "part one part two");
 });
 
@@ -130,18 +131,102 @@ test("callOpenRouter throws when the SDK returns a 4xx", async () => {
   const error = Object.assign(new Error("Bad Request: invalid model"), {
     statusCode: 400,
   });
-  const client = makeFakeClient({ error });
+  const { fn: chatSend } = makeFakeChatSend({ error });
   await assert.rejects(
-    () => callOpenRouter("p", { ...baseDeps(), client }),
+    () => callOpenRouter("p", { ...baseDeps(), chatSend }),
     /OpenRouter chat completion failed \(400\): Bad Request: invalid model/,
+  );
+});
+
+// QUB-124 acceptance: the success path mock returns a
+// Result<value, error>. The runner reads `value` from the
+// Result and returns the assistant text. This test pins the
+// contract: the mock is a `chatSend` standalone function (not a
+// client.chat.send method) and the return shape is `{ ok: true,
+// value }`, not the unwrapped response.
+test("callOpenRouter reads value from Result on success (QUB-124)", async () => {
+  const value = makeAssistantResponse({
+    content: "QUB-124 success path",
+    model: "minimax/minimax-m3",
+  });
+  const { fn: chatSend, sent } = makeFakeChatSend({ value });
+  const result = await callOpenRouter("review this", {
+    ...baseDeps(),
+    chatSend,
+  });
+  // The runner read `value` from the Result, not the raw response.
+  assert.equal(result.text, "QUB-124 success path");
+  assert.equal(result.model, "minimax/minimax-m3");
+  // The mock was called exactly once as the standalone function.
+  assert.equal(sent.calls.length, 1);
+  // The first argument was the client (not undefined — callOpenRouter
+  // constructs one from the API key when no client is injected).
+  assert.ok(sent.calls[0].client, "chatSend must receive the client");
+});
+
+// QUB-124 acceptance: the error path mock returns
+// { ok: false, error: <error with statusCode> }. The runner logs
+// statusCode, body, contentType, and the message via errlog, then
+// throws. The error object mirrors the SDK's OpenRouterError shape
+// (statusCode, body, headers, contentType, rawResponse).
+test("callOpenRouter logs statusCode, body, contentType on error (QUB-124)", async () => {
+  const errLogs = [];
+  const error = Object.assign(new Error("Unauthorized: invalid API key"), {
+    name: "UnauthorizedResponseError",
+    statusCode: 401,
+    body: '{"error":{"message":"invalid API key"}}',
+    contentType: "application/json",
+    headers: { "x-request-id": "req-123" },
+  });
+  const { fn: chatSend } = makeFakeChatSend({ error });
+  await assert.rejects(
+    () =>
+      callOpenRouter("p", {
+        ...baseDeps(),
+        chatSend,
+        errlog: (tag, msg, meta) => errLogs.push({ tag, msg, meta }),
+      }),
+    /OpenRouter chat completion failed \(401\): Unauthorized: invalid API key/,
+  );
+  // The runner logged the SDK error with every field the SDK exposes.
+  assert.equal(errLogs.length, 1);
+  const log = errLogs[0];
+  assert.equal(log.tag, "openrouter");
+  assert.equal(log.msg, "sdk returned non-ok result");
+  assert.equal(log.meta.status, 401);
+  assert.equal(log.meta.message, "Unauthorized: invalid API key");
+  assert.equal(log.meta.contentType, "application/json");
+  assert.equal(log.meta.body, '{"error":{"message":"invalid API key"}}');
+  assert.equal(log.meta.errorName, "UnauthorizedResponseError");
+});
+
+// QUB-124: when chatSend returns a Result with an AbortError (the
+// timeout fires), callOpenRouter must re-throw the AbortError so
+// runOpenCodeSkill's handler can distinguish timeouts from genuine
+// SDK failures. chatSend (the standalone function) returns the abort
+// as a Result; client.chat.send (the class method) throws via
+// unwrapAsync. This test pins the Result-based abort path.
+test("callOpenRouter re-throws AbortError from non-ok Result (QUB-124)", async () => {
+  const abortErr = Object.assign(new Error("The user aborted a request"), {
+    name: "AbortError",
+  });
+  const chatSend = async () => ({ ok: false, error: abortErr });
+  await assert.rejects(
+    () =>
+      callOpenRouter("p", {
+        ...baseDeps(),
+        chatSend,
+        timeoutMs: 5,
+      }),
+    (err) => err.name === "AbortError",
   );
 });
 
 test("callOpenRouter throws when the response has no assistant text", async () => {
   const value = makeAssistantResponse({ content: "" });
-  const client = makeFakeClient({ value });
+  const { fn: chatSend } = makeFakeChatSend({ value });
   await assert.rejects(
-    () => callOpenRouter("p", { ...baseDeps(), client }),
+    () => callOpenRouter("p", { ...baseDeps(), chatSend }),
     /returned no assistant text/,
   );
 });
@@ -149,8 +234,8 @@ test("callOpenRouter throws when the response has no assistant text", async () =
 test("callOpenRouter uses zero token counts when the response has no usage", async () => {
   const value = makeAssistantResponse();
   delete value.usage;
-  const client = makeFakeClient({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), client });
+  const { fn: chatSend } = makeFakeChatSend({ value });
+  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
   assert.deepEqual(result.usage, {
     prompt_tokens: 0,
     completion_tokens: 0,
@@ -161,8 +246,8 @@ test("callOpenRouter uses zero token counts when the response has no usage", asy
 test("callOpenRouter falls back to zero cost when usage.cost is missing", async () => {
   const value = makeAssistantResponse();
   delete value.usage.cost;
-  const client = makeFakeClient({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), client });
+  const { fn: chatSend } = makeFakeChatSend({ value });
+  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
   assert.equal(result.usage.cost, 0);
 });
 
@@ -178,27 +263,23 @@ test("callOpenRouter throws when OPENROUTER_API_KEY is unset", async () => {
 });
 
 test("callOpenRouter aborts the SDK call after the timeout", async () => {
-  // The fake client blocks forever; callOpenRouter should abort it
+  // The fake chatSend blocks forever; callOpenRouter should abort it
   // once the (very short) timeout elapses. The AbortError from the
   // SDK bubbles up; the runner treats it as a clean timeout failure.
-  const blockingClient = {
-    chat: {
-      send: (request, options) =>
-        new Promise((_resolve, reject) => {
-          options.abortSignal.addEventListener("abort", () => {
-            const err = new Error("aborted");
-            err.name = "AbortError";
-            reject(err);
-          });
-        }),
-    },
-  };
+  const blockingChatSend = (client, request, options) =>
+    new Promise((_resolve, reject) => {
+      options.abortSignal.addEventListener("abort", () => {
+        const err = new Error("aborted");
+        err.name = "AbortError";
+        reject(err);
+      });
+    });
 
   await assert.rejects(
     () =>
       callOpenRouter("p", {
         ...baseDeps(),
-        client: blockingClient,
+        chatSend: blockingChatSend,
         timeoutMs: 5,
       }),
     /aborted/,
@@ -208,25 +289,21 @@ test("callOpenRouter aborts the SDK call after the timeout", async () => {
 test("callOpenRouter does not read files or spawn processes", async () => {
   // QUB-96 acceptance: the module must not depend on a config file
   // or a subprocess. We assert this by checking that the only
-  // side-effects on `deps` are the `client.chat.send` call and
+  // side-effects on `deps` are the `chatSend` call and
   // the log/timeout plumbing. If a future change adds fs or spawn
   // calls, this test will fail and force the author to justify it.
   const calls = [];
-  const client = {
-    chat: {
-      send: async (request) => {
-        calls.push({ kind: "send", request });
-        return { ok: true, value: makeAssistantResponse() };
-      },
-    },
+  const chatSend = async (client, request) => {
+    calls.push({ kind: "chatSend", request });
+    return { ok: true, value: makeAssistantResponse() };
   };
   await callOpenRouter("p", {
     ...baseDeps(),
-    client,
+    chatSend,
     log: (tag, msg, meta) => calls.push({ kind: "log", tag, msg, meta }),
   });
   const kinds = new Set(calls.map((c) => c.kind));
-  assert.ok(kinds.has("send"), "client.chat.send should be called");
+  assert.ok(kinds.has("chatSend"), "chatSend should be called");
   // No fs.readFile, no spawn, no execFile calls are expected.
   for (const c of calls) {
     assert.notEqual(c.kind, "fs");
