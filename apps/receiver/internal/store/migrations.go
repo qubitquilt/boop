@@ -21,7 +21,7 @@ import (
 // N only after the entire block has run. A block that fails
 // half-way leaves user_version unchanged and the next Open
 // retries from that point.
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 // applyMigrations runs the schema migrations, gated on
 // PRAGMA user_version. The version starts at 0 on a fresh
@@ -141,6 +141,31 @@ func applyMigrations(db *sql.DB) error {
 			return fmt.Errorf("migration v5: write user_version: %w", err)
 		}
 		v = 5
+	}
+	// v6 (QUB-105) widens the telemetry table. The
+	// OpenRouter SDK exposes more fields on its ChatUsage
+	// than the runner was forwarding: total_tokens, the
+	// cost_details prompt/completion split, is_byok,
+	// server_tool_use_details, the response id, and the
+	// wall-clock duration of the SDK call. The runner
+	// also enriches the failed-call telemetry row with
+	// the SDK's typed error (status_code, content_type,
+	// body snippet) so a 4xx is diagnosable from the
+	// dashboard without a pod-log round trip.
+	//
+	// Every new column is additive with a default so an
+	// in-place upgrade preserves existing rows; the
+	// dashboard can ignore fields it does not render
+	// while the runner's contract gains a clean
+	// surface to land future fields on.
+	if v < 6 {
+		if err := migrateV6(ctx, db); err != nil {
+			return fmt.Errorf("migration v6: %w", err)
+		}
+		if err := writeUserVersion(ctx, db, 6); err != nil {
+			return fmt.Errorf("migration v6: write user_version: %w", err)
+		}
+		v = 6
 	}
 	// Add later migrations as additional `if v < N { ... }`
 	// blocks here. Each must set user_version = N on success.
@@ -464,6 +489,109 @@ func migrateV5(ctx context.Context, db *sql.DB) error {
 	for i, stmt := range stmts {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("migration v5 statement %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+// migrateV6 (QUB-105) widens the telemetry table to
+// surface every field the OpenRouter SDK exposes. Every
+// column is additive with a default so the in-place
+// upgrade preserves existing rows; the runner's POST
+// path tolerates a partial payload (the new JSON
+// fields are optional on telemetryRequest), so a
+// pre-QUB-105 runner posting against a v6 schema
+// still lands a usable row.
+//
+// The runner-facing rationale for each column is in
+// the QUB-105 description; the SQL rationale is here:
+//
+//   - total_tokens: SDK-reported sum; the dashboard
+//     can sanity-check against input + output +
+//     reasoning + cache. Default 0 keeps the existing
+//     "missing is zero" contract.
+//   - cost_prompt_usd / cost_completion_usd: split
+//     the lumped cost_usd into prompt vs completion
+//     so the dashboard can render
+//     "cheap input vs expensive reasoning". Default
+//     0 (the lumped cost stays on cost_usd).
+//   - cost_upstream_usd: provider-reported total
+//     (may differ from cost). Default 0; useful as a
+//     second opinion when the SDK's own cost
+//     disagrees with the upstream's.
+//   - is_byok: BYOK traffic vs OpenRouter-routed.
+//     Boolean as INTEGER per SQLite convention. Default
+//     0 (routed).
+//   - server_tool_calls_executed /
+//     server_tool_calls_requested: always 0 today
+//     (no tools), reserved for future tool-using
+//     skills. Default 0.
+//   - request_id: OpenRouter per-request id for
+//     activity-log correlation. Nullable TEXT.
+//   - duration_ms: wall-clock SDK call latency
+//     (separate from runs.duration_ms which is the
+//     whole run). Nullable INTEGER.
+//   - error: human-readable error message from a
+//     failed SDK call. Nullable TEXT; absent on
+//     successful runs. The dashboard's failure-class
+//     filter uses error_status_code (a typed int) for
+//     programmatic decisions, and error for the
+//     operator's breadcrumb.
+//   - error_status_code / error_content_type: SDK
+//     error context so a 4xx is diagnosable from the
+//     dashboard row without a pod-log round trip.
+//     Nullable; absent on successful calls.
+//   - error_body: short snippet of the SDK's response
+//     body for a failed call (truncated to 500 chars
+//     in the runner per the existing errlog cap). The
+//     dashboard surfaces it alongside error_status_code
+//     so the operator can read the upstream's own
+//     error message without a pod-log round trip.
+//     Nullable TEXT.
+func migrateV6(ctx context.Context, db *sql.DB) error {
+	colAdds := []struct {
+		table string
+		col   string
+		def   string
+	}{
+		{"telemetry", "total_tokens", "INTEGER NOT NULL DEFAULT 0"},
+		{"telemetry", "cost_prompt_usd", "REAL NOT NULL DEFAULT 0"},
+		{"telemetry", "cost_completion_usd", "REAL NOT NULL DEFAULT 0"},
+		{"telemetry", "cost_upstream_usd", "REAL NOT NULL DEFAULT 0"},
+		{"telemetry", "is_byok", "INTEGER NOT NULL DEFAULT 0"},
+		{"telemetry", "server_tool_calls_executed", "INTEGER NOT NULL DEFAULT 0"},
+		{"telemetry", "server_tool_calls_requested", "INTEGER NOT NULL DEFAULT 0"},
+		{"telemetry", "request_id", "TEXT"},
+		{"telemetry", "duration_ms", "INTEGER"},
+		{"telemetry", "error", "TEXT"},
+		{"telemetry", "error_status_code", "INTEGER"},
+		{"telemetry", "error_content_type", "TEXT"},
+		{"telemetry", "error_body", "TEXT"},
+	}
+	for _, c := range colAdds {
+		has, err := hasColumn(ctx, db, c.table, c.col)
+		if err != nil {
+			return fmt.Errorf("migration v6 hasColumn %s.%s: %w", c.table, c.col, err)
+		}
+		if has {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", c.table, c.col, c.def)
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v6 alter %s.%s: %w", c.table, c.col, err)
+		}
+	}
+	// idx_telemetry_is_byok feeds the dashboard's
+	// BYOK-vs-routed split; the column is low-cardinality
+	// (boolean) so the index is small. Without it the
+	// dashboard's "filter to BYOK only" query is a full
+	// scan.
+	idxStmts := []string{
+		`CREATE INDEX IF NOT EXISTS idx_telemetry_is_byok ON telemetry(is_byok)`,
+	}
+	for i, stmt := range idxStmts {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("migration v6 index %d: %w", i, err)
 		}
 	}
 	return nil

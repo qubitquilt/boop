@@ -24,30 +24,48 @@ const (
 // "current streak" fields are computed in Go because the streak
 // is a function of the run's chronological order, not a single
 // aggregate. JSON tags added for stable /api/stats wire format.
+//
+// QUB-105: CostPromptUSD / CostCompletionUSD split the lumped
+// TotalCostUSD so the dashboard can render prompt vs completion
+// spend. BYOKRuns counts the routed traffic that came in via
+// cluster-operator-supplied provider keys (the cost semantics
+// differ from OpenRouter-routed; the dashboard filters BYOK
+// from the all-in rollup).
 type SummaryStats struct {
-	TotalRuns      int64   `json:"total_runs"`
-	SucceededRuns  int64   `json:"succeeded_runs"`
-	FailedRuns     int64   `json:"failed_runs"`
-	RunningRuns    int64   `json:"running_runs"`
-	SuccessRate    float64 `json:"success_rate"`
-	TotalCostUSD   float64 `json:"total_cost_usd"`
-	TotalTokens    int64   `json:"total_tokens"`
-	AvgDurationMS  int64   `json:"avg_duration_ms"`
-	P50DurationMS  int64   `json:"p50_duration_ms"`
-	P95DurationMS  int64   `json:"p95_duration_ms"`
-	UniqueRepos    int64   `json:"unique_repos"`
-	UniqueInstalls int64   `json:"unique_installs"`
+	TotalRuns        int64   `json:"total_runs"`
+	SucceededRuns    int64   `json:"succeeded_runs"`
+	FailedRuns       int64   `json:"failed_runs"`
+	RunningRuns      int64   `json:"running_runs"`
+	SuccessRate      float64 `json:"success_rate"`
+	TotalCostUSD     float64 `json:"total_cost_usd"`
+	CostPromptUSD    float64 `json:"cost_prompt_usd"`
+	CostCompletionUSD float64 `json:"cost_completion_usd"`
+	TotalTokens      int64   `json:"total_tokens"`
+	AvgDurationMS    int64   `json:"avg_duration_ms"`
+	P50DurationMS    int64   `json:"p50_duration_ms"`
+	P95DurationMS    int64   `json:"p95_duration_ms"`
+	BYOKRuns         int64   `json:"byok_runs"`
+	UniqueRepos      int64   `json:"unique_repos"`
+	UniqueInstalls   int64   `json:"unique_installs"`
 }
 
 // BucketPoint is one bar on the time-series chart.
+//
+// QUB-105: the per-bucket rollup now surfaces the prompt vs
+// completion cost split and a BYOK count alongside the existing
+// cost + tokens. The dashboard renders the split as a stacked
+// bar; the BYOK count feeds the "BYOK vs routed" trend line.
 type BucketPoint struct {
-	BucketStart  time.Time `json:"bucket_start"`
-	Runs         int64     `json:"runs"`
-	Succeeded    int64     `json:"succeeded"`
-	Failed       int64     `json:"failed"`
-	CostUSD      float64   `json:"cost_usd"`
-	InputTokens  int64     `json:"input_tokens"`
-	OutputTokens int64     `json:"output_tokens"`
+	BucketStart      time.Time `json:"bucket_start"`
+	Runs             int64     `json:"runs"`
+	Succeeded        int64     `json:"succeeded"`
+	Failed           int64     `json:"failed"`
+	CostUSD          float64   `json:"cost_usd"`
+	CostPromptUSD    float64   `json:"cost_prompt_usd"`
+	CostCompletionUSD float64 `json:"cost_completion_usd"`
+	InputTokens      int64     `json:"input_tokens"`
+	OutputTokens     int64     `json:"output_tokens"`
+	BYOKRuns         int64     `json:"byok_runs"`
 }
 
 // GroupBy selects the dimension for per-bucket aggregation. The
@@ -135,12 +153,15 @@ func (s *Store) Summary(ctx context.Context, from, to time.Time) (SummaryStats, 
 	// total tokens = input + output + cache_read + cache_write +
 	// reasoning. The breakdown is on the drill-down; the
 	// top-line shows the all-in count.
-	cost, tokens, err := s.sumCostAndTokens(ctx, from, to)
+	cost, promptCost, completionCost, tokens, byokRuns, err := s.sumCostAndTokens(ctx, from, to)
 	if err != nil {
 		return SummaryStats{}, err
 	}
 	out.TotalCostUSD = cost
+	out.CostPromptUSD = promptCost
+	out.CostCompletionUSD = completionCost
 	out.TotalTokens = tokens
+	out.BYOKRuns = byokRuns
 
 	// Unique repos and installations: cheap DISTINCT counts
 	// over the runs table. The dashboard uses these to say
@@ -162,23 +183,36 @@ func (s *Store) Summary(ctx context.Context, from, to time.Time) (SummaryStats, 
 	return out, nil
 }
 
-func (s *Store) sumCostAndTokens(ctx context.Context, from, to time.Time) (float64, int64, error) {
+// sumCostAndTokens aggregates the dashboard's cost + token
+// rollup. QUB-105 widens the return signature: prompt vs
+// completion cost split (so the dashboard can render
+// "cheap input vs expensive reasoning") plus the BYOK
+// run count (so the operator can filter cluster-supplied
+// provider keys from the all-in rollup). The lumped
+// `cost_usd` sum stays the same — the split is additive.
+func (s *Store) sumCostAndTokens(ctx context.Context, from, to time.Time) (float64, float64, float64, int64, int64, error) {
 	var (
-		cost   sql.NullFloat64
-		tokens sql.NullInt64
+		cost              sql.NullFloat64
+		promptCost        sql.NullFloat64
+		completionCost    sql.NullFloat64
+		tokens            sql.NullInt64
+		byok              sql.NullInt64
 	)
 	err := s.db.QueryRowContext(ctx, `
 		SELECT
 			COALESCE(SUM(t.cost_usd), 0),
-			COALESCE(SUM(t.input_tokens + t.output_tokens + t.reasoning_tokens + t.cache_read_tokens + t.cache_write_tokens), 0)
+			COALESCE(SUM(t.cost_prompt_usd), 0),
+			COALESCE(SUM(t.cost_completion_usd), 0),
+			COALESCE(SUM(t.input_tokens + t.output_tokens + t.reasoning_tokens + t.cache_read_tokens + t.cache_write_tokens), 0),
+			COALESCE(SUM(CASE WHEN t.is_byok = 1 THEN 1 ELSE 0 END), 0)
 		FROM telemetry t
 		JOIN runs r ON r.id = t.run_id
 		WHERE r.started_at >= ? AND r.started_at <= ?
-	`, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano)).Scan(&cost, &tokens)
+	`, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano)).Scan(&cost, &promptCost, &completionCost, &tokens, &byok)
 	if err != nil {
-		return 0, 0, fmt.Errorf("store: cost+tokens: %w", err)
+		return 0, 0, 0, 0, 0, fmt.Errorf("store: cost+tokens: %w", err)
 	}
-	return cost.Float64, tokens.Int64, nil
+	return cost.Float64, promptCost.Float64, completionCost.Float64, tokens.Int64, byok.Int64, nil
 }
 
 // BucketSeries returns one BucketPoint per time bucket in [from,
@@ -202,8 +236,11 @@ func (s *Store) BucketSeries(ctx context.Context, from, to time.Time, bucket Sta
 			COALESCE(SUM(CASE WHEN r.status = 'succeeded' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN r.status = 'failed'    THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(t.cost_usd), 0),
+			COALESCE(SUM(t.cost_prompt_usd), 0),
+			COALESCE(SUM(t.cost_completion_usd), 0),
 			COALESCE(SUM(t.input_tokens), 0),
-			COALESCE(SUM(t.output_tokens), 0)
+			COALESCE(SUM(t.output_tokens), 0),
+			COALESCE(SUM(CASE WHEN t.is_byok = 1 THEN 1 ELSE 0 END), 0)
 		FROM runs r
 		LEFT JOIN telemetry t ON t.run_id = r.id
 		WHERE r.started_at >= ? AND r.started_at <= ?
@@ -220,7 +257,7 @@ func (s *Store) BucketSeries(ctx context.Context, from, to time.Time, bucket Sta
 			bucketStr string
 			bp        BucketPoint
 		)
-		if err := rows.Scan(&bucketStr, &bp.Runs, &bp.Succeeded, &bp.Failed, &bp.CostUSD, &bp.InputTokens, &bp.OutputTokens); err != nil {
+		if err := rows.Scan(&bucketStr, &bp.Runs, &bp.Succeeded, &bp.Failed, &bp.CostUSD, &bp.CostPromptUSD, &bp.CostCompletionUSD, &bp.InputTokens, &bp.OutputTokens, &bp.BYOKRuns); err != nil {
 			return nil, fmt.Errorf("store: bucket scan: %w", err)
 		}
 		t, err := time.Parse(bucketFormatForParse(bucket), bucketStr)
@@ -302,15 +339,24 @@ func (s *Store) GroupedBucketSeries(ctx context.Context, from, to time.Time, buc
 // dashboard's Repositories page. Limited to repos that have at
 // least one completed run in the window; an "all-time" call with
 // a wide window is the right shape for the side panel.
+//
+// QUB-105: the rollup adds the prompt vs completion cost split
+// and the BYOK run count. The split feeds the dashboard's
+// "cheap input vs expensive reasoning" per-repo chart; the BYOK
+// count lets the operator see which repos are routed via
+// cluster-supplied provider keys.
 type RepoRollup struct {
-	Owner        string    `json:"owner"`
-	Repo         string    `json:"repo"`
-	Runs         int64     `json:"runs"`
-	Succeeded    int64     `json:"succeeded"`
-	Failed       int64     `json:"failed"`
-	SuccessRate  float64   `json:"success_rate"`
-	TotalCostUSD float64   `json:"total_cost_usd"`
-	LastRunAt    time.Time `json:"last_run_at"`
+	Owner           string    `json:"owner"`
+	Repo            string    `json:"repo"`
+	Runs            int64     `json:"runs"`
+	Succeeded       int64     `json:"succeeded"`
+	Failed          int64     `json:"failed"`
+	SuccessRate     float64   `json:"success_rate"`
+	TotalCostUSD    float64   `json:"total_cost_usd"`
+	CostPromptUSD   float64   `json:"cost_prompt_usd"`
+	CostCompletionUSD float64 `json:"cost_completion_usd"`
+	BYOKRuns        int64     `json:"byok_runs"`
+	LastRunAt       time.Time `json:"last_run_at"`
 }
 
 // PerRepo returns one RepoRollup per repo, ordered by total runs
@@ -328,6 +374,9 @@ func (s *Store) PerRepo(ctx context.Context, from, to time.Time, limit int) ([]R
 			COALESCE(SUM(CASE WHEN r.status = 'succeeded' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN r.status = 'failed'    THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(t.cost_usd), 0),
+			COALESCE(SUM(t.cost_prompt_usd), 0),
+			COALESCE(SUM(t.cost_completion_usd), 0),
+			COALESCE(SUM(CASE WHEN t.is_byok = 1 THEN 1 ELSE 0 END), 0),
 			MAX(r.started_at)
 		FROM runs r
 		LEFT JOIN telemetry t ON t.run_id = r.id
@@ -346,7 +395,7 @@ func (s *Store) PerRepo(ctx context.Context, from, to time.Time, limit int) ([]R
 			rr     RepoRollup
 			lastAt string
 		)
-		if err := rows.Scan(&rr.Owner, &rr.Repo, &rr.Runs, &rr.Succeeded, &rr.Failed, &rr.TotalCostUSD, &lastAt); err != nil {
+		if err := rows.Scan(&rr.Owner, &rr.Repo, &rr.Runs, &rr.Succeeded, &rr.Failed, &rr.TotalCostUSD, &rr.CostPromptUSD, &rr.CostCompletionUSD, &rr.BYOKRuns, &lastAt); err != nil {
 			return nil, fmt.Errorf("store: per repo scan: %w", err)
 		}
 		if rr.Runs > 0 {
@@ -366,12 +415,20 @@ func (s *Store) PerRepo(ctx context.Context, from, to time.Time, limit int) ([]R
 // ModelRollup is the per-model breakdown. Same shape as
 // RepoRollup; the dashboard renders these as a stacked-bar chart
 // on the cost page.
+//
+// QUB-105: the per-model rollup exposes the prompt vs
+// completion cost split and the BYOK run count so a
+// single-model dashboard view can answer "is this model
+// cheap on input or expensive on reasoning?".
 type ModelRollup struct {
-	Model        string  `json:"model"`
-	Runs         int64   `json:"runs"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
-	InputTokens  int64   `json:"input_tokens"`
-	OutputTokens int64   `json:"output_tokens"`
+	Model           string  `json:"model"`
+	Runs            int64   `json:"runs"`
+	TotalCostUSD    float64 `json:"total_cost_usd"`
+	CostPromptUSD   float64 `json:"cost_prompt_usd"`
+	CostCompletionUSD float64 `json:"cost_completion_usd"`
+	InputTokens     int64   `json:"input_tokens"`
+	OutputTokens    int64   `json:"output_tokens"`
+	BYOKRuns        int64   `json:"byok_runs"`
 }
 
 // PerModel returns the per-model rollup. Pulled from the
@@ -383,8 +440,11 @@ func (s *Store) PerModel(ctx context.Context, from, to time.Time) ([]ModelRollup
 		SELECT t.model,
 			COUNT(t.run_id),
 			COALESCE(SUM(t.cost_usd), 0),
+			COALESCE(SUM(t.cost_prompt_usd), 0),
+			COALESCE(SUM(t.cost_completion_usd), 0),
 			COALESCE(SUM(t.input_tokens), 0),
-			COALESCE(SUM(t.output_tokens), 0)
+			COALESCE(SUM(t.output_tokens), 0),
+			COALESCE(SUM(CASE WHEN t.is_byok = 1 THEN 1 ELSE 0 END), 0)
 		FROM telemetry t
 		JOIN runs r ON r.id = t.run_id
 		WHERE r.started_at >= ? AND r.started_at <= ?
@@ -398,7 +458,7 @@ func (s *Store) PerModel(ctx context.Context, from, to time.Time) ([]ModelRollup
 	var out []ModelRollup
 	for rows.Next() {
 		var m ModelRollup
-		if err := rows.Scan(&m.Model, &m.Runs, &m.TotalCostUSD, &m.InputTokens, &m.OutputTokens); err != nil {
+		if err := rows.Scan(&m.Model, &m.Runs, &m.TotalCostUSD, &m.CostPromptUSD, &m.CostCompletionUSD, &m.InputTokens, &m.OutputTokens, &m.BYOKRuns); err != nil {
 			return nil, fmt.Errorf("store: per model scan: %w", err)
 		}
 		out = append(out, m)

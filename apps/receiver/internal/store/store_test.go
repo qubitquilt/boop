@@ -394,18 +394,29 @@ func TestRecordTelemetry(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
+	reqID := "chatcmpl-1"
+	dur := int64(4321)
 	telem := Telemetry{
-		RunID:            "boop-a-b-1-aaaaaaa",
-		Model:            "openrouter/anthropic/claude-3.5-sonnet",
-		Provider:         "openrouter",
-		InputTokens:      1000,
-		OutputTokens:     500,
-		ReasoningTokens:  0,
-		CacheReadTokens:  200,
-		CacheWriteTokens: 0,
-		CostUSD:          0.0123,
-		StepCount:        3,
-		RecordedAt:       now,
+		RunID:               "boop-a-b-1-aaaaaaa",
+		Model:               "openrouter/anthropic/claude-3.5-sonnet",
+		Provider:            "openrouter",
+		InputTokens:         1000,
+		OutputTokens:        500,
+		TotalTokens:         1505,
+		ReasoningTokens:     0,
+		CacheReadTokens:     200,
+		CacheWriteTokens:    0,
+		CostUSD:             0.0123,
+		CostPromptUSD:       0.001,
+		CostCompletionUSD:   0.0113,
+		CostUpstreamUSD:     0.0124,
+		IsByok:              true,
+		ServerToolCallsExec: 0,
+		ServerToolCallsReq:  0,
+		RequestID:           &reqID,
+		DurationMS:          &dur,
+		StepCount:           3,
+		RecordedAt:          now,
 	}
 	if err := s.RecordTelemetry(ctx, telem); err != nil {
 		t.Fatalf("record: %v", err)
@@ -417,11 +428,118 @@ func TestRecordTelemetry(t *testing.T) {
 	if got.Model != telem.Model {
 		t.Errorf("model = %q", got.Model)
 	}
-	if got.InputTokens != 1000 || got.OutputTokens != 500 {
+	if got.InputTokens != 1000 || got.OutputTokens != 500 || got.TotalTokens != 1505 {
 		t.Errorf("tokens = %+v", got)
 	}
 	if got.CostUSD != 0.0123 {
 		t.Errorf("cost = %f", got.CostUSD)
+	}
+	if got.CostPromptUSD != 0.001 || got.CostCompletionUSD != 0.0113 || got.CostUpstreamUSD != 0.0124 {
+		t.Errorf("cost split = (%f, %f, %f)", got.CostPromptUSD, got.CostCompletionUSD, got.CostUpstreamUSD)
+	}
+	if !got.IsByok {
+		t.Errorf("is_byok = false, want true")
+	}
+	if got.RequestID == nil || *got.RequestID != reqID {
+		t.Errorf("request_id = %v, want %q", got.RequestID, reqID)
+	}
+	if got.DurationMS == nil || *got.DurationMS != dur {
+		t.Errorf("duration_ms = %v, want %d", got.DurationMS, dur)
+	}
+}
+
+func TestRecordTelemetry_DefaultsForMissingQUB105Fields(t *testing.T) {
+	// QUB-105 acceptance: a pre-QUB-105 runner posts a partial
+	// payload (no total_tokens, no request_id, no cost
+	// split). The store lands a usable row with the SQL DEFAULT
+	// values for the new scalar columns and NULL for the
+	// nullable ones — the dashboard can render a row even when
+	// the runner is still on the older contract.
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusSucceeded, now)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	telem := Telemetry{
+		RunID:        "boop-a-b-1-aaaaaaa",
+		Model:        "m",
+		InputTokens:  100,
+		OutputTokens: 50,
+		CostUSD:      0.001,
+		StepCount:    1,
+		RecordedAt:   now,
+	}
+	if err := s.RecordTelemetry(ctx, telem); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	got, err := s.GetTelemetry(ctx, telem.RunID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.TotalTokens != 0 {
+		t.Errorf("total_tokens = %d, want 0", got.TotalTokens)
+	}
+	if got.CostPromptUSD != 0 || got.CostCompletionUSD != 0 || got.CostUpstreamUSD != 0 {
+		t.Errorf("cost split not zeroed: %+v", got)
+	}
+	if got.IsByok {
+		t.Errorf("is_byok = true, want false (default)")
+	}
+	if got.RequestID != nil {
+		t.Errorf("request_id = %v, want nil", got.RequestID)
+	}
+	if got.DurationMS != nil {
+		t.Errorf("duration_ms = %v, want nil", got.DurationMS)
+	}
+}
+
+func TestRecordTelemetry_QUB105ErrorContext(t *testing.T) {
+	// QUB-105: a failed SDK call stamps the human-readable
+	// error string, status_code, content_type, and a short
+	// body snippet on the telemetry row. The nullable columns
+	// store NULL on success; the dashboard's failure-class
+	// filter can read error_status_code (typed) for
+	// programmatic decisions and error (string) for the
+	// operator's breadcrumb.
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusFailed, now)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	statusCode := int64(401)
+	contentType := "application/json"
+	errMsg := "OpenRouter chat completion failed (401): Bad token"
+	errBody := `{"error":"unauthorized"}`
+	telem := Telemetry{
+		RunID:            "boop-a-b-1-aaaaaaa",
+		Model:            "openrouter/x",
+		StepCount:        1,
+		RecordedAt:       now,
+		Error:            &errMsg,
+		ErrorStatusCode:  &statusCode,
+		ErrorContentType: &contentType,
+		ErrorBody:        &errBody,
+	}
+	if err := s.RecordTelemetry(ctx, telem); err != nil {
+		t.Fatalf("record: %v", err)
+	}
+	got, err := s.GetTelemetry(ctx, telem.RunID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Error == nil || *got.Error != errMsg {
+		t.Errorf("error = %v, want %q", got.Error, errMsg)
+	}
+	if got.ErrorStatusCode == nil || *got.ErrorStatusCode != 401 {
+		t.Errorf("error_status_code = %v, want 401", got.ErrorStatusCode)
+	}
+	if got.ErrorContentType == nil || *got.ErrorContentType != "application/json" {
+		t.Errorf("error_content_type = %v, want application/json", got.ErrorContentType)
+	}
+	if got.ErrorBody == nil || *got.ErrorBody != errBody {
+		t.Errorf("error_body = %v, want %q", got.ErrorBody, errBody)
 	}
 }
 

@@ -47,6 +47,16 @@ export async function postStatus(stage, ctx, deps, reason) {
  * postTelemetry sends the final token + cost rollup for a run.
  * Same best-effort contract as postStatus. Called once at the
  * end of a successful or failed review.
+ *
+ * QUB-105: the payload carries every QUB-105 field
+ * (`total_tokens`, `cost_prompt_usd`, `cost_completion_usd`,
+ * `is_byok`, `server_tool_calls_*`, `request_id`, `duration_ms`,
+ * `error_status_code`, `error_content_type`, `error_body`).
+ * `JSON.stringify` drops `undefined` values, so a successful
+ * call with no error fields serialises a clean object — the
+ * receiver's `telemetryRequest` accepts the new fields as
+ * optional and the SQL columns have defaults, so a partial
+ * payload (older runner, missing fields) lands cleanly.
  */
 export async function postTelemetry(telemetry, ctx, deps) {
   if (!ctx.dashboardUrl || !ctx.dashboardToken) return;
@@ -57,11 +67,24 @@ export async function postTelemetry(telemetry, ctx, deps) {
     provider: telemetry.provider,
     input_tokens: telemetry.inputTokens,
     output_tokens: telemetry.outputTokens,
+    total_tokens: telemetry.totalTokens,
     reasoning_tokens: telemetry.reasoningTokens,
     cache_read_tokens: telemetry.cacheReadTokens,
     cache_write_tokens: telemetry.cacheWriteTokens,
     cost_usd: telemetry.costUsd,
+    cost_prompt_usd: telemetry.costPromptUsd,
+    cost_completion_usd: telemetry.costCompletionUsd,
+    cost_upstream_usd: telemetry.costUpstreamUsd,
+    is_byok: telemetry.isByok === true,
+    server_tool_calls_executed: telemetry.serverToolCallsExecuted,
+    server_tool_calls_requested: telemetry.serverToolCallsRequested,
+    request_id: telemetry.requestId,
+    duration_ms: telemetry.durationMs,
     step_count: telemetry.stepCount,
+    error: telemetry.error,
+    error_status_code: telemetry.errorStatusCode,
+    error_content_type: telemetry.errorContentType,
+    error_body: telemetry.errorBody,
   });
   await postWithRetry(url, body, ctx.dashboardToken, deps);
 }

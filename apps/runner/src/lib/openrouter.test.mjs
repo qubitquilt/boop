@@ -7,6 +7,7 @@ import {
   buildTelemetry,
   callOpenRouter,
   emptyTelemetry,
+  extractUsage,
   runOpenCodeSkill,
   parseReviewOutput,
   buildBoopPrompt,
@@ -87,11 +88,19 @@ test("callOpenRouter returns text, usage, and model on success", async () => {
   });
   assert.equal(result.text, "hello from the model");
   assert.equal(result.model, "minimax/minimax-m3");
-  assert.deepEqual(result.usage, {
-    prompt_tokens: 12,
-    completion_tokens: 34,
-    cost: 0.0007,
-  });
+  // QUB-105: extractUsage also forwards total_tokens and the
+  // response-level request_id. The "minimal" response in this
+  // fixture does not include cost_details / is_byok /
+  // server_tool_use_details, so those keys are omitted entirely
+  // (not undefined) — see the assertion below.
+  assert.equal(result.usage.prompt_tokens, 12);
+  assert.equal(result.usage.completion_tokens, 34);
+  assert.equal(result.usage.total_tokens, 46);
+  assert.equal(result.usage.cost, 0.0007);
+  assert.equal(result.requestId, "chatcmpl-1");
+  assert.equal(typeof result.durationMs, "number");
+  assert.equal(result.usage.cost_prompt_usd, undefined);
+  assert.equal(result.usage.is_byok, undefined);
 });
 
 test("callOpenRouter surfaces cached and reasoning tokens when present", async () => {
@@ -103,6 +112,185 @@ test("callOpenRouter surfaces cached and reasoning tokens when present", async (
   const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
   assert.equal(result.usage.cached_tokens, 5);
   assert.equal(result.usage.reasoning_tokens, 9);
+});
+
+test("callOpenRouter surfaces total_tokens and request_id (QUB-105)", async () => {
+  // The SDK exposes the server-computed totalTokens and the
+  // response-level id. Both surface as fields on the call
+  // result: total_tokens is on usage (mirrors the SDK's
+  // snake_case JSON key), request_id rides on usage too
+  // because extractUsage reads response.id there.
+  const value = makeAssistantResponse();
+  value.id = "chatcmpl-xyz";
+  value.usage.totalTokens = 999;
+  const { fn: chatSend } = makeFakeChatSend({ value });
+  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  assert.equal(result.usage.total_tokens, 999);
+  assert.equal(result.usage.request_id, "chatcmpl-xyz");
+  assert.equal(result.requestId, "chatcmpl-xyz");
+});
+
+test("callOpenRouter surfaces the SDK's cost_details split when present (QUB-105)", async () => {
+  // Mirror a real ChatUsage shape: the SDK exposes the prompt
+  // vs completion cost split (and the upstream-reported total)
+  // on usage.costDetails. extractUsage forwards the fields
+  // and buildTelemetry maps them onto costPromptUsd /
+  // costCompletionUsd / costUpstreamUsd.
+  const value = {
+    ...makeAssistantResponse(),
+    usage: {
+      ...makeAssistantResponse().usage,
+      costDetails: {
+        upstreamInferencePromptCost: 0.0008,
+        upstreamInferenceCompletionsCost: 0.004,
+        upstreamInferenceCost: 0.0051,
+      },
+    },
+  };
+  const { fn: chatSend } = makeFakeChatSend({ value });
+  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  // camelCase SDK fields → snake_case runner fields: this
+  // exercises the actual extraction path inside extractUsage
+  // (not the buildTelemetry mapping, which has its own test).
+  assert.equal(result.usage.cost_prompt_usd, 0.0008);
+  assert.equal(result.usage.cost_completion_usd, 0.004);
+  assert.equal(result.usage.cost_upstream_usd, 0.0051);
+});
+
+test("callOpenRouter accepts the SDK camelCase cost_details shape (QUB-105)", async () => {
+  // Direct coverage of the camelCase→snake_case conversion in
+  // extractUsage. The SDK's serializer produces camelCase keys
+  // (costDetails, upstreamInferencePromptCost, isByok,
+  // serverToolUseDetails); extractUsage must read those keys
+  // and the snake_case fallbacks in one pass, then expose
+  // snake_case on the runner's wire shape. This test uses the
+  // full camelCase fixture rather than the pre-converted
+  // snake_case one in the buildTelemetry mapping test.
+  const value = {
+    id: "chatcmpl-camel",
+    choices: [
+      {
+        index: 0,
+        finishReason: "stop",
+        message: { role: "assistant", content: "ok" },
+      },
+    ],
+    model: "anthropic/claude-3.5-sonnet",
+    usage: {
+      promptTokens: 200,
+      completionTokens: 100,
+      totalTokens: 305,
+      cost: 0.01,
+      promptTokensDetails: { cachedTokens: 5 },
+      completionTokensDetails: { reasoningTokens: 5 },
+      costDetails: {
+        upstreamInferencePromptCost: 0.002,
+        upstreamInferenceCompletionsCost: 0.008,
+        upstreamInferenceCost: 0.0101,
+      },
+      isByok: true,
+      serverToolUseDetails: {
+        toolCallsExecuted: 0,
+        toolCallsRequested: 0,
+      },
+    },
+  };
+  const { fn: chatSend } = makeFakeChatSend({ value });
+  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  assert.equal(result.usage.prompt_tokens, 200);
+  assert.equal(result.usage.completion_tokens, 100);
+  assert.equal(result.usage.total_tokens, 305);
+  assert.equal(result.usage.cached_tokens, 5);
+  assert.equal(result.usage.reasoning_tokens, 5);
+  assert.equal(result.usage.cost_prompt_usd, 0.002);
+  assert.equal(result.usage.cost_completion_usd, 0.008);
+  assert.equal(result.usage.cost_upstream_usd, 0.0101);
+  assert.equal(result.usage.is_byok, true);
+  assert.equal(result.usage.server_tool_calls_executed, 0);
+  assert.equal(result.usage.server_tool_calls_requested, 0);
+  assert.equal(result.requestId, "chatcmpl-camel");
+});
+
+test("extractUsage accepts the SDK camelCase cost_details shape (QUB-105)", () => {
+  // Direct unit-level coverage of extractUsage itself. The
+  // function is module-internal; the test imports it via the
+  // re-export shim. The buildTelemetry mapping tests above
+  // assert the runner-side rename; this test pins the SDK→
+  // runner key translation in extractUsage so a future
+  // refactor that drops the camelCase accessor fails here.
+  const out = extractUsage({
+    id: "chatcmpl-direct",
+    usage: {
+      promptTokens: 100,
+      completionTokens: 50,
+      totalTokens: 150,
+      cost: 0.005,
+      costDetails: {
+        upstreamInferencePromptCost: 0.001,
+        upstreamInferenceCompletionsCost: 0.004,
+        upstreamInferenceCost: 0.0052,
+      },
+      isByok: true,
+      serverToolUseDetails: { toolCallsExecuted: 0, toolCallsRequested: 0 },
+    },
+  });
+  assert.equal(out.prompt_tokens, 100);
+  assert.equal(out.completion_tokens, 50);
+  assert.equal(out.total_tokens, 150);
+  assert.equal(out.cost_prompt_usd, 0.001);
+  assert.equal(out.cost_completion_usd, 0.004);
+  assert.equal(out.cost_upstream_usd, 0.0052);
+  assert.equal(out.is_byok, true);
+  assert.equal(out.server_tool_calls_executed, 0);
+  assert.equal(out.server_tool_calls_requested, 0);
+  assert.equal(out.request_id, "chatcmpl-direct");
+});
+
+test("callOpenRouter surfaces isByok and server_tool_use_details (QUB-105)", async () => {
+  // The SDK exposes isByok (boolean) and server_tool_use_details
+  // (per-call tool stats). The runner does not enable tools
+  // today so the SDK reports zeros; the fixture exercises
+  // both fields so a future tool-using skill does not need
+  // a runner-side schema change.
+  const value = {
+    ...makeAssistantResponse(),
+    usage: {
+      ...makeAssistantResponse().usage,
+      isByok: true,
+      serverToolUseDetails: {
+        toolCallsExecuted: 0,
+        toolCallsRequested: 0,
+      },
+    },
+  };
+  const { fn: chatSend } = makeFakeChatSend({ value });
+  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  assert.equal(result.usage.is_byok, true);
+  assert.equal(result.usage.server_tool_calls_executed, 0);
+  assert.equal(result.usage.server_tool_calls_requested, 0);
+});
+
+test("callOpenRouter stamps QUB-105 error context on the thrown Error", async () => {
+  // QUB-105 acceptance: a non-ok SDK result throws with the
+  // same diagnostic fields the errlog captures, so the
+  // runner's buildTelemetry can stamp them on the telemetry
+  // row. The fixture uses the SDK's typed error shape.
+  const err = Object.assign(new Error("Bad Request: invalid model"), {
+    statusCode: 400,
+    body: '{"error":"invalid model"}',
+    contentType: "application/json",
+  });
+  const { fn: chatSend } = makeFakeChatSend({ error: err });
+  await assert.rejects(
+    () => callOpenRouter("p", { ...baseDeps(), chatSend }),
+    (caught) => {
+      assert.equal(caught.statusCode, 400);
+      assert.equal(caught.errorContentType, "application/json");
+      assert.equal(caught.errorBody, '{"error":"invalid model"}');
+      assert.equal(typeof caught.durationMs, "number");
+      return true;
+    },
+  );
 });
 
 test("callOpenRouter concatenates structured content parts", async () => {
@@ -236,11 +424,14 @@ test("callOpenRouter uses zero token counts when the response has no usage", asy
   delete value.usage;
   const { fn: chatSend } = makeFakeChatSend({ value });
   const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
-  assert.deepEqual(result.usage, {
-    prompt_tokens: 0,
-    completion_tokens: 0,
-    cost: 0,
-  });
+  // QUB-105: the SDK returning no usage falls back to all-zero
+  // numerics, but the response-level request_id is still
+  // captured (it lives on `response.id`, not on `usage`).
+  assert.equal(result.usage.prompt_tokens, 0);
+  assert.equal(result.usage.completion_tokens, 0);
+  assert.equal(result.usage.total_tokens, 0);
+  assert.equal(result.usage.cost, 0);
+  assert.equal(result.requestId, "chatcmpl-1");
 });
 
 test("callOpenRouter falls back to zero cost when usage.cost is missing", async () => {
@@ -313,28 +504,129 @@ test("callOpenRouter does not read files or spawn processes", async () => {
 });
 
 test("buildTelemetry maps SDK usage onto the dashboard shape", () => {
+  // QUB-105: the dashboard shape gains totalTokens, the prompt
+  // / completion cost split, isByok, server tool stats,
+  // requestId, and durationMs. The "happy path" fixture still
+  // matches a real OpenRouter ChatUsage; the new fields default
+  // to zero / undefined so a payload missing cost_details does
+  // not crash buildTelemetry.
   const callResult = {
     text: "irrelevant",
     model: "minimax/minimax-m3",
     usage: {
       prompt_tokens: 100,
       completion_tokens: 50,
+      total_tokens: 153,
       cost: 0.001,
       cached_tokens: 8,
       reasoning_tokens: 3,
     },
+    requestId: "chatcmpl-1",
+    durationMs: 4321,
   };
-  assert.deepEqual(buildTelemetry(callResult), {
+  const t = buildTelemetry(callResult);
+  assert.equal(t.model, "minimax/minimax-m3");
+  assert.equal(t.provider, "openrouter");
+  assert.equal(t.inputTokens, 100);
+  assert.equal(t.outputTokens, 50);
+  assert.equal(t.totalTokens, 153);
+  assert.equal(t.reasoningTokens, 3);
+  assert.equal(t.cacheReadTokens, 8);
+  assert.equal(t.cacheWriteTokens, 0);
+  assert.equal(t.costUsd, 0.001);
+  assert.equal(t.costPromptUsd, 0);
+  assert.equal(t.costCompletionUsd, 0);
+  assert.equal(t.costUpstreamUsd, 0);
+  assert.equal(t.isByok, false);
+  assert.equal(t.serverToolCallsExecuted, 0);
+  assert.equal(t.serverToolCallsRequested, 0);
+  assert.equal(t.requestId, "chatcmpl-1");
+  assert.equal(t.durationMs, 4321);
+  assert.equal(t.stepCount, 1);
+});
+
+test("buildTelemetry forwards cost_details prompt / completion / upstream split (QUB-105)", () => {
+  // The SDK's `usage.cost_details` block splits the lumped
+  // `cost_usd` so the dashboard can render
+  // "cheap input vs expensive reasoning". The camelCase
+  // accessor is the modern SDK; the snake_case fallback is
+  // tested separately below.
+  const callResult = {
     model: "minimax/minimax-m3",
-    provider: "openrouter",
-    inputTokens: 100,
-    outputTokens: 50,
-    reasoningTokens: 3,
-    cacheReadTokens: 8,
-    cacheWriteTokens: 0,
-    costUsd: 0.001,
-    stepCount: 1,
+    usage: {
+      prompt_tokens: 100,
+      completion_tokens: 50,
+      total_tokens: 150,
+      cost: 0.005,
+      cost_prompt_usd: 0.0008,
+      cost_completion_usd: 0.004,
+      cost_upstream_usd: 0.0051,
+    },
+  };
+  const t = buildTelemetry(callResult);
+  assert.equal(t.costUsd, 0.005);
+  assert.equal(t.costPromptUsd, 0.0008);
+  assert.equal(t.costCompletionUsd, 0.004);
+  assert.equal(t.costUpstreamUsd, 0.0051);
+});
+
+test("buildTelemetry surfaces isByok, server tool stats, and requestId (QUB-105)", () => {
+  const callResult = {
+    model: "minimax/minimax-m3",
+    usage: {
+      prompt_tokens: 1,
+      completion_tokens: 2,
+      cost: 0.0001,
+      is_byok: true,
+      server_tool_calls_executed: 0,
+      server_tool_calls_requested: 0,
+    },
+    requestId: "chatcmpl-x",
+  };
+  const t = buildTelemetry(callResult);
+  assert.equal(t.isByok, true);
+  assert.equal(t.serverToolCallsExecuted, 0);
+  assert.equal(t.serverToolCallsRequested, 0);
+  assert.equal(t.requestId, "chatcmpl-x");
+});
+
+test("buildTelemetry accepts snake_case cost_details (older SDK fallback)", () => {
+  // Pre-1.2 SDKs may return snake_case keys; extractUsage
+  // tolerates both via `??`. The dashboard wire format is the
+  // snake_case shape either way (the runner renames once in
+  // buildTelemetry), so a partial fixture that uses snake_case
+  // round-trips identically.
+  const t = buildTelemetry({
+    model: "m",
+    usage: {
+      prompt_tokens: 1,
+      completion_tokens: 2,
+      cost: 0.0001,
+      cost_prompt_usd: 0.00005,
+      cost_completion_usd: 0.00005,
+      cost_upstream_usd: 0.00011,
+      is_byok: false,
+    },
   });
+  assert.equal(t.costPromptUsd, 0.00005);
+  assert.equal(t.costCompletionUsd, 0.00005);
+  assert.equal(t.costUpstreamUsd, 0.00011);
+  assert.equal(t.isByok, false);
+});
+
+test("buildTelemetry falls back to zero for missing cost_details split", () => {
+  // A SDK release that does not surface cost_details (older
+  // models, some Anthropic paths) still produces a usable row
+  // with the lumped cost_usd and zero for the split.
+  const t = buildTelemetry({
+    model: "m",
+    usage: { prompt_tokens: 1, completion_tokens: 2, cost: 0.0001 },
+  });
+  assert.equal(t.costUsd, 0.0001);
+  assert.equal(t.costPromptUsd, 0);
+  assert.equal(t.costCompletionUsd, 0);
+  assert.equal(t.costUpstreamUsd, 0);
+  assert.equal(t.isByok, false);
 });
 
 test("buildTelemetry drops provider ambiguity and pins stepCount to 1", () => {
@@ -379,6 +671,37 @@ test("buildTelemetry stamps the error message on a failed-call row", () => {
   assert.equal(t.error, "401 Unauthorized");
   assert.equal(t.inputTokens, 0);
   assert.equal(t.costUsd, 0);
+});
+
+test("buildTelemetry stamps QUB-105 error context (status, content-type, body, duration)", () => {
+  // QUB-105: the SDK's typed error fields land on the
+  // telemetry row so a 4xx is diagnosable from the dashboard
+  // without a pod-log round trip. callOpenRouter attaches
+  // statusCode / errorContentType / errorBody / durationMs
+  // to the thrown Error; buildTelemetry reads them through.
+  const err = new Error("OpenRouter chat completion failed (401): Bad token");
+  err.statusCode = 401;
+  err.errorContentType = "application/json";
+  err.errorBody = '{"error":"unauthorized"}';
+  err.durationMs = 1234;
+  const t = buildTelemetry(null, err);
+  assert.equal(t.error, "OpenRouter chat completion failed (401): Bad token");
+  assert.equal(t.errorStatusCode, 401);
+  assert.equal(t.errorContentType, "application/json");
+  assert.equal(t.errorBody, '{"error":"unauthorized"}');
+  assert.equal(t.durationMs, 1234);
+});
+
+test("buildTelemetry leaves QUB-105 error fields absent on a successful call", () => {
+  // The error fields stay undefined so the dashboard does not
+  // surface stale diagnostic context on a successful run.
+  const t = buildTelemetry({
+    model: "m",
+    usage: { prompt_tokens: 1, completion_tokens: 1, cost: 0 },
+  });
+  assert.equal("errorStatusCode" in t, false);
+  assert.equal("errorContentType" in t, false);
+  assert.equal("errorBody" in t, false);
 });
 
 test("buildTelemetry leaves error absent on a successful call", () => {

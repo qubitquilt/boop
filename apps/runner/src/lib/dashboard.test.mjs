@@ -86,6 +86,79 @@ test("postTelemetry POSTs the full telemetry payload", async () => {
   assert.equal(body.step_count, 2);
 });
 
+test("postTelemetry forwards QUB-105 fields to the dashboard (QUB-105)", async () => {
+  // QUB-105 acceptance: the receiver's telemetryRequest struct
+  // grows new optional fields. The runner serialises them
+  // here; the receiver stores them; the dashboard renders
+  // them. The fixture exercises every QUB-105 field including
+  // the failed-call error context.
+  sent.length = 0;
+  const telem = {
+    model: "openrouter/anthropic/claude-3.5-sonnet",
+    provider: "openrouter",
+    inputTokens: 100,
+    outputTokens: 50,
+    totalTokens: 175,
+    reasoningTokens: 10,
+    cacheReadTokens: 5,
+    cacheWriteTokens: 0,
+    costUsd: 0.0123,
+    costPromptUsd: 0.001,
+    costCompletionUsd: 0.0113,
+    costUpstreamUsd: 0.0124,
+    isByok: true,
+    serverToolCallsExecuted: 0,
+    serverToolCallsRequested: 0,
+    requestId: "chatcmpl-xyz",
+    durationMs: 4321,
+    stepCount: 1,
+    error: "401 Unauthorized",
+    errorStatusCode: 401,
+    errorContentType: "application/json",
+  };
+  await postTelemetry(telem, makeCtx(), { log: () => {}, fetchImpl: makeFetchOK() });
+  assert.equal(sent.length, 1);
+  const body = JSON.parse(sent[0].init.body);
+  assert.equal(body.total_tokens, 175);
+  assert.equal(body.cost_prompt_usd, 0.001);
+  assert.equal(body.cost_completion_usd, 0.0113);
+  assert.equal(body.cost_upstream_usd, 0.0124);
+  assert.equal(body.is_byok, true);
+  assert.equal(body.server_tool_calls_executed, 0);
+  assert.equal(body.server_tool_calls_requested, 0);
+  assert.equal(body.request_id, "chatcmpl-xyz");
+  assert.equal(body.duration_ms, 4321);
+  assert.equal(body.error, "401 Unauthorized");
+  assert.equal(body.error_status_code, 401);
+  assert.equal(body.error_content_type, "application/json");
+});
+
+test("postTelemetry omits undefined QUB-105 fields (clean wire shape)", async () => {
+  // Successful calls leave the error fields undefined;
+  // JSON.stringify drops undefined so the wire payload stays
+  // clean. The receiver treats the absent keys as nullable
+  // columns.
+  sent.length = 0;
+  const telem = {
+    model: "openrouter/x",
+    provider: "openrouter",
+    inputTokens: 1,
+    outputTokens: 1,
+    costUsd: 0.0001,
+    stepCount: 1,
+    requestId: "chatcmpl-1",
+    durationMs: 100,
+  };
+  await postTelemetry(telem, makeCtx(), { log: () => {}, fetchImpl: makeFetchOK() });
+  assert.equal(sent.length, 1);
+  const body = JSON.parse(sent[0].init.body);
+  assert.equal("error" in body, false, "no error on a successful call");
+  assert.equal("error_status_code" in body, false);
+  assert.equal("error_content_type" in body, false);
+  assert.equal(body.request_id, "chatcmpl-1");
+  assert.equal(body.duration_ms, 100);
+});
+
 test("postStatus retries once on 5xx, then gives up", async () => {
   sent.length = 0;
   const fr = makeFetchRetry([500, 500]);
