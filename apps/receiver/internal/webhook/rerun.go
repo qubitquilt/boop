@@ -299,6 +299,18 @@ func (h *Handler) CreateRerunJob(ctx context.Context, prior store.Run, reason st
 		// future "rerun with override" endpoint can
 		// add a per-rerun flag.
 		OpenRouterSDKEnabled: h.cfg.OpenRouterSDKDefault,
+		// QUB-106: forward the receiver's OPENROUTER_MODEL
+		// to the rerun Job. The runner reads it as
+		// ctx.openrouterModel and calls the OpenRouter SDK
+		// with it. Without this, the jobbuilder sets
+		// OPENROUTER_MODEL="" and the runner's expert
+		// dispatch throws `callOpenRouter: 'model' is
+		// required` (openrouter.mjs:182). The main
+		// submit path in handler.go already does this;
+		// the rerun path missed it in PR #135 and
+		// every dashboard requeue has been silently
+		// broken since.
+		OpenRouterModel: h.cfg.OpenRouterModel,
 		// Dashboard URL/Token: same as the original
 		// Job so the rerun's telemetry lands in the
 		// same data layer.

@@ -43,6 +43,7 @@ func newTestHandlerWithStoreAndKube(t *testing.T) *Handler {
 			TargetNamespace:      "dev-tools",
 			RunnerToken:          "test-runner-token",
 			OpenRouterSDKDefault: "1",
+			OpenRouterModel:      "test-model",
 		},
 		logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		store:  s,
@@ -150,6 +151,25 @@ func TestCreateRerunJob_CreatesK8sJob(t *testing.T) {
 	}
 	if !found {
 		t.Error("BOOP_PARENT_RUN_ID env var missing from Job")
+	}
+	// QUB-126: OPENROUTER_MODEL must be forwarded on
+	// re-runs. The main submit path (handler.go) sets it
+	// from h.cfg.OpenRouterModel; the rerun path missed
+	// this in PR #135 and every dashboard requeue has
+	// landed the runner with OPENROUTER_MODEL="" since,
+	// tripping the runner's `model is required` guard.
+	// A unit test that fails on the current code keeps
+	// the regression from coming back.
+	var modelEnv *corev1.EnvVar
+	for i, env := range job.Spec.Template.Spec.Containers[0].Env {
+		if env.Name == "OPENROUTER_MODEL" {
+			modelEnv = &job.Spec.Template.Spec.Containers[0].Env[i]
+		}
+	}
+	if modelEnv == nil {
+		t.Error("OPENROUTER_MODEL env var missing from Job")
+	} else if modelEnv.Value != "test-model" {
+		t.Errorf("OPENROUTER_MODEL = %q, want %q (QUB-126: rerun path must forward the receiver's OPENROUTER_MODEL)", modelEnv.Value, "test-model")
 	}
 }
 
