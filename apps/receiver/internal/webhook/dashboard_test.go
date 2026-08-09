@@ -194,6 +194,115 @@ func TestRecordTelemetry_HappyPath(t *testing.T) {
 	}
 }
 
+func TestRecordTelemetry_QUB105Fields(t *testing.T) {
+	// QUB-105 acceptance: the receiver reads every QUB-105
+	// field, persists them, and surfaces them through
+	// GetTelemetry. The fixture exercises the full set:
+	// total_tokens, the cost split, is_byok, server tool
+	// stats, request_id, duration_ms, and the failed-call
+	// error context.
+	h := newTestHandlerWithStore(t)
+	ctx := context.Background()
+	if _, err := h.store.UpsertRun(ctx, store.Run{
+		ID: "boop-a-b-1-aaaaaaa", Owner: "a", Repo: "b", PRNumber: 1,
+		CommitSHA: "aaaaaaa", Status: store.StatusSucceeded,
+		StartedAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	body := `{
+		"model": "openrouter/anthropic/claude-3.5-sonnet",
+		"provider": "openrouter",
+		"input_tokens": 1000,
+		"output_tokens": 500,
+		"total_tokens": 1505,
+		"reasoning_tokens": 5,
+		"cache_read_tokens": 200,
+		"cache_write_tokens": 0,
+		"cost_usd": 0.0123,
+		"cost_prompt_usd": 0.001,
+		"cost_completion_usd": 0.0113,
+		"cost_upstream_usd": 0.0124,
+		"is_byok": true,
+		"server_tool_calls_executed": 0,
+		"server_tool_calls_requested": 0,
+		"request_id": "chatcmpl-xyz",
+		"duration_ms": 4321,
+		"step_count": 3
+	}`
+	rr := doRequest(t, h, "POST", "/api/runs/boop-a-b-1-aaaaaaa/telemetry", body, map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
+	if rr.Code != 204 {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	telem, err := h.store.GetTelemetry(ctx, "boop-a-b-1-aaaaaaa")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if telem.TotalTokens != 1505 {
+		t.Errorf("total_tokens = %d", telem.TotalTokens)
+	}
+	if telem.CostPromptUSD != 0.001 || telem.CostCompletionUSD != 0.0113 || telem.CostUpstreamUSD != 0.0124 {
+		t.Errorf("cost split = (%f, %f, %f)", telem.CostPromptUSD, telem.CostCompletionUSD, telem.CostUpstreamUSD)
+	}
+	if !telem.IsByok {
+		t.Errorf("is_byok = false, want true")
+	}
+	if telem.RequestID == nil || *telem.RequestID != "chatcmpl-xyz" {
+		t.Errorf("request_id = %v", telem.RequestID)
+	}
+	if telem.DurationMS == nil || *telem.DurationMS != 4321 {
+		t.Errorf("duration_ms = %v", telem.DurationMS)
+	}
+}
+
+func TestRecordTelemetry_QUB105ErrorContext(t *testing.T) {
+	// QUB-105: a failed-call telemetry row stamps error (the
+	// human-readable message), error_status_code,
+	// error_content_type, and error_body (the SDK response
+	// snippet) so a 4xx is diagnosable from the dashboard
+	// without digging through pod logs. The handler forwards
+	// the JSON fields to the store; the store persists them
+	// and round-trips them through GetTelemetry.
+	h := newTestHandlerWithStore(t)
+	ctx := context.Background()
+	if _, err := h.store.UpsertRun(ctx, store.Run{
+		ID: "boop-a-b-1-aaaaaaa", Owner: "a", Repo: "b", PRNumber: 1,
+		CommitSHA: "aaaaaaa", Status: store.StatusFailed,
+		StartedAt:  time.Now(),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	body := `{
+		"model": "openrouter/x",
+		"step_count": 1,
+		"error": "OpenRouter chat completion failed (401): Bad token",
+		"error_status_code": 401,
+		"error_content_type": "application/json",
+		"error_body": "{\"error\":\"unauthorized\"}"
+	}`
+	rr := doRequest(t, h, "POST", "/api/runs/boop-a-b-1-aaaaaaa/telemetry", body, map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
+	if rr.Code != 204 {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	telem, err := h.store.GetTelemetry(ctx, "boop-a-b-1-aaaaaaa")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if telem.Error == nil || *telem.Error != "OpenRouter chat completion failed (401): Bad token" {
+		t.Errorf("error = %v", telem.Error)
+	}
+	if telem.ErrorStatusCode == nil || *telem.ErrorStatusCode != 401 {
+		t.Errorf("error_status_code = %v", telem.ErrorStatusCode)
+	}
+	if telem.ErrorContentType == nil || *telem.ErrorContentType != "application/json" {
+		t.Errorf("error_content_type = %v", telem.ErrorContentType)
+	}
+	if telem.ErrorBody == nil || *telem.ErrorBody != `{"error":"unauthorized"}` {
+		t.Errorf("error_body = %v", telem.ErrorBody)
+	}
+}
+
 func TestRecordTelemetry_Auth(t *testing.T) {
 	h := newTestHandlerWithStore(t)
 	body := `{"model": "x", "input_tokens": 0, "output_tokens": 0, "cost_usd": 0, "step_count": 0}`

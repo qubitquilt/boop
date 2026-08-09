@@ -33,18 +33,39 @@ var ErrUnknownRun = errors.New("store: unknown run")
 // the only writer.
 // Field names mirror the receiver's wire format (snake_case JSON
 // tags) so the CLI and other API consumers get stable keys.
+//
+// QUB-105: every field the OpenRouter SDK exposes on ChatUsage
+// now lands on a typed column. Nullable columns (request_id,
+// duration_ms, error_status_code, error_content_type) use
+// pointers so the JSON shape distinguishes "missing" from "zero".
+// Default-zero columns use plain scalars; the SQL DEFAULT clauses
+// fill missing values for a partial payload (pre-QUB-105 runner
+// posting against a v6 schema still lands a usable row).
 type Telemetry struct {
-	RunID            string    `json:"run_id"`
-	Model            string    `json:"model"`
-	Provider         string    `json:"provider,omitempty"`
-	InputTokens      int64     `json:"input_tokens"`
-	OutputTokens     int64     `json:"output_tokens"`
-	ReasoningTokens  int64     `json:"reasoning_tokens"`
-	CacheReadTokens  int64     `json:"cache_read_tokens"`
-	CacheWriteTokens int64     `json:"cache_write_tokens"`
-	CostUSD          float64   `json:"cost_usd"`
-	StepCount        int       `json:"step_count"`
-	RecordedAt       time.Time `json:"recorded_at"`
+	RunID                 string    `json:"run_id"`
+	Model                 string    `json:"model"`
+	Provider              string    `json:"provider,omitempty"`
+	InputTokens           int64     `json:"input_tokens"`
+	OutputTokens          int64     `json:"output_tokens"`
+	TotalTokens           int64     `json:"total_tokens"`
+	ReasoningTokens       int64     `json:"reasoning_tokens"`
+	CacheReadTokens       int64     `json:"cache_read_tokens"`
+	CacheWriteTokens      int64     `json:"cache_write_tokens"`
+	CostUSD               float64   `json:"cost_usd"`
+	CostPromptUSD         float64   `json:"cost_prompt_usd"`
+	CostCompletionUSD     float64   `json:"cost_completion_usd"`
+	CostUpstreamUSD       float64   `json:"cost_upstream_usd"`
+	IsByok                bool      `json:"is_byok"`
+	ServerToolCallsExec   int64     `json:"server_tool_calls_executed"`
+	ServerToolCallsReq    int64     `json:"server_tool_calls_requested"`
+	RequestID             *string   `json:"request_id,omitempty"`
+	DurationMS            *int64    `json:"duration_ms,omitempty"`
+	StepCount             int       `json:"step_count"`
+	RecordedAt            time.Time `json:"recorded_at"`
+	Error                 *string   `json:"error,omitempty"`
+	ErrorStatusCode       *int64    `json:"error_status_code,omitempty"`
+	ErrorContentType      *string   `json:"error_content_type,omitempty"`
+	ErrorBody             *string   `json:"error_body,omitempty"`
 }
 
 // RecordTelemetry inserts or replaces the telemetry row for a run.
@@ -97,15 +118,23 @@ func (s *Store) RecordTelemetry(ctx context.Context, t Telemetry) error {
 	if _, err := s.db.ExecContext(ctx, `
 		INSERT OR REPLACE INTO telemetry (
 			run_id, model, provider,
-			input_tokens, output_tokens, reasoning_tokens,
-			cache_read_tokens, cache_write_tokens,
-			cost_usd, step_count, recorded_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			input_tokens, output_tokens, total_tokens,
+			reasoning_tokens, cache_read_tokens, cache_write_tokens,
+			cost_usd, cost_prompt_usd, cost_completion_usd, cost_upstream_usd,
+			is_byok, server_tool_calls_executed, server_tool_calls_requested,
+			request_id, duration_ms,
+			step_count, recorded_at,
+			error, error_status_code, error_content_type, error_body
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		t.RunID, t.Model, t.Provider,
-		t.InputTokens, t.OutputTokens, t.ReasoningTokens,
-		t.CacheReadTokens, t.CacheWriteTokens,
-		t.CostUSD, t.StepCount, t.RecordedAt.UTC().Format(time.RFC3339Nano),
+		t.InputTokens, t.OutputTokens, t.TotalTokens,
+		t.ReasoningTokens, t.CacheReadTokens, t.CacheWriteTokens,
+		t.CostUSD, t.CostPromptUSD, t.CostCompletionUSD, t.CostUpstreamUSD,
+		boolToInt(t.IsByok), t.ServerToolCallsExec, t.ServerToolCallsReq,
+		nullableString(t.RequestID), nullableInt64(t.DurationMS),
+		t.StepCount, t.RecordedAt.UTC().Format(time.RFC3339Nano),
+		nullableString(t.Error), nullableInt64(t.ErrorStatusCode), nullableString(t.ErrorContentType), nullableString(t.ErrorBody),
 	); err != nil {
 		return fmt.Errorf("store: insert telemetry: %w", err)
 	}
@@ -118,25 +147,65 @@ func (s *Store) RecordTelemetry(ctx context.Context, t Telemetry) error {
 func (s *Store) GetTelemetry(ctx context.Context, runID string) (Telemetry, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT run_id, model, provider,
-			input_tokens, output_tokens, reasoning_tokens,
-			cache_read_tokens, cache_write_tokens,
-			cost_usd, step_count, recorded_at
+			input_tokens, output_tokens, total_tokens,
+			reasoning_tokens, cache_read_tokens, cache_write_tokens,
+			cost_usd, cost_prompt_usd, cost_completion_usd, cost_upstream_usd,
+			is_byok, server_tool_calls_executed, server_tool_calls_requested,
+			request_id, duration_ms,
+			step_count, recorded_at,
+			error, error_status_code, error_content_type, error_body
 		FROM telemetry WHERE run_id = ?
 	`, runID)
 	var (
-		t          Telemetry
-		recordedAt string
-		provider   sql.NullString
+		t            Telemetry
+		recordedAt   string
+		provider     sql.NullString
+		requestID    sql.NullString
+		durationMS   sql.NullInt64
+		errStr       sql.NullString
+		errStatus    sql.NullInt64
+		errContentTp sql.NullString
+		errBody      sql.NullString
+		isByok       int
 	)
 	if err := row.Scan(
 		&t.RunID, &t.Model, &provider,
-		&t.InputTokens, &t.OutputTokens, &t.ReasoningTokens,
-		&t.CacheReadTokens, &t.CacheWriteTokens,
-		&t.CostUSD, &t.StepCount, &recordedAt,
+		&t.InputTokens, &t.OutputTokens, &t.TotalTokens,
+		&t.ReasoningTokens, &t.CacheReadTokens, &t.CacheWriteTokens,
+		&t.CostUSD, &t.CostPromptUSD, &t.CostCompletionUSD, &t.CostUpstreamUSD,
+		&isByok, &t.ServerToolCallsExec, &t.ServerToolCallsReq,
+		&requestID, &durationMS,
+		&t.StepCount, &recordedAt,
+		&errStr, &errStatus, &errContentTp, &errBody,
 	); err != nil {
 		return Telemetry{}, err
 	}
 	t.Provider = provider.String
+	t.IsByok = isByok != 0
+	if requestID.Valid {
+		v := requestID.String
+		t.RequestID = &v
+	}
+	if durationMS.Valid {
+		v := durationMS.Int64
+		t.DurationMS = &v
+	}
+	if errStr.Valid {
+		v := errStr.String
+		t.Error = &v
+	}
+	if errStatus.Valid {
+		v := errStatus.Int64
+		t.ErrorStatusCode = &v
+	}
+	if errContentTp.Valid {
+		v := errContentTp.String
+		t.ErrorContentType = &v
+	}
+	if errBody.Valid {
+		v := errBody.String
+		t.ErrorBody = &v
+	}
 	if at, err := time.Parse(time.RFC3339Nano, recordedAt); err == nil {
 		t.RecordedAt = at
 	}
@@ -161,4 +230,28 @@ func (s *Store) TotalCost(ctx context.Context, from, to time.Time) (float64, err
 		return 0, nil
 	}
 	return v.Float64, nil
+}
+
+// boolToInt is defined in installations.go (used by both
+// Installations.UpsertInstallations and RecordTelemetry).
+
+// nullableString turns a *string into an interface that the
+// SQLite driver writes as NULL when the pointer is nil. The
+// telemetry table has nullable TEXT columns for request_id and
+// error_content_type; using a Go pointer keeps the "absent vs
+// empty string" distinction visible in the JSON wire shape too.
+func nullableString(s *string) interface{} {
+	if s == nil {
+		return nil
+	}
+	return *s
+}
+
+// nullableInt64 mirrors nullableString for *int64 (the
+// telemetry table's duration_ms and error_status_code columns).
+func nullableInt64(n *int64) interface{} {
+	if n == nil {
+		return nil
+	}
+	return *n
 }

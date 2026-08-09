@@ -317,16 +317,38 @@ func (h *Handler) Stats(w http.ResponseWriter, r *http.Request) {
 // Field names mirror the OpenCode step_finish event shape so
 // the runner's JSON unmarshals into this struct without a
 // hand-written adapter.
+//
+// QUB-105: every new field the runner forwards is optional on
+// the wire (the runner's pre-QUB-105 contract did not include
+// them). Optional-with-pointer is the convention so a partial
+// payload (older runner, network truncation) does not silently
+// land zero where the SDK actually reported a value. The
+// store's INSERT OR REPLACE fills the SQL DEFAULT for the
+// absent scalar fields; the nullable TEXT / INTEGER columns
+// stay NULL when the runner did not forward them.
 type telemetryRequest struct {
-	Model            string  `json:"model"`
-	Provider         string  `json:"provider,omitempty"`
-	InputTokens      int64   `json:"input_tokens"`
-	OutputTokens     int64   `json:"output_tokens"`
-	ReasoningTokens  int64   `json:"reasoning_tokens"`
-	CacheReadTokens  int64   `json:"cache_read_tokens"`
-	CacheWriteTokens int64   `json:"cache_write_tokens"`
-	CostUSD          float64 `json:"cost_usd"`
-	StepCount        int     `json:"step_count"`
+	Model                 string  `json:"model"`
+	Provider              string  `json:"provider,omitempty"`
+	InputTokens           int64   `json:"input_tokens"`
+	OutputTokens          int64   `json:"output_tokens"`
+	TotalTokens           int64   `json:"total_tokens"`
+	ReasoningTokens       int64   `json:"reasoning_tokens"`
+	CacheReadTokens       int64   `json:"cache_read_tokens"`
+	CacheWriteTokens      int64   `json:"cache_write_tokens"`
+	CostUSD               float64 `json:"cost_usd"`
+	CostPromptUSD         float64 `json:"cost_prompt_usd"`
+	CostCompletionUSD     float64 `json:"cost_completion_usd"`
+	CostUpstreamUSD       float64 `json:"cost_upstream_usd"`
+	IsByok                bool    `json:"is_byok"`
+	ServerToolCallsExec   int64   `json:"server_tool_calls_executed"`
+	ServerToolCallsReq    int64   `json:"server_tool_calls_requested"`
+	RequestID             *string `json:"request_id,omitempty"`
+	DurationMS            *int64  `json:"duration_ms,omitempty"`
+	StepCount             int     `json:"step_count"`
+	Error                 *string `json:"error,omitempty"`
+	ErrorStatusCode       *int64  `json:"error_status_code,omitempty"`
+	ErrorContentType      *string `json:"error_content_type,omitempty"`
+	ErrorBody             *string `json:"error_body,omitempty"`
 }
 
 // RecordTelemetry handles POST /api/runs/:id/telemetry. The
@@ -361,16 +383,29 @@ func (h *Handler) RecordTelemetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.store.RecordTelemetry(r.Context(), store.Telemetry{
-		RunID:            id,
-		Model:            body.Model,
-		Provider:         body.Provider,
-		InputTokens:      body.InputTokens,
-		OutputTokens:     body.OutputTokens,
-		ReasoningTokens:  body.ReasoningTokens,
-		CacheReadTokens:  body.CacheReadTokens,
-		CacheWriteTokens: body.CacheWriteTokens,
-		CostUSD:          body.CostUSD,
-		StepCount:        body.StepCount,
+		RunID:               id,
+		Model:               body.Model,
+		Provider:            body.Provider,
+		InputTokens:         body.InputTokens,
+		OutputTokens:        body.OutputTokens,
+		TotalTokens:         body.TotalTokens,
+		ReasoningTokens:     body.ReasoningTokens,
+		CacheReadTokens:     body.CacheReadTokens,
+		CacheWriteTokens:    body.CacheWriteTokens,
+		CostUSD:             body.CostUSD,
+		CostPromptUSD:       body.CostPromptUSD,
+		CostCompletionUSD:   body.CostCompletionUSD,
+		CostUpstreamUSD:     body.CostUpstreamUSD,
+		IsByok:              body.IsByok,
+		ServerToolCallsExec: body.ServerToolCallsExec,
+		ServerToolCallsReq:  body.ServerToolCallsReq,
+		RequestID:           body.RequestID,
+		DurationMS:          body.DurationMS,
+		StepCount:           body.StepCount,
+		Error:               body.Error,
+		ErrorStatusCode:     body.ErrorStatusCode,
+		ErrorContentType:    body.ErrorContentType,
+		ErrorBody:           body.ErrorBody,
 	}); err != nil {
 		if errors.Is(err, store.ErrUnknownRun) {
 			// QUB-101: the store's default path is now to

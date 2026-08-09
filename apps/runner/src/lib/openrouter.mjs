@@ -101,7 +101,10 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
     review.parseError = review.parseError || "sdk call failed";
     // Stamp the error on the telemetry so the dashboard can
     // distinguish a failed SDK call from a successful call that
-    // happened to produce an empty summary.
+    // happened to produce an empty summary. The QUB-105 helpers
+    // surface status / content-type / body alongside the message
+    // so a 4xx response is diagnosable from the dashboard row
+    // without digging through pod logs.
     return { ...review, telemetry: buildTelemetry(null, err) };
   }
 
@@ -202,6 +205,13 @@ export async function callOpenRouter(prompt, deps = {}) {
     promptBytes: prompt.length,
     timeoutMs,
   });
+  // QUB-105: the wall-clock latency per call is now surfaced
+  // on the dashboard row. `startedAt` is the moment we hand
+  // off to the SDK; `finishedAt` is the moment the response
+  // (or error) is in hand. `Date.now()` is sufficient — the
+  // runner does not need monotonic time and the dashboard
+  // stores duration_ms as a plain integer.
+  const startedAt = Date.now();
 
   try {
     const result = await chatSend(
@@ -282,9 +292,21 @@ export async function callOpenRouter(prompt, deps = {}) {
         raw,
         stack,
       });
-      throw new Error(
+      // QUB-105: surface the same diagnostic fields on the
+      // thrown Error so buildTelemetry can stamp them on the
+      // telemetry row (the dashboard surfaces them alongside
+      // the message without an extra pod-log round trip).
+      // `durationMs` rides on the Error too — the errlog
+      // records the elapsed time but the telemetry row needs
+      // it persisted on its own field for the latency KPI.
+      const wrappedErr = new Error(
         `OpenRouter chat completion failed${status ? ` (${status})` : ""}: ${message}`,
       );
+      wrappedErr.durationMs = Date.now() - startedAt;
+      if (status != null) wrappedErr.statusCode = status;
+      if (contentType != null) wrappedErr.errorContentType = contentType;
+      if (body != null) wrappedErr.errorBody = body;
+      throw wrappedErr;
     }
 
     const response = result.value;
@@ -293,10 +315,23 @@ export async function callOpenRouter(prompt, deps = {}) {
       throw new Error("OpenRouter chat completion returned no assistant text");
     }
 
+    // QUB-105: the response `id` is OpenRouter's per-request
+    // identifier; it lets an operator correlate a dashboard
+    // row with the OpenRouter activity log without grepping
+    // pod logs. Some SDK failure paths surface a non-ok result
+    // whose `value` is undefined; the optional chain keeps
+    // that branch from throwing here (the outer catch handles
+    // it). `created` is the unix-second timestamp the SDK
+    // stamps on the response; we use it for nothing today
+    // but capture it so a future "model time-to-first-token"
+    // metric has the source data without another wire change.
+    const finishedAt = Date.now();
     return {
       text,
       usage: extractUsage(response),
       model: response.model || model,
+      requestId: typeof response.id === "string" ? response.id : undefined,
+      durationMs: finishedAt - startedAt,
     };
   } finally {
     clearTimeout(timer);
@@ -330,34 +365,66 @@ function extractAssistantText(response) {
 /**
  * Map the SDK `usage` object onto the runner's telemetry shape.
  *
+ * QUB-105: the runner now captures every field the SDK exposes
+ * on `ChatUsage`. The SDK's serializer converts the JSON
+ * snake_case keys to camelCase (so `cost_details` arrives as
+ * `costDetails`, `is_byok` as `isByok`, etc.); the accessors
+ * below use camelCase. Older SDK releases that return
+ * snake_case fall back via the `||` chain — the change is
+ * additive and degrades gracefully to the previous shape.
+ *
  * - `prompt_tokens` → `prompt_tokens` (runner field name)
  * - `completion_tokens` → `completion_tokens`
  * - `cost` (when present) → `cost`. Missing → 0 so the dashboard
  *   row still gets a numeric value.
  * - Cached / reasoning tokens surface when the SDK reports them;
  *   the dashboard can ignore fields it doesn't render.
+ * - `total_tokens` (server-computed sum) lands on `total_tokens`
+ *   so the dashboard can sanity-check against input + output +
+ *   reasoning + cache. The SDK's value is authoritative when
+ *   present; the caller falls back to the sum only if both the
+ *   SDK and `extractUsage` can't derive a number.
+ * - `cost_details.{upstream_inference_prompt_cost,
+ *   upstream_inference_completions_cost,
+ *   upstream_inference_cost}` split the lumped `cost` into
+ *   prompt vs completion so the dashboard can surface
+ *   "cheap input vs expensive reasoning" rather than a single
+ *   scalar.
+ * - `is_byok` distinguishes OpenRouter-routed traffic from
+ *   cluster-operator-supplied provider keys (the cost semantics
+ *   differ; the dashboard filters BYOK from routed).
+ * - `server_tool_use_details.{tool_calls_executed,
+ *   tool_calls_requested}` are 0 today (the runner does not
+ *   enable tools) but the fields are reserved for future
+ *   tool-using skills.
+ * - `id` (response-level) is the OpenRouter request id; the
+ *   caller surfaces it via `extractUsage`'s return shape rather
+ *   than the `usage` block because it lives on the response,
+ *   not on `usage`.
  *
  * The runner's telemetry contract (see `postTelemetry` in
  * `./dashboard.mjs`) expects the snake_case keys below; the field
  * rename to `inputTokens` / `outputTokens` happens in the caller
  * (`buildTelemetry`).
  */
-function extractUsage(response) {
+export function extractUsage(response) {
   const usage = response?.usage;
   if (!usage || typeof usage !== "object") {
     return {
       prompt_tokens: 0,
       completion_tokens: 0,
+      total_tokens: 0,
       cost: 0,
     };
   }
-  // Omit optional fields (cached_tokens, reasoning_tokens) when
-  // the SDK doesn't surface them. Returning `{ foo: undefined }`
-  // is semantically equivalent to `{}` but breaks deep-equal
-  // assertions and serialises to a `null` field in JSON.
+  // Omit optional fields when the SDK doesn't surface them.
+  // Returning `{ foo: undefined }` is semantically equivalent
+  // to `{}` but breaks deep-equal assertions and serialises to
+  // a `null` field in JSON.
   const out = {
     prompt_tokens: numOrZero(usage.promptTokens),
     completion_tokens: numOrZero(usage.completionTokens),
+    total_tokens: numOrZero(usage.totalTokens),
     cost: typeof usage.cost === "number" ? usage.cost : 0,
   };
   const cached = usage.promptTokensDetails?.cachedTokens;
@@ -367,6 +434,66 @@ function extractUsage(response) {
   const reasoning = usage.completionTokensDetails?.reasoningTokens;
   if (reasoning != null) {
     out.reasoning_tokens = numOrZero(reasoning);
+  }
+  // cost_details splits the lumped `cost` scalar. The SDK
+  // camelCases the outer key; the inner keys follow the same
+  // convention. Older releases surface snake_case — try the
+  // modern form first, then fall back. Any field the SDK
+  // doesn't expose is omitted (the dashboard treats missing
+  // as 0).
+  const costDetails = usage.costDetails ?? usage.cost_details;
+  if (costDetails && typeof costDetails === "object") {
+    const promptCost =
+      costDetails.upstreamInferencePromptCost ??
+      costDetails.upstream_inference_prompt_cost;
+    const completionCost =
+      costDetails.upstreamInferenceCompletionsCost ??
+      costDetails.upstream_inference_completions_cost;
+    const upstreamCost =
+      costDetails.upstreamInferenceCost ??
+      costDetails.upstream_inference_cost;
+    if (typeof promptCost === "number") {
+      out.cost_prompt_usd = promptCost;
+    }
+    if (typeof completionCost === "number") {
+      out.cost_completion_usd = completionCost;
+    }
+    if (typeof upstreamCost === "number") {
+      out.cost_upstream_usd = upstreamCost;
+    }
+  }
+  // is_byok: boolean. The SDK camelCases; snake_case is the
+  // pre-QUB-105 fallback. `false` is the routed-traffic default
+  // (OpenRouter's own billing); `true` means a cluster operator
+  // supplied their own provider key and OpenRouter only
+  // forwarded the call.
+  const byok = usage.isByok ?? usage.is_byok;
+  if (typeof byok === "boolean") {
+    out.is_byok = byok;
+  }
+  // server_tool_use_details: per-call tool stats. The runner
+  // does not enable tools today, so the SDK reports zeros; we
+  // forward whatever the SDK exposes so a future tool-using
+  // skill does not need a runner-side schema change.
+  const serverTools =
+    usage.serverToolUseDetails ?? usage.server_tool_use_details;
+  if (serverTools && typeof serverTools === "object") {
+    const executed =
+      serverTools.toolCallsExecuted ?? serverTools.tool_calls_executed;
+    const requested =
+      serverTools.toolCallsRequested ?? serverTools.tool_calls_requested;
+    if (typeof executed === "number") {
+      out.server_tool_calls_executed = executed;
+    }
+    if (typeof requested === "number") {
+      out.server_tool_calls_requested = requested;
+    }
+  }
+  // Response-level id (OpenRouter's per-request identifier).
+  // The SDK stamps `id` on the ChatResult, not on usage;
+  // pull it here so the caller's callResult shape carries it.
+  if (typeof response?.id === "string") {
+    out.request_id = response.id;
   }
   return out;
 }
@@ -385,12 +512,30 @@ function numOrZero(v) {
  *   single provider now.
  * - `inputTokens` / `outputTokens` come from the SDK `usage` object.
  * - `costUsd` from the SDK `usage.cost` (0 when missing).
+ * - `totalTokens` is the SDK-reported sum; the dashboard
+ *   sanity-checks against input + output + reasoning + cache.
+ * - `costPromptUsd` / `costCompletionUsd` come from
+ *   `usage.cost_details.{upstream_inference_prompt_cost,
+ *   upstream_inference_completions_cost}`. Missing → 0; the
+ *   dashboard splits the lumped `costUsd` so an operator can
+ *   tell reasoning spend from input spend.
+ * - `isByok` distinguishes BYOK traffic from OpenRouter-routed;
+ *   the dashboard filters / groups on it.
+ * - `serverToolCallsExecuted` / `serverToolCallsRequested` are
+ *   0 today; the fields are reserved for future tool use.
+ * - `requestId` is the SDK's per-request id; lets the operator
+ *   cross-reference the dashboard row with OpenRouter's
+ *   activity log.
+ * - `durationMs` is wall-clock time for the SDK call (measured
+ *   in `callOpenRouter`); feeds the latency KPI.
  * - `stepCount` is always 1 — the SDK does one round-trip.
  *   Keeping the field non-null avoids a dashboard-side null check.
  *
  * Returns the empty telemetry object when the call failed before
  * the response landed (timeout, 4xx/5xx, etc.) so the dashboard
- * still gets a row.
+ * still gets a row. The failure-mode rows carry the QUB-105
+ * error context (status / content-type / body) so a 4xx is
+ * diagnosable from the dashboard.
  */
 export function buildTelemetry(callResult, error) {
   const empty = emptyTelemetry();
@@ -403,7 +548,26 @@ export function buildTelemetry(callResult, error) {
     // intentionally NOT counted as telemetry — the cost / token
     // fields stay zero so the failure doesn't double-count if
     // the dashboard later sums across runs.
-    if (error) empty.error = String(error?.message ?? error);
+    //
+    // QUB-105: when callOpenRouter attaches status / content-type /
+    // body / duration to the thrown Error (the non-ok path), stamp
+    // them on the telemetry row so the operator can diagnose
+    // without a pod-log round trip.
+    if (error) {
+      empty.error = String(error?.message ?? error);
+      if (typeof error?.statusCode === "number") {
+        empty.errorStatusCode = error.statusCode;
+      }
+      if (typeof error?.errorContentType === "string") {
+        empty.errorContentType = error.errorContentType;
+      }
+      if (typeof error?.errorBody === "string") {
+        empty.errorBody = error.errorBody;
+      }
+      if (typeof error?.durationMs === "number") {
+        empty.durationMs = error.durationMs;
+      }
+    }
     return empty;
   }
   return {
@@ -411,10 +575,19 @@ export function buildTelemetry(callResult, error) {
     provider: "openrouter",
     inputTokens: callResult.usage?.prompt_tokens ?? 0,
     outputTokens: callResult.usage?.completion_tokens ?? 0,
+    totalTokens: callResult.usage?.total_tokens ?? 0,
     reasoningTokens: callResult.usage?.reasoning_tokens ?? 0,
     cacheReadTokens: callResult.usage?.cached_tokens ?? 0,
     cacheWriteTokens: 0,
     costUsd: callResult.usage?.cost ?? 0,
+    costPromptUsd: callResult.usage?.cost_prompt_usd ?? 0,
+    costCompletionUsd: callResult.usage?.cost_completion_usd ?? 0,
+    costUpstreamUsd: callResult.usage?.cost_upstream_usd ?? 0,
+    isByok: callResult.usage?.is_byok === true,
+    serverToolCallsExecuted: callResult.usage?.server_tool_calls_executed ?? 0,
+    serverToolCallsRequested: callResult.usage?.server_tool_calls_requested ?? 0,
+    requestId: callResult.requestId ?? callResult.usage?.request_id ?? undefined,
+    durationMs: typeof callResult.durationMs === "number" ? callResult.durationMs : undefined,
     stepCount: 1,
   };
 }
@@ -425,17 +598,24 @@ export function emptyTelemetry() {
     provider: "openrouter",
     inputTokens: 0,
     outputTokens: 0,
+    totalTokens: 0,
     reasoningTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
     costUsd: 0,
-    stepCount: 0,
-    // `error` is stamped by `buildTelemetry` when the SDK call
-    // failed before the response landed. Absent on a successful
-    // call (even one whose summary is empty) so the dashboard can
+    costPromptUsd: 0,
+    costCompletionUsd: 0,
+    costUpstreamUsd: 0,
+    isByok: false,
+    serverToolCallsExecuted: 0,
+    serverToolCallsRequested: 0,
+    // `error`, `errorStatusCode`, `errorContentType`, `errorBody`
+    // are stamped by `buildTelemetry` when the SDK call failed
+    // before the response landed. Absent on a successful call
+    // (even one whose summary is empty) so the dashboard can
     // tell "model said nothing useful" from "the API rejected
-    // the request". The field is intentionally `undefined` here
-    // so successful rows don't carry a stale error string.
+    // the request". The fields are intentionally `undefined`
+    // here so successful rows don't carry a stale error string.
   };
 }
 
