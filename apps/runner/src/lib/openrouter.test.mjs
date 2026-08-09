@@ -910,6 +910,65 @@ test("parseReviewOutput rejects build header + shell transcript combo (PR #89)",
   assert.match(r.parseError, /build header|shell transcript/);
 });
 
+test("parseReviewOutput rejects tool-call hallucination (PR #180)", () => {
+  // The narrator LLM sometimes hallucinates a tool call (opencode
+  // / Claude / OpenAI shapes) as the "summary" body. The narrator
+  // is a single chat completion with no tools enabled, so any
+  // tool call is a hallucination. The runner must refuse to post
+  // it. Pin all four observed wrapper shapes so the runner does
+  // not regress to posting a tool call to the PR.
+  const cases = [
+    // opencode / Claude bare JSON
+    [
+      "=== SUMMARY ===",
+      '{"name": "execute_command", "arguments": {"command": "ls -la /work/repo"}}',
+      "=== INLINE COMMENTS ===",
+      "=== CONFIDENCE ===",
+      "medium",
+      "=== END ===",
+    ].join("\n"),
+    // Anthropic <tool_use>
+    [
+      "=== SUMMARY ===",
+      "<tool_use>",
+      '{"name": "bash", "input": {"command": "git diff"}}',
+      "</tool_use>",
+      "=== INLINE COMMENTS ===",
+      "=== CONFIDENCE ===",
+      "medium",
+      "=== END ===",
+    ].join("\n"),
+    // OpenAI <tool_call> XML
+    [
+      "=== SUMMARY ===",
+      "I'll examine the files first.",
+      "<tool_call>",
+      '{"function": {"name": "read_file", "arguments": {"path": "src/x.ts"}}}',
+      "</tool_call>",
+      "=== INLINE COMMENTS ===",
+      "=== CONFIDENCE ===",
+      "medium",
+      "=== END ===",
+    ].join("\n"),
+    // Bracket wrapper
+    [
+      "=== SUMMARY ===",
+      "[TOOL_CALL]",
+      '{"name": "list_dir", "arguments": {"path": "."}}',
+      "=== INLINE COMMENTS ===",
+      "=== CONFIDENCE ===",
+      "medium",
+      "=== END ===",
+    ].join("\n"),
+  ];
+  for (const out of cases) {
+    const r = parseReviewOutput(out);
+    assert.equal(r.summary, "");
+    assert.equal(r.confidence, "low");
+    assert.match(r.parseError, /tool-call hallucination/);
+  }
+});
+
 test("parseReviewOutput rejects summary shorter than 200 bytes", () => {
   const out = [
     "=== SUMMARY ===",
