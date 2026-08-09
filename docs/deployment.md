@@ -59,26 +59,29 @@ stage of the chain.
 
 | Workflow | Trigger | Pushes image? | Runs when |
 |---|---|---|---|
-| `build-receiver` | `push` to `main` | yes | every commit that touches receiver code |
+| `build-receiver` | `push` to `main` (scoped to `apps/receiver`) | yes | every commit that touches receiver code |
 | `build-receiver` | `push` to `v*` tag | yes | each release tag |
-| `build-receiver` | `pull_request` to `main` | no | PR builds; fork PRs skipped |
+| `build-receiver` | `pull_request` to `main` (scoped to `apps/receiver`) | no | PR builds; fork PRs skipped |
 | `build-runner` | `push` to `main` (scoped to `apps/runner`) | yes | every commit that touches runner code |
 | `build-runner` | `push` to `v*` tag | yes | each release tag |
-| `build-runner` | `pull_request` to `main` | no | PR builds; fork PRs skipped |
+| `build-runner` | `pull_request` to `main` (scoped to `apps/runner`) | no | PR builds; fork PRs skipped |
 | `build-runner` | `workflow_dispatch` | yes | manual re-run from the Actions tab; also fired by the nightly schedule |
 | `rebuild-runner-nightly` | `schedule` (daily 02:00 UTC) | no | calls `gh workflow run build-runner --ref main`, then `sync-image-digests` |
 | `rebuild-runner-nightly` | `workflow_dispatch` | no | manual run of the same chain |
 | `sync-image-digests` | `workflow_run` of either build, on `success` | n/a | runs after every successful build |
 | `sync-image-digests` | `workflow_dispatch` | n/a | manual re-run from the Actions tab |
 
-The two build workflows share a `paths-ignore` list:
+The two build workflows are independently scoped via `on.push.paths:`
+(QUB-119 / PR #166):
 
-- `apps/k8s/overlays/**` — overlay edits do not rebuild the image
-- `.github/workflows/sync-image-digests.yaml` — workflow-file edits do not rebuild the image
-- `docs/**` — doc edits do not rebuild the image
+- `build-receiver` matches `apps/receiver/**` and
+  `.github/workflows/build-receiver.yaml`.
+- `build-runner` matches `apps/runner/**` and
+  `.github/workflows/build-runner.yaml`.
 
-Editing any of those paths alone produces no build. The build step
-also has the guard:
+Editing a path outside both scopes (the kustomize overlay,
+`sync-image-digests.yaml` itself, docs, root CI, etc.) produces no
+build. The build step also has the guard:
 
 ```yaml
 if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
@@ -87,17 +90,45 @@ if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.f
 Fork PRs cannot use `packages: write`; the guard short-circuits the
 build before `docker login` would fail.
 
+### Sibling-wait short-circuit on single-subtree pushes (QUB-125)
+
+When a push only touches one subtree, only the matching build fires.
+`workflow_run` from that build still triggers `sync-image-digests`,
+but the wait step would otherwise spin until the 5-minute deadline
+polling for the sibling that the `paths:` filter just excluded. The
+wait step now reads the files changed by the head SHA and skips the
+poll when none of them match the sibling's `paths:` filter
+(receiver-scope regex for the runner wait, runner-scope regex for the
+receiver wait). The path filters are mirrored inline in the step; if
+you change a `paths:` block in `build-receiver.yaml` /
+`build-runner.yaml`, mirror it in `sync-image-digests.yaml`.
+
+The same logic applies on `pull_request` events: a PR that only
+touches runner code fires only `build-runner`, and the sync
+short-circuits the wait for `build-receiver`.
+
+Manual `workflow_dispatch` of `sync-image-digests` still skips the
+wait entirely (`if: github.event_name == 'workflow_run'`).
+
 ### Main commit: build to rollout
 
 1. Commit lands on `main` (direct push or PR merge).
-2. `build-receiver` and `build-runner` run in parallel on the
-   `boop-runner-set` Actions runner. Each calls
+2. The build workflows run conditionally on the commit's `paths:`
+   filter. A commit that touches `apps/receiver/**` (or
+   `.github/workflows/build-receiver.yaml`) fires `build-receiver`;
+   a commit that touches `apps/runner/**` (or
+   `.github/workflows/build-runner.yaml`) fires `build-runner`. A
+   commit that touches both fires both. Each runs on the
+   `boop-runner-set` Actions runner, calls
    `docker/metadata-action` for tags, builds `linux/arm64` with
    buildx, logs in to `ghcr.io`, and pushes on `push` events. On
-   `pull_request` events, `push: ${{ github.event_name == 'push' }}`
+   `pull_request` events, `push: ${{ github.event_name != 'pull_request' }}`
    is false; the build is local, no push.
 3. On `success`, the `workflow_run` event fires
-   `sync-image-digests`.
+   `sync-image-digests`. The "wait for sibling upstream build"
+   step skips its poll when the commit did not touch the
+   sibling's subtree (QUB-125); it proceeds straight to the
+   digest query.
 4. `sync-image-digests` calls the GitHub packages API for the
    current `:stable` digest of each image, rewrites the digest in
    `apps/k8s/overlays/pugquilt/kustomization.yaml` (receiver) and in
@@ -234,8 +265,11 @@ The explicit `sync-image-digests` dispatch is required to skip its
 that prevents half-correct digest pairs when the two builds
 finish at different latencies. A nightly rebuild that only triggers
 `build-runner` has no `build-receiver` run for the current SHA, so
-the wait would time out after 5 minutes. A direct
-`workflow_dispatch` of `sync-image-digests` skips the step
+the wait would time out after 5 minutes (or, with QUB-125,
+short-circuit only if the current `main` tip commit happens to
+not touch any `apps/receiver/**` file — a property the rebuild
+cannot rely on across days). A direct `workflow_dispatch` of
+`sync-image-digests` skips the step
 (`if: github.event_name == 'workflow_run'`), and the workflow's
 `concurrency.cancel-in-progress` group coalesces the two runs
 into one — the failed `workflow_run` is cancelled the moment the

@@ -48,6 +48,18 @@ name: sync-image-digests
 # (operator chose to run it manually; they can re-trigger if the
 # pair is wrong).
 #
+# QUB-125: each upstream build is also scoped to its own subtree
+# (`build-receiver.yaml` matches `apps/receiver/**` +
+# `.github/workflows/build-receiver.yaml`; `build-runner.yaml`
+# matches `apps/runner/**` + `.github/workflows/build-runner.yaml`,
+# PR #166 / QUB-119). A push that touches only one subtree fires
+# only one upstream; the sibling will never arrive on this head
+# SHA, so the wait would spin until the 5-minute deadline. The
+# wait step now reads the files changed by the head SHA and
+# short-circuits when the sibling's path filter is empty. The
+# same paths apply to `pull_request`, so PR builds take the same
+# path.
+#
 # A pull_request build of either upstream (which does not push to
 # :stable — the build-push-action gates on push) intentionally
 # fires this workflow; the digest resolution still queries the
@@ -87,9 +99,19 @@ jobs:
       # The trigger is one of {build-receiver, build-runner}. When
       # that upstream completes successfully, this workflow fires
       # via workflow_run. We then check whether the OTHER upstream
-      # has a successful run for the same head SHA. If so, both
+      # has a successful run on the same head SHA. If so, both
       # images are now pushed under :stable and the digest query
       # will see the correct pair.
+      #
+      # QUB-125: each upstream's push trigger is scoped to its own
+      # subtree (PR #166 / QUB-119). A push that touches only one
+      # subtree fires only one upstream; the sibling will never
+      # arrive on this head SHA, so the wait must short-circuit.
+      # We resolve the files changed by this head SHA and skip the
+      # wait when none of them match the sibling's `paths:` filter.
+      # The filter is mirrored inline below; keep it in sync with
+      # the `on.push.paths:` and `on.pull_request.paths:` blocks
+      # in `build-receiver.yaml` / `build-runner.yaml`.
       #
       # What "github.event.workflow_run.created_at" is: it's the
       # upstream run's created_at, NOT the workflow_run event
@@ -105,6 +127,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           UPSTREAM: ${{ github.event.workflow_run.name }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if [ "${UPSTREAM}" = "build-receiver" ]; then
@@ -112,10 +135,60 @@ jobs:
           else
             SIBLING="build-receiver"
           fi
+
+          # Mirror of the sibling workflow's `paths:` filter. Keep
+          # in sync with build-receiver.yaml / build-runner.yaml.
+          case "${SIBLING}" in
+            build-receiver)
+              SIBLING_REGEX='^(apps/receiver/|\.github/workflows/build-receiver\.yaml)' ;;
+            build-runner)
+              SIBLING_REGEX='^(apps/runner/|\.github/workflows/build-runner\.yaml)' ;;
+            *)
+              echo "::error::Unknown sibling workflow ${SIBLING}"
+              exit 1 ;;
+          esac
+
+          # QUB-125: short-circuit when the head SHA did not touch
+          # the sibling's subtree. If we did not skip here, the wait
+          # below would spin until the 5-minute deadline because the
+          # sibling upstream's `paths:` filter excludes this commit.
+          # PR head SHAs land here too (a `pull_request` build fires
+          # `workflow_run` the same way `push` does); the paths are
+          # identical between push and pull_request in the build
+          # workflows, so the same check covers both events.
+          #
+          # The first-parent commit API does not list changed files
+          # for merge commits whose first-parent diff is empty, so
+          # we use the full `/commits/{sha}` endpoint. The endpoint
+          # is paginated; `?per_page=100` covers anything we have
+          # ever committed (the repo's largest single-commit change
+          # to date is well under that).
+          TOUCHED="$(
+            gh api "/repos/${REPO}/commits/${HEAD_SHA}?per_page=100" \
+              --jq '.files[]?.filename // empty'
+          )"
+          if [ -z "${TOUCHED}" ]; then
+            # Empty file list: a merge commit or an unborn
+            # ref. Treat as "no sibling path touched" and skip
+            # rather than guessing. If the operator wants to
+            # force a digest pin they can `workflow_dispatch`
+            # the workflow (which already skips the wait).
+            echo "::warning::No files returned for ${HEAD_SHA:0:7}; skipping sibling wait."
+            exit 0
+          fi
+          if ! printf "%s\n" "${TOUCHED}" | grep -Eq "${SIBLING_REGEX}"; then
+            echo "Sibling ${SIBLING} path not touched by ${HEAD_SHA:0:7}; skipping wait."
+            exit 0
+          fi
+
           # 5 minutes covers a normal cold-cache build (the runner
           # takes ~25s, the receiver ~1m30s without cache, plus
           # buildx setup + push). Anything longer is a real outage
           # and we want to fail loudly rather than spin silently.
+          # QUB-125: the wait only runs when the sibling's path
+          # filter matched above; a sibling that the path filter
+          # would have excluded is no longer in the deadline's
+          # path.
           DEADLINE=$(date -u -d '+5 minutes' +%s)
           while true; do
             if [ "$(date -u +%s)" -gt "${DEADLINE}" ]; then
@@ -129,7 +202,7 @@ jobs:
             # equals the upstream's created_at, and "<" would
             # exclude the upstream itself.
             SIBLING_OK="$(
-              gh api "/repos/qubitquilt/boop/actions/workflows/${SIBLING}.yaml/runs?per_page=20" \
+              gh api "/repos/${REPO}/actions/workflows/${SIBLING}.yaml/runs?per_page=20" \
                 --jq ".workflow_runs[] | select(.head_sha == \"${HEAD_SHA}\" and .conclusion == \"success\") | .created_at" \
                 | head -1
             )"
