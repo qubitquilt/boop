@@ -1,13 +1,17 @@
-# QUB-115: public API surface for the boop CLI and a tailnet
-# AI agent. The receiver was previously in-cluster only
-# (port-forward / VPN); the CLI on a tailnet node, or an
-# agent running alongside the developer, could not reach
-# /api/* or /dashboard/* without a tunnel.
+# QUB-115 / QUB-134: public API surface for the boop CLI and a
+# tailnet AI agent. The receiver was previously in-cluster only
+# (port-forward / VPN); the CLI on a tailnet node, or an agent
+# running alongside the developer, could not reach /api/* or
+# /dashboard/* without a tunnel.
 #
-# Three surfaces, three middleware chains:
+# Four surfaces, four middleware chains:
 #
-# 1. /webhook  — GitHub HMAC-authed, no Ingress auth needed.
-#                Stays open. Existing rule.
+# 1. /webhook  — GitHub HMAC-authed, rate-limit-webhook at the
+#                Ingress (QUB-134) caps the outer bound at
+#                300/min with a 100 burst. The receiver's own
+#                process-level limiter (M4) stays as an inner
+#                guard. No body cap — GitHub's payload is the
+#                largest legitimate body in the system.
 # 2. /api/*    — read-only GETs are unauthenticated at the
 #                receiver layer (they leak Job metadata only
 #                — review_number, model, token counts). The
@@ -26,9 +30,7 @@
 #
 # Method-based routing splits GETs from POSTs so the body
 # cap applies only where a body exists. The webhook path
-# gets neither cap (GitHub's payload is the largest legiti-
-# mate body in the system and a different size policy lives
-# there).
+# takes the rate limit but not the body cap.
 ---
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
@@ -39,9 +41,15 @@ spec:
   entryPoints:
     - websecure
   routes:
-    # GitHub webhook: HMAC-authed by the receiver, stays open
+    # GitHub webhook: HMAC-authed by the receiver, rate-limited
+    # at Traefik (QUB-134). The 300/min outer bound stops a
+    # hostile flood before it reaches the receiver's HMAC
+    # verify; the receiver's own limiter (20 req/s) is the
+    # inner guard if the Traefik limit is bypassed.
     - kind: Rule
       match: Host(`boop.qubitquilt.dev`) && PathPrefix(`/webhook`)
+      middlewares:
+        - name: rate-limit-webhook
       services:
         - name: boop-receiver
           port: http
