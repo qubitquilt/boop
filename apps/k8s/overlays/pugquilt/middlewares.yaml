@@ -1,8 +1,9 @@
-# QUB-115: Traefik middlewares for the public boop receiver
-# surface. Three middlewares, all in dev-tools:
+# QUB-115 / QUB-134: Traefik middlewares for the public boop
+# receiver surface. Four middlewares, all in dev-tools:
 #
 #   rate-limit-api       — 60 req/min per source IP on /api/*
 #   rate-limit-dashboard — 30 req/min per source IP on /dashboard/*
+#   rate-limit-webhook   — 300 req/min per source IP on /webhook
 #   body-limit          — 64 KB request body cap
 #
 # The /api and /dashboard limits are different on purpose:
@@ -12,6 +13,17 @@
 # painful. /dashboard is human-driven and the refresh
 # cadence is "every few seconds during an incident, then
 # nothing"; 30/min is refresh-friendly.
+#
+# rate-limit-webhook is the outer bound for the GitHub
+# webhook path. GitHub's normal delivery rate is bounded
+# (low hundreds per minute for a single repo) so 300/min
+# is well above legitimate traffic. The burst of 100
+# covers a force-push fan-out that lands N webhooks at
+# once. The rate-limit is at the Traefik layer, so 429s
+# never reach the receiver — HMAC validation cost on a
+# hostile flood stays at zero, and the receiver's
+# process-level limiter (M4) only matters if the Traefik
+# limit is bypassed.
 #
 # The rateLimit plugin uses the in-memory bucket. Traefik
 # is a single instance in this cluster so the state is
@@ -45,6 +57,17 @@ spec:
     average: 30
     period: 1m
     burst: 30
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rate-limit-webhook
+  namespace: dev-tools
+spec:
+  rateLimit:
+    average: 300
+    period: 1m
+    burst: 100
 ---
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
