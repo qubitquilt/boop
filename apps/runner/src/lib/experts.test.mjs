@@ -439,7 +439,7 @@ test("defaultExpert forwards deps.env.OPENROUTER_API_KEY to callOpenRouter (QUB-
   );
 });
 
-// QUB-<next> local-run regression: the lens file path must be
+// local-run regression: the lens file path must be
 // resolved from deps.paths.configSrc, NOT ctx.paths.configSrc
 // (ctx never carries `paths` — only deps does). The pre-fix code
 // read ctx.paths.configSrc, which is always undefined, so the
@@ -452,7 +452,7 @@ test("defaultExpert forwards deps.env.OPENROUTER_API_KEY to callOpenRouter (QUB-
 // The test pins that a custom deps.paths.configSrc is honored
 // (so the local run reads /tmp/boop-runner/skills/boop/...),
 // and that the fallback fires when deps.paths.configSrc is absent.
-test("defaultExpert reads lens path from deps.paths.configSrc (QUB-<next>)", async () => {
+test("defaultExpert reads lens path from deps.paths.configSrc (QUB-132)", async () => {
   // Capture the path the expert tried to read. fs.readFile is the
   // ground-truth source the expert uses (the rtk adapter falls
   // back to fs when its CLI call fails).
@@ -511,7 +511,7 @@ test("defaultExpert reads lens path from deps.paths.configSrc (QUB-<next>)", asy
   );
 });
 
-// QUB-<next> BOOP_TOOLS_ENABLED kill switch: the experts path
+// BOOP_TOOLS_ENABLED kill switch: the experts path
 // must honor ctx.toolsEnabled the same way the narrator does.
 // Pre-fix, the experts always built the tool set even when the
 // operator flipped the env var off — so setting BOOP_TOOLS_ENABLED=0

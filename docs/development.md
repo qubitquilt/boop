@@ -195,7 +195,7 @@ This pushes `stable`, `v0.2.0`, `0.2`, `0`. The default overlay pins
 `latest` (main HEAD); override to a specific tag for reproducible
 rollouts.
 
-## OpenRouter agent invocation (post QUB-<next>)
+## OpenRouter agent invocation (post PR #191)
 
 The runner calls
 [`@openrouter/agent`](https://github.com/openrouterteam/typescript-sdk)

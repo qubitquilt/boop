@@ -421,7 +421,7 @@ test("callOpenRouter stamps QUB-105 error context on the thrown Error", async ()
 });
 
 test("callOpenRouter concatenates structured content parts via getText", async () => {
-  // QUB-<next>: the agent SDK's `getText()` walks the
+  // SDK cutover: the agent SDK's `getText()` walks the
   // OpenResponses `output[]` and concatenates the message
   // content parts. The runner does not have to concatenate
   // them itself — the SDK does. This test pins the call
@@ -521,7 +521,7 @@ test("callOpenRouter logs statusCode, body, contentType on error (QUB-124)", asy
   assert.equal(log.meta.errorName, "UnauthorizedResponseError");
 });
 
-// QUB-<next>: when callModel throws an AbortError (the timeout
+// SDK cutover: when callModel throws an AbortError (the timeout
 // fires), callOpenRouter must re-throw it so runOpenCodeSkill's
 // handler can distinguish timeouts from genuine SDK failures.
 // The agent SDK surfaces AbortError via `throw result.error`
@@ -1853,7 +1853,7 @@ test("runOpenCodeSkill throws when the stripped model is empty", async () => {
 // section so the model reads the description before the
 // task framing.
 //
-// QUB-<next>: the block has two variants. The default (no
+// SDK cutover: the block has two variants. The default (no
 // `ctx.toolsEnabled === false`) names the agent tool set so
 // the model knows it can run `run_command` / `read_file` /
 // `git_diff`; the `ctx.toolsEnabled === false` path keeps the
@@ -1922,7 +1922,7 @@ test("isToolsEnabled honors ctx.toolsEnabled and defaults to true", () => {
   assert.equal(isToolsEnabled({ toolsEnabled: "0" }), true);
 });
 
-test("buildBoopPrompt's 'What you are receiving' block names the verification tools (QUB-<next>)", async () => {
+test("buildBoopPrompt's 'What you are receiving' block names the verification tools (QUB-132)", async () => {
   // The QUB-<next variant tells the model it CAN read the diff
   // via read_file / git_diff (the prior contract said "you
   // cannot read the diff"). The block still pins that the

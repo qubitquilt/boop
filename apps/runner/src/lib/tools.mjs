@@ -1,6 +1,6 @@
 // Agent tools for the boop reviewer.
 //
-// The QUB-<next> SDK swap moved the runner from @openrouter/sdk's
+// The SDK swap moved the runner from @openrouter/sdk's
 // single-shot chatSend to @openrouter/agent's callModel, which
 // natively auto-executes tools within the agent loop. The reviewer
 // gains the ability to run commands against the cloned PR (the

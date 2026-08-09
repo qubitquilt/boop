@@ -40,7 +40,7 @@ apps/runner/
 │       ├── classify.mjs           # PR classifier stub (QUB-94 sub-workflow)
 │       ├── experts.mjs            # multi-expert review (QUB-95), meta-review (QUB-96)
 │       ├── rtk.mjs                # rtk adapter (QUB-85) — readFile with rtk + raw fallback
-│       ├── tools.mjs              # agent tool set (QUB-<next>): run_command, read_file, git_diff
+│       ├── tools.mjs              # agent tool set (PR #191): run_command, read_file, git_diff
 │       ├── workflow.mjs           # macro + sub-workflow executor
 │       └── github.mjs             # mintInstallationToken, postStatus, postReview, postInlineComments, cleanupPriorReview
 ├── rtk/

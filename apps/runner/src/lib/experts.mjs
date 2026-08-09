@@ -260,7 +260,7 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   // until this fallback landed.
   const EXPERT_TIMEOUT_MS = 90_000;
   const callOpenRouter = deps.callOpenRouter || (await import("./openrouter.mjs")).callOpenRouter;
-  // QUB-<next>: the experts are the second call site that hands
+  // SDK cutover: the experts are the second call site that hands
   // the reviewer the agent tool set. The test-quality / regression-
   // hunter experts can run `npm test` / `bun test` to verify
   // findings; the design-pattern / readability experts can use
@@ -284,7 +284,7 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
       // expert dispatch with `callOpenRouter: model is required`.
       model: stripOpenRouterPrefix(ctx.openrouterModel),
       timeoutMs: EXPERT_TIMEOUT_MS,
-      // QUB-<next>: the lens body rides on the agent SDK's
+      // SDK cutover: the lens body rides on the agent SDK's
       // `instructions` field (callModel's system-prompt
       // equivalent). Pre-swap, the chatSend path silently
       // dropped `system`; the agent SDK actually honors it.
