@@ -155,6 +155,18 @@ export function loadConfig(env = process.env) {
     // fallback; QUB-98 deleted the opencode.json ConfigMap so
     // this env var is now the only source of the model name.
     openrouterModel: env.OPENROUTER_MODEL || null,
+    // QUB-<next: agent tool-set kill switch. The QUB-<next SDK
+    // swap gave the reviewer a tool set (run_command, read_file,
+    // git_diff) for the experts + narrator. Set
+    // BOOP_TOOLS_ENABLED=0 to disable tools fleet-wide (the
+    // narrator gets the QUB-130 "no tools available" prompt
+    // variant and a no-tools SDK call). The walkthrough is
+    // unaffected — it never had tools. Default `true` keeps
+    // tool execution on for normal operations; this env var is
+    // the operator's escape hatch when a tool-using prompt
+    // regresses or a runner host can't safely execute
+    // subprocesses.
+    toolsEnabled: env.BOOP_TOOLS_ENABLED !== "0",
   };
 }
 

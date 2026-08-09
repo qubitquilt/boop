@@ -195,14 +195,15 @@ This pushes `stable`, `v0.2.0`, `0.2`, `0`. The default overlay pins
 `latest` (main HEAD); override to a specific tag for reproducible
 rollouts.
 
-## OpenRouter SDK invocation (post QUB-98)
+## OpenRouter agent invocation (post QUB-<next>)
 
 The runner calls
-[`@openrouter/sdk`](https://github.com/openrouterteam/typescript-sdk)
-in-process. There is no subprocess, no `script(1)` PTY wrap, and no
-`opencode.json` template. The model name comes from the
-`OPENROUTER_MODEL` Job env var; the API key comes from the
-`boop-secrets` mounted file. Telemetry is captured from the SDK
+[`@openrouter/agent`](https://github.com/openrouterteam/typescript-sdk)
+in-process via `client.callModel`. There is no subprocess, no
+`script(1)` PTY wrap, and no `opencode.json` template. The model
+name comes from the `OPENROUTER_MODEL` Job env var; the API key
+comes from the `boop-secrets` mounted file. Telemetry is captured
+from the SDK
 response directly (`prompt_tokens`, `completion_tokens`, `cost`).
 
 The QUB-94 rollout was driven by the `BOOP_USE_OPENROUTER_SDK`

@@ -74,11 +74,11 @@ See [receiver.md](./receiver.md).
 ### boop-runner (`apps/runner/`)
 
 Short-lived. One pod per PR review. Clones the PR, runs the
-multi-expert review pipeline via the OpenRouter SDK in-process,
-posts the result.
+multi-expert review pipeline via the OpenRouter Agent SDK
+in-process, posts the result.
 
 - **Image:** `ghcr.io/qubitquilt/boop-runner` (Ubuntu 24.04, Node 22,
-  `@openrouter/sdk` from npm, `rtk` 0.44.2 binary). The image is
+  `@openrouter/agent` from npm, `rtk` 0.44.2 binary). The image is
   ~250 MB; rtk adds ~25 MB.
 - **Lifetime:** 1 pod, started by the receiver, runs to completion or 30
   min (`activeDeadlineSeconds: 1800`), GC'd 1 h after finish.

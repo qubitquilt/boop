@@ -32,6 +32,7 @@
 // across retries), so re-attempts are safe.
 
 import { emptyTelemetry, stripOpenRouterPrefix } from "./openrouter.mjs";
+import { buildAgentTools } from "./tools.mjs";
 
 // pickExperts is the orchestrator. Maps a PR type to a
 // list of expert names. The default mapping is a starting
@@ -113,6 +114,7 @@ const EXPERT_TO_LENS = Object.fromEntries(
 // bullet per finding, no preamble.
 function buildExpertPrompt(name, ctx, deps, walkthrough) {
   const wt = walkthrough || "(walkthrough unavailable — read the diff directly)";
+  const toolsEnabled = deps && deps.paths?.repoDir && deps.execFile && deps.fs;
   return [
     "# Task",
     "",
@@ -137,6 +139,23 @@ function buildExpertPrompt(name, ctx, deps, walkthrough) {
     "```",
     "",
     "Read the diff. Apply your lens checklist. Report findings as JSON.",
+    ...(toolsEnabled
+      ? [
+          "",
+          "# Tools available for verification",
+          "",
+          "You have a small agent tool set for verification: `run_command` " +
+            "(run a shell command in the PR's working directory with a " +
+            "timeout + output cap — useful for running the PR's test suite), " +
+            "`read_file` (read a file inside the repo), and `git_diff` " +
+            "(run `git diff <range>` for a path). The tool guard rejects " +
+            "network primitives and references to the runner's secret mounts. " +
+            "Use these tools to verify a finding (e.g. confirm a test failure, " +
+            "ground a line number) before reporting it; do NOT emit raw tool-" +
+            "call JSON in your final response — the SDK runs tools natively " +
+            "and your final text must be the JSON findings object below.",
+        ]
+      : []),
     "",
     "# Output spec",
     "",
@@ -228,6 +247,13 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   // until this fallback landed.
   const EXPERT_TIMEOUT_MS = 90_000;
   const callOpenRouter = deps.callOpenRouter || (await import("./openrouter.mjs")).callOpenRouter;
+  // QUB-<next>: the experts are the second call site that hands
+  // the reviewer the agent tool set. The test-quality / regression-
+  // hunter experts can run `npm test` / `bun test` to verify
+  // findings; the design-pattern / readability experts can use
+  // `read_file` / `git_diff` to ground line numbers. The walkthrough
+  // stays tool-free (no tools passed in walkthrough.mjs).
+  const expertTools = buildAgentTools(ctx, deps);
   let callResult;
   try {
     callResult = await callOpenRouter(userPrompt, {
@@ -241,7 +267,14 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
       // expert dispatch with `callOpenRouter: model is required`.
       model: stripOpenRouterPrefix(ctx.openrouterModel),
       timeoutMs: EXPERT_TIMEOUT_MS,
-      system: lensBody, // the lens file as the system prompt
+      // QUB-<next>: the lens body rides on the agent SDK's
+      // `instructions` field (callModel's system-prompt
+      // equivalent). Pre-swap, the chatSend path silently
+      // dropped `system`; the agent SDK actually honors it.
+      // Each expert gets its lens as the system prompt and the
+      // walkthrough + diff as the user message.
+      system: lensBody,
+      tools: expertTools,
     });
   } catch (err) {
     // A single expert failure rejects the dispatch; the
