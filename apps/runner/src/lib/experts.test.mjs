@@ -7,7 +7,10 @@ import {
   runExperts,
   gather,
   defaultNarrate,
+  placeholderNarrate,
+  _PLACEHOLDER_NARRATE_SUMMARY,
 } from "./experts.mjs";
+import { parseReviewOutput } from "./openrouter.mjs";
 
 // --- pickExperts ------------------------------------------------------
 
@@ -434,4 +437,83 @@ test("defaultExpert forwards deps.env.OPENROUTER_API_KEY to callOpenRouter (QUB-
       calls[0].env.OPENROUTER_API_KEY.length > 0,
     "OPENROUTER_API_KEY must be a non-empty string",
   );
+});
+
+// --- QUB-130: placeholderNarrate ---------------------------------------
+//
+// When the multi-expert dispatch returns 0 findings, the
+// narrator's LLM can refuse to produce a review (the model
+// emits a refusal under 200 bytes that the parser rejects as
+// "summary empty"). The placeholder bypasses the LLM and
+// produces a clean, deterministic "no issues found" review
+// that passes the parser's shape check.
+
+test("placeholderNarrate returns the same summary regardless of walkthrough (QUB-130)", () => {
+  // The placeholder body is intentionally generic. A
+  // walkthrough-shaped failure must not leak into the
+  // review. The function accepts walkthrough /
+  // walkthroughIsPlaceholder for diagnostic logging only.
+  const a = placeholderNarrate([], "any walkthrough", true, {}, { log: () => {} });
+  const b = placeholderNarrate(
+    [],
+    "another walkthrough that is completely different",
+    false,
+    {},
+    { log: () => {} },
+  );
+  assert.equal(a.summary, b.summary, "placeholder body is identical for any walkthrough");
+});
+
+test("placeholderNarrate returns a summary that passes parseReviewOutput (QUB-130)", () => {
+  // The placeholder summary must pass the parser's
+  // looksLikeReviewShape gate (≥ 200 bytes, has a heading
+  // or finding table, no refusal patterns). The runner
+  // posts the summary to the PR via the structured block;
+  // a failure here would mean the placeholder is rejected
+  // by the same gate that rejected the LLM's refusal.
+  const placeholder = placeholderNarrate([], "", true, {}, { log: () => {} });
+  // Round-trip the summary through the full structured
+  // block to exercise parseReviewOutput's shape check.
+  const wrapped = [
+    "=== SUMMARY ===",
+    placeholder.summary,
+    "=== INLINE COMMENTS ===",
+    "=== CONFIDENCE ===",
+    placeholder.confidence,
+    "=== END ===",
+  ].join("\n");
+  const parsed = parseReviewOutput(wrapped);
+  assert.equal(parsed.parseError, null, `placeholder failed parse: ${parsed.parseError}`);
+  assert.equal(parsed.summary, placeholder.summary);
+  assert.equal(parsed.confidence, "high");
+  assert.equal(parsed.inlineComments.length, 0);
+});
+
+test("placeholderNarrate stamps stepCount: 0 on telemetry (QUB-130)", () => {
+  // The dashboard distinguishes a placeholder review from
+  // a successful LLM review via stepCount (0 vs 1). The
+  // telemetry shape matches emptyTelemetry so the row
+  // looks like a zero-cost call.
+  const placeholder = placeholderNarrate([], "", false, {}, { log: () => {} });
+  assert.equal(placeholder.telemetry.stepCount, 0);
+  assert.equal(placeholder.telemetry.provider, "openrouter");
+  assert.equal(placeholder.telemetry.inputTokens, 0);
+  assert.equal(placeholder.telemetry.outputTokens, 0);
+  assert.equal(placeholder.telemetry.costUsd, 0);
+});
+
+test("placeholderNarrate returns high confidence and empty inline comments (QUB-130)", () => {
+  const placeholder = placeholderNarrate([], "", true, {}, { log: () => {} });
+  assert.equal(placeholder.confidence, "high");
+  assert.deepEqual(placeholder.inlineComments, []);
+});
+
+test("placeholderNarrate summary is locked to the documented body (QUB-130)", () => {
+  // The summary string is consumed by tests + the runner.
+  // A future refactor that changes the wording is a user-
+  // visible change and needs an explicit decision. Pin the
+  // exported constant so the assertion covers the literal
+  // string the placeholder posts.
+  const placeholder = placeholderNarrate([], "", true, {}, { log: () => {} });
+  assert.equal(placeholder.summary, _PLACEHOLDER_NARRATE_SUMMARY);
 });
