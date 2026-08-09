@@ -120,6 +120,17 @@ spec:
 #      GitHub REST/GraphQL API.
 #   2. openrouter.ai — the LLM provider.
 #   3. (Implicit) kube-dns — already allowed by allow-dns.
+#   4. The boop-receiver Pod on port 8080 — for the runner's
+#      dashboard POSTs (telemetry, status, stages, heartbeat,
+#      lens_telemetry). Without this rule the runner's fetch
+#      to http://boop-receiver.dev-tools.svc.cluster.local:8080
+#      is dropped at the network layer and the runner logs
+#      `dashboard post error err=fetch failed` on every
+#      status update. The K8s Service ClusterIP is the
+#      destination; the podSelector below is the
+#      receiver-pod label, which the Service's selector
+#      matches too, so cluster-internal Service routing
+#      lands on the same pods the policy allows.
 #
 # The 0.0.0.0/0 + 169.254.0.0/16 exception is the standard
 # "allow the world but block cloud metadata" pattern. A
@@ -140,17 +151,32 @@ spec:
     matchLabels:
       app: boop
   policyTypes:
-    - Egress
+  - Egress
   egress:
-    - to:
-        - ipBlock:
-            cidr: 0.0.0.0/0
-            except:
-              # RFC 3927 link-local — covers cloud IMDS
-              # (169.254.169.254) on every major provider.
-              - 169.254.0.0/16
-      ports:
-        - protocol: TCP
-          port: 443
-        - protocol: TCP
-          port: 80
+  # QUB-127: in-cluster reach to the receiver on port 8080
+  # for dashboard POSTs. Pod-selector + named-port match
+  # keeps the rule narrow; the Service ClusterIP
+  # (boop-receiver.dev-tools.svc.cluster.local) routes
+  # through the same pod label, so the runner's DNS
+  # resolution + Service hop lands on a pod this
+  # policy allows. K8s evaluates each rule independently
+  # (additive OR), so order in the array is not load-bearing.
+  - to:
+    - podSelector:
+        matchLabels:
+          app: boop-receiver
+    ports:
+    - protocol: TCP
+      port: 8080
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+          # RFC 3927 link-local — covers cloud IMDS
+          # (169.254.169.254) on every major provider.
+          - 169.254.0.0/16
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
