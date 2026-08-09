@@ -298,19 +298,31 @@ jobs:
 
             # Try to enable auto-merge. Requires the repo to have
             # auto-merge enabled in settings; if it isn't, the PR
-            # stays open for manual review and merge.
+            # stays open for manual review and merge. Fail loudly so
+            # the orphan case (PR opened, auto-merge never engaged,
+            # nobody watches for stale PRs) surfaces as a red
+            # workflow run instead of a green one that quietly
+            # needs human attention. The standard recovery is to
+            # enable `enable_pull_request_auto_merge` on the main
+            # branch protection.
             if gh pr merge "${CREATED_PR}" --auto --squash; then
               echo "Auto-merge enabled for PR #${CREATED_PR}."
             else
-              echo "Auto-merge not available; PR #${CREATED_PR} needs a manual merge."
+              echo "::error::Auto-merge not available for PR #${CREATED_PR}; needs a manual merge. Enable 'Allow auto-merge' on the main branch protection."
+              exit 1
             fi
           else
             # The new push reset the PR's required-checks state, so
-            # we re-arm auto-merge. Failure here is non-fatal — the
-            # PR is still updated, just without auto-merge.
+            # we re-arm auto-merge. Same failure-mode reasoning as
+            # the create branch above: if auto-merge doesn't engage,
+            # the PR is still updated but will sit until a human
+            # merges. Fail loudly so the operator gets a clear
+            # signal instead of having to discover the stale PR
+            # by comparing the registry digest to the ConfigMap.
             if gh pr merge "${PR_NUMBER}" --auto --squash; then
               echo "Auto-merge re-enabled for existing PR #${PR_NUMBER}."
             else
-              echo "::warning::Auto-merge not re-enabled for PR #${PR_NUMBER}; needs a manual merge."
+              echo "::error::Auto-merge not re-enabled for existing PR #${PR_NUMBER}; needs a manual merge. Enable 'Allow auto-merge' on the main branch protection."
+              exit 1
             fi
           fi

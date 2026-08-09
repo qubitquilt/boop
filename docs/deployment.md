@@ -62,7 +62,12 @@ stage of the chain.
 | `build-receiver` | `push` to `main` | yes | every commit that touches receiver code |
 | `build-receiver` | `push` to `v*` tag | yes | each release tag |
 | `build-receiver` | `pull_request` to `main` | no | PR builds; fork PRs skipped |
-| `build-runner` | same shape as `build-receiver` | same | scoped to `apps/runner` |
+| `build-runner` | `push` to `main` (scoped to `apps/runner`) | yes | every commit that touches runner code |
+| `build-runner` | `push` to `v*` tag | yes | each release tag |
+| `build-runner` | `pull_request` to `main` | no | PR builds; fork PRs skipped |
+| `build-runner` | `workflow_dispatch` | yes | manual re-run from the Actions tab; also fired by the nightly schedule |
+| `rebuild-runner-nightly` | `schedule` (daily 02:00 UTC) | no | calls `gh workflow run build-runner --ref main`, then `sync-image-digests` |
+| `rebuild-runner-nightly` | `workflow_dispatch` | no | manual run of the same chain |
 | `sync-image-digests` | `workflow_run` of either build, on `success` | n/a | runs after every successful build |
 | `sync-image-digests` | `workflow_dispatch` | n/a | manual re-run from the Actions tab |
 
@@ -203,6 +208,48 @@ Cost: one extra `Get` per webhook. Webhooks are bounded by GitHub's
 delivery rate (one per push per repo, in practice), and the read
 returns from the API server's in-memory cache, so the latency
 overhead is single-digit milliseconds.
+
+### Self-heal for the runner image (QUB-122)
+
+The push trigger on `build-runner.yaml` is scoped to
+`apps/runner/**` and `.github/workflows/build-runner.yaml`. A fix
+to anything outside that path (the deploy workflow, a kustomize
+overlay, a sibling app, a docs page) leaves the runner image
+behind the source until the next `apps/runner/**` change. The
+ConfigMap `JOB_IMAGE` digest is a one-step-behind target — once
+`:stable` lands, nothing forces a rebuild even if the source tree
+has moved on.
+
+`rebuild-runner-nightly.yaml` closes the gap. A daily cron at
+02:00 UTC calls `gh workflow run build-runner --ref main`, waits
+for it to complete, then calls `gh workflow run sync-image-digests`.
+The build is cache-warmed (buildx layer cache; the runner image
+spends ~25s on a no-op rebuild) so a no-op rebuild completes in
+seconds, and `sync-image-digests` produces no diff when the digest
+has not changed (`git diff --quiet` short-circuits the PR step).
+
+The explicit `sync-image-digests` dispatch is required to skip its
+"wait for sibling upstream" step. The step polls for
+`build-receiver`'s successful run on the same head SHA — a guard
+that prevents half-correct digest pairs when the two builds
+finish at different latencies. A nightly rebuild that only triggers
+`build-runner` has no `build-receiver` run for the current SHA, so
+the wait would time out after 5 minutes. A direct
+`workflow_dispatch` of `sync-image-digests` skips the step
+(`if: github.event_name == 'workflow_run'`), and the workflow's
+`concurrency.cancel-in-progress` group coalesces the two runs
+into one — the failed `workflow_run` is cancelled the moment the
+explicit dispatch lands.
+
+Manual triggers:
+
+- `Actions → rebuild-runner-nightly → Run workflow` for an
+  end-to-end rebuild + digest sync on demand.
+- `Actions → build-runner → Run workflow` for a rebuild without
+  forcing the digest sync (useful when you only want to push
+  bytes; the digest sync will fire from `workflow_run` and will
+  correctly pin whatever is on `:stable` once both upstreams
+  complete on the same SHA).
 
 ## Image publishing
 

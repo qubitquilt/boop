@@ -6,7 +6,7 @@ name: pinact
 # bytes behind the tag without changing the manifest. SHAs are
 # immutable by definition.
 #
-# pinact (`rhysd/pinact`) reads every workflow under
+# pinact (`suzuki-shunsuke/pinact`) reads every workflow under
 # .github/workflows/ and fails the run if any `uses:` line is
 # not pinned to a 40-character SHA. The fix is mechanical —
 # `pinact run` rewrites the file in place — and well-tested in
@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run pinact
-        uses: rhysd/pinact-action@27bb84ac9af3887c9b75e2a37af3a59c838ec1cd # v1.5.0
+        uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
         with:
           args: --skip-pr
           # skip-pr means we don't have pinact open its own
