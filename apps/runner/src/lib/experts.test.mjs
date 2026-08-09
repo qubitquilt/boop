@@ -511,6 +511,70 @@ test("defaultExpert reads lens path from deps.paths.configSrc (QUB-<next>)", asy
   );
 });
 
+// QUB-<next> BOOP_TOOLS_ENABLED kill switch: the experts path
+// must honor ctx.toolsEnabled the same way the narrator does.
+// Pre-fix, the experts always built the tool set even when the
+// operator flipped the env var off — so setting BOOP_TOOLS_ENABLED=0
+// disabled tools only for the narrator, not for the experts.
+// This was caught by a local-run review (PR #191). The test
+// pins that the expert call carries an empty tool array when
+// the kill switch is set.
+test("defaultExpert honors ctx.toolsEnabled === false (BOOP_TOOLS_ENABLED kill switch)", async () => {
+  const calls = [];
+  const baseDeps = () => ({
+    callOpenRouter: async (_prompt, opts) => {
+      calls.push({ prompt: _prompt, opts });
+      return {
+        text: '{"findings": []}',
+        model: opts?.model ?? "test-model",
+        usage: { prompt_tokens: 0, completion_tokens: 0, cost: 0 },
+      };
+    },
+    fs: {
+      readFile: async () =>
+        "# test lens\nYou are a test expert. Return {findings:[]}.",
+    },
+    execFile: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+    paths: { configSrc: "/tmp", repoDir: "/tmp" },
+    postStatus: async () => {},
+    env: { OPENROUTER_API_KEY: "test-key" },
+    log: () => {},
+    errlog: () => {},
+  });
+
+  // Case 1: toolsEnabled === false (operator flipped BOOP_TOOLS_ENABLED=0).
+  // The expert must NOT receive any tools.
+  calls.length = 0;
+  await runExperts(
+    ["regression-hunter"],
+    {
+      openrouterModel: "minimax/minimax-m3",
+      toolsEnabled: false,
+    },
+    baseDeps(),
+  );
+  assert.ok(calls[0], "expert dispatch must invoke callOpenRouter");
+  const toolsOpt = calls[0].opts?.tools;
+  assert.ok(
+    Array.isArray(toolsOpt) && toolsOpt.length === 0,
+    `expert must receive empty tools array when toolsEnabled=false; got ${JSON.stringify(toolsOpt)}`,
+  );
+
+  // Case 2: toolsEnabled undefined (default). The expert must
+  // receive the full tool set (run_command + read_file + git_diff).
+  calls.length = 0;
+  await runExperts(
+    ["regression-hunter"],
+    { openrouterModel: "minimax/minimax-m3" },
+    baseDeps(),
+  );
+  const toolsOpt2 = calls[0].opts?.tools;
+  assert.ok(
+    Array.isArray(toolsOpt2) && toolsOpt2.length === 3,
+    `expert must receive full tool set by default; got ${JSON.stringify(toolsOpt2?.map((t) => t?.function?.name))}`,
+  );
+});
+
 // --- QUB-130: placeholderNarrate ---------------------------------------
 //
 // When the multi-expert dispatch returns 0 findings, the
