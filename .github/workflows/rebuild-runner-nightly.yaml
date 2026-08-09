@@ -1,0 +1,146 @@
+name: rebuild-runner-nightly
+
+# QUB-122: self-heal for the runner image.
+#
+# The push trigger on `build-runner.yaml` is scoped to `apps/runner/**`
+# and `.github/workflows/build-runner.yaml`. A fix to anything else
+# (deploy workflow, kustomize overlay, docs, a sibling app) leaves the
+# runner image behind the source. QUB-117 / QUB-118 / QUB-120 all
+# fixed runner code so they self-healed; a future fix to, say,
+# `apps/receiver/cmd/receiver/main.go` would not.
+#
+# This workflow closes the gap by re-running `build-runner` on a daily
+# schedule. The build is cache-warmed (QUB-114) so a no-op rebuild
+# completes in seconds, and the rebuild produces a fresh `:stable`
+# digest. We then explicitly trigger `sync-image-digests` so the
+# ConfigMap `JOB_IMAGE` pin is rewritten to the new bytes.
+#
+# Why explicitly trigger `sync-image-digests` rather than rely on its
+# `workflow_run` hook: the upstream sync workflow has a "wait for
+# sibling upstream build" step (added when the fan-in was fixed) that
+# polls the GitHub Actions API for the OTHER build's successful run
+# on the same head SHA. A nightly schedule that only triggers
+# `build-runner` has no `build-receiver` run for the current SHA, so
+# the wait would time out after 5 minutes and the digest pin would
+# never update. A direct `workflow_dispatch` of `sync-image-digests`
+# skips the wait step (`if: github.event_name == 'workflow_run'`), and
+# the workflow's `concurrency.cancel-in-progress` group coalesces the
+# two runs into one — the failed `workflow_run` is cancelled the
+# moment our explicit dispatch lands.
+#
+# Idempotent: when nothing has changed, the build is a no-op (same
+# layers, same digest) and `sync-image-digests` produces no diff
+# (`git diff --quiet` short-circuits the PR step). The only side
+# effect is a few seconds of CI time per day.
+#
+# QUB-122 follow-up: `build-runner.yaml`'s push guard is
+# `github.event_name != 'pull_request'`, NOT `== 'push'`. The
+# `workflow_dispatch` we fire here lands on a `workflow_dispatch`
+# event, and the guard must include that event for `:stable` to
+# actually move on the registry. The pre-QUB-122 `== 'push'` guard
+# silently turned the chain into a cache-warmed local build that
+# never pushed, which is the original gap this workflow exists to
+# close.
+
+on:
+  schedule:
+    # 02:00 UTC daily. Off-peak for both GitHub Actions runners and
+    # the `boop-runner-set` (the buildx Kubernetes driver that
+    # `build-runner` runs on). Cron in UTC; the GitHub UI converts
+    # to the viewer's local time.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger build-runner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Capture a `created` filter BEFORE the dispatch so the
+          # next step's API query cannot match an earlier completed
+          # run (yesterday's nightly, a previous manual dispatch).
+          # The GitHub API accepts `>=` / `>` filters on the
+          # `created` parameter; we use `>` so a run created in the
+          # same second as the trigger is included.
+          echo "TRIGGER_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        id: trigger_meta
+
+      - name: Dispatch build-runner
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # `gh workflow run` returns immediately; the run is queued.
+          # The wait step below polls the API for completion.
+          gh workflow run build-runner.yaml --ref main
+
+      - name: Wait for build-runner to complete
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRIGGER_TIME: ${{ steps.trigger_meta.outputs.TRIGGER_TIME }}
+        run: |
+          set -euo pipefail
+          # 10 minutes covers a cold-cache runner build with
+          # buildx setup + push. Anything longer is a real outage;
+          # fail loudly so the schedule alert fires instead of
+          # silently looping.
+          DEADLINE=$(date -u -d '+10 minutes' +%s)
+          while true; do
+            if [ "$(date -u +%s)" -gt "${DEADLINE}" ]; then
+              echo "::error::Timed out waiting for build-runner to complete"
+              exit 1
+            fi
+            # Filter by `created > TRIGGER_TIME` so we never match a
+            # prior completed run (yesterday's nightly, a previous
+            # manual dispatch). The `event == workflow_dispatch`
+            # filter pins it to the run we just kicked off — a push
+            # run on the same SHA would have a different event.
+            LATEST="$(
+              gh api "/repos/qubitquilt/boop/actions/workflows/build-runner.yaml/runs?per_page=5&created=%3E${TRIGGER_TIME}" \
+                --jq '.workflow_runs[] | select(.event == "workflow_dispatch") | "\(.status)|\(.conclusion // "")"' \
+                | head -1
+            )"
+            if [ -z "${LATEST}" ]; then
+              echo "No workflow_dispatch run after ${TRIGGER_TIME} yet; retrying..."
+              sleep 10
+              continue
+            fi
+            STATUS="${LATEST%%|*}"
+            CONCLUSION="${LATEST##*|}"
+            if [ "${STATUS}" = "completed" ]; then
+              if [ "${CONCLUSION}" = "success" ]; then
+                echo "build-runner completed successfully."
+                exit 0
+              fi
+              echo "::error::build-runner finished with conclusion=${CONCLUSION}"
+              exit 1
+            fi
+            echo "build-runner status=${STATUS}; waiting..."
+            sleep 15
+          done
+
+      # QUB-122: the explicit dispatch is required to skip the
+      # `sync-image-digests` "wait for sibling upstream" step. The
+      # step only runs under `workflow_run` events, and we want to
+      # avoid a 5-minute timeout because no `build-receiver` run
+      # exists for the current head SHA on a runner-only rebuild.
+      # The workflow's `concurrency.cancel-in-progress: true` group
+      # coalesces this with the auto-fired `workflow_run` from the
+      # step above; the failed `workflow_run` is cancelled the
+      # moment this dispatch lands.
+      - name: Trigger sync-image-digests
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run sync-image-digests.yaml --ref main
+          echo "sync-image-digests dispatched. The ConfigMap JOB_IMAGE pin will follow."

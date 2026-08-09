@@ -12,6 +12,16 @@ on:
     paths:
       - 'apps/runner/**'
       - '.github/workflows/build-runner.yaml'
+  # QUB-122: nightly self-heal. The `rebuild-runner-nightly` workflow
+  # calls `gh workflow run build-runner --ref main` on a cron. Manual
+  # dispatch from the Actions tab also lands here — useful for a
+  # forced rebuild when a base image (e.g. `ubuntu:24.04`) is known
+  # to have a CVE but the source tree is unchanged. The push path
+  # filter does not apply to workflow_dispatch, so this runs even
+  # when `apps/runner/**` has not changed — which is the whole point
+  # of the self-heal (a fix to any other path leaves the runner
+  # image behind until the next push, by design).
+  workflow_dispatch:
 
 env:
   IMAGE: ghcr.io/qubitquilt/boop-runner
@@ -72,7 +82,15 @@ jobs:
         with:
           context: apps/runner
           platforms: linux/arm64
-          push: ${{ github.event_name == 'push' }}
+          # QUB-122: `!= pull_request` rather than `== push` so the
+          # `rebuild-runner-nightly` `workflow_dispatch` (and any
+          # manual Actions-tab dispatch) actually pushes to GHCR.
+          # The old `== push` guard silently turned a dispatch into
+          # a cache-warmed local build that never landed a new
+          # `:stable` digest. `pull_request` is the only event where
+          # the guard should be false (PR builds are smoke tests
+          # and fork PRs cannot push anyway).
+          push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           # QUB-114: BUILDKIT_INLINE_CACHE=1 makes the `mode=max` cache
           # export carry layer metadata so downstream `--cache-from` can
