@@ -28,6 +28,13 @@ func newTestDashboard(t *testing.T, rerunFn func(ctx context.Context, prior stor
 // newTestDashboardWithLogs is the variant that also wires
 // Actions.FetchPodLogs. Used by TestServeRunDetail* to
 // assert that the dashboard surfaces the runner's pod logs.
+//
+// The returned *Handler carries a TestStore (a *store.Store,
+// which implements both the production Store interface
+// and the test-only TestStore seam). The test seam
+// exposes DB() for raw SQL UPDATEs the seeded runs
+// need (backdating started_at, etc.); production code
+// never calls DB().
 func newTestDashboardWithLogs(t *testing.T, rerunFn func(ctx context.Context, prior store.Run, reason string) (string, error), fetchLogsFn func(ctx context.Context, jobName string) (string, error)) *Handler {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "boop.db")
@@ -36,6 +43,15 @@ func newTestDashboardWithLogs(t *testing.T, rerunFn func(ctx context.Context, pr
 		t.Fatalf("open store: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
+	// Compile-time check that *store.Store implements
+	// both the production Store interface and the
+	// test-only TestStore seam. The Handler holds
+	// the interface-typed field; tests type-assert
+	// back to TestStore for raw SQL access (see
+	// the backdate UPDATE in the imminent-flag
+	// retention test).
+	var _ Store = s
+	var _ TestStore = s
 	return &Handler{
 		store:  s,
 		logger: slog.New(slog.NewJSONHandler(io.Discard, nil)),
@@ -436,8 +452,16 @@ func TestServeRetention_ImminentFlag(t *testing.T) {
 	run := seedRunForDashboard(t, d, store.StatusSucceeded, 0)
 
 	// Backdate started_at by 360 days via raw SQL.
+	// The store is typed as the Store interface on
+	// Handler; we type-assert to TestStore to get
+	// DB() for the backdate UPDATE. *store.Store
+	// implements TestStore.
 	backdated := run.StartedAt.Add(-360 * 24 * time.Hour)
-	res, err := d.store.DB().ExecContext(context.Background(),
+	ts, ok := d.store.(TestStore)
+	if !ok {
+		t.Fatalf("d.store does not implement TestStore")
+	}
+	res, err := ts.DB().ExecContext(context.Background(),
 		`UPDATE runs SET started_at = ? WHERE id = ?`,
 		backdated.UTC().Format(time.RFC3339Nano), run.ID)
 	if err != nil {
@@ -463,6 +487,55 @@ func TestServeRetention_ImminentFlag(t *testing.T) {
 	}
 	if !strings.Contains(body, `<span class="chip chip-fail">yes</span>`) {
 		t.Errorf("imminent row missing yes chip: %s", body)
+	}
+}
+
+// TestServeAudit_RendersEvents pins the new
+// /dashboard/audit view (SP-008). The view lists the
+// most recent audit_events rows; the empty-state path
+// renders the placeholder copy. A seeded event shows
+// up in the rendered HTML with action / actor /
+// target / details.
+func TestServeAudit_RendersEvents(t *testing.T) {
+	d := newTestDashboard(t, nil)
+	if _, err := d.store.RecordAuditEvent(context.Background(), store.AuditEvent{
+		Action:   "test.event",
+		Actor:    "test:actor",
+		TargetID: "boop-a-b-1-aaaaaaa",
+		Details:  store.MarshalDetails(map[string]any{"key": "value"}),
+	}); err != nil {
+		t.Fatalf("seed audit: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/dashboard/audit", nil)
+	rr := httptest.NewRecorder()
+	d.serveAudit(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "test.event") {
+		t.Errorf("body missing action: %s", body)
+	}
+	if !strings.Contains(body, "test:actor") {
+		t.Errorf("body missing actor: %s", body)
+	}
+	if !strings.Contains(body, "boop-a-b-1-aaaaaaa") {
+		t.Errorf("body missing target id: %s", body)
+	}
+}
+
+func TestServeAudit_EmptyState(t *testing.T) {
+	d := newTestDashboard(t, nil)
+	req := httptest.NewRequest("GET", "/dashboard/audit", nil)
+	rr := httptest.NewRecorder()
+	d.serveAudit(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), "No audit events yet") {
+		t.Errorf("body missing empty-state copy: %s", rr.Body.String())
 	}
 }
 
