@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -383,6 +382,52 @@ func TestListRuns_KeysetPagination(t *testing.T) {
 	}
 	if page3.NextCursor != "" {
 		t.Errorf("page3 should be last; got next cursor %q", page3.NextCursor)
+	}
+}
+
+// SP-006: the bulk fetch returns the page with each run
+// paired with its telemetry. Runs without a telemetry row
+// get a zero-valued Telemetry (not a hard error) so the
+// dashboard's table renders the row without a $ column.
+func TestListRunsWithTelemetry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-1-aaaaaaa", "a", "b", 1, "aaaaaaa", StatusSucceeded, now)); err != nil {
+		t.Fatalf("seed run 1: %v", err)
+	}
+	if _, err := s.UpsertRun(ctx, sampleRun("boop-a-b-2-bbbbbbb", "a", "b", 2, "bbbbbbb", StatusFailed, now.Add(time.Minute))); err != nil {
+		t.Fatalf("seed run 2: %v", err)
+	}
+	// Only the first run has telemetry.
+	if err := s.RecordTelemetry(ctx, Telemetry{
+		RunID:    "boop-a-b-1-aaaaaaa",
+		Model:    "openrouter/x",
+		CostUSD:  0.05,
+		StepCount: 1,
+	}); err != nil {
+		t.Fatalf("seed telemetry: %v", err)
+	}
+	page, err := s.ListRunsWithTelemetry(ctx, ListRunsFilter{Owner: "a", Limit: 10})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(page.Runs) != 2 {
+		t.Fatalf("runs = %d, want 2", len(page.Runs))
+	}
+	var withT, withoutT *RunWithTelemetry
+	for i := range page.Runs {
+		if page.Runs[i].Run.ID == "boop-a-b-1-aaaaaaa" {
+			withT = &page.Runs[i]
+		} else {
+			withoutT = &page.Runs[i]
+		}
+	}
+	if withT == nil || withT.Telemetry.CostUSD != 0.05 {
+		t.Errorf("run-with-telemetry cost = %v, want 0.05", withT)
+	}
+	if withoutT == nil || withoutT.Telemetry.RunID != "" {
+		t.Errorf("run-without-telemetry: %+v, want zero Telemetry", withoutT)
 	}
 }
 
@@ -1029,6 +1074,122 @@ func TestUpsertRun_LineageRoundTrip(t *testing.T) {
 	}
 }
 
+// EH-005: CreateRerun is the atomic version of
+// UpsertRun + SetSupersededBy. A crash between the two
+// writes used to leave either a "no parent link" new row
+// or a "points at a non-existent id" prior row. The
+// transaction wraps both, so we can assert the post-
+// commit state in one place.
+func TestCreateRerun_AtomicLineage(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	prior := "boop-a-b-1-aaaaaaa"
+	next := "boop-a-b-1-aaaaaaa-r1"
+	if _, err := s.UpsertRun(ctx, sampleRun(prior, "a", "b", 1, "aaaaaaa", StatusSucceeded, time.Now())); err != nil {
+		t.Fatalf("upsert prior: %v", err)
+	}
+	got, err := s.CreateRerun(ctx, Run{
+		ID:           next,
+		Owner:        "a",
+		Repo:         "b",
+		PRNumber:     1,
+		CommitSHA:    "aaaaaaa",
+		BaseRef:      "main",
+		ReviewNumber: 2,
+		Status:       StatusPending,
+		StartedAt:    time.Now().UTC(),
+		ParentRunID:  prior,
+	}, prior)
+	if err != nil {
+		t.Fatalf("create rerun: %v", err)
+	}
+	if got.ParentRunID != prior {
+		t.Errorf("new row parent_run_id = %q, want %q", got.ParentRunID, prior)
+	}
+	if got.Status != StatusPending {
+		t.Errorf("new row status = %q, want pending", got.Status)
+	}
+	priorRow, err := s.GetRun(ctx, prior)
+	if err != nil {
+		t.Fatalf("get prior: %v", err)
+	}
+	if priorRow.SupersededByID != next {
+		t.Errorf("prior superseded_by_id = %q, want %q", priorRow.SupersededByID, next)
+	}
+}
+
+// EH-005: a second CreateRerun call against the same
+// prior must not clobber an existing superseded_by_id.
+// The operator's "double-click on Requeue" surfaces here
+// as two handler calls; the second should be a no-op on
+// the prior (and would still insert the new row, since
+// the new id differs).
+func TestCreateRerun_DoesNotClobberExistingSupersede(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	prior := "boop-a-b-1-aaaaaaa"
+	first := "boop-a-b-1-aaaaaaa-r1"
+	second := "boop-a-b-1-aaaaaaa-r2"
+	if _, err := s.UpsertRun(ctx, sampleRun(prior, "a", "b", 1, "aaaaaaa", StatusSucceeded, time.Now())); err != nil {
+		t.Fatalf("upsert prior: %v", err)
+	}
+	if _, err := s.CreateRerun(ctx, Run{
+		ID: first, Owner: "a", Repo: "b", PRNumber: 1, CommitSHA: "aaaaaaa",
+		BaseRef: "main", ReviewNumber: 2, Status: StatusPending,
+		StartedAt: time.Now().UTC(), ParentRunID: prior,
+	}, prior); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	if _, err := s.CreateRerun(ctx, Run{
+		ID: second, Owner: "a", Repo: "b", PRNumber: 1, CommitSHA: "aaaaaaa",
+		BaseRef: "main", ReviewNumber: 3, Status: StatusPending,
+		StartedAt: time.Now().UTC(), ParentRunID: prior,
+	}, prior); err != nil {
+		t.Fatalf("second create: %v", err)
+	}
+	// Prior's superseded_by_id stays pointed at the
+	// first re-run; the second call's UPDATE sees the
+	// existing non-empty value and skips.
+	priorRow, err := s.GetRun(ctx, prior)
+	if err != nil {
+		t.Fatalf("get prior: %v", err)
+	}
+	if priorRow.SupersededByID != first {
+		t.Errorf("prior superseded_by_id = %q, want %q (first)", priorRow.SupersededByID, first)
+	}
+}
+
+// EH-008: an explicit candidate name that collides
+// with an existing row returns ErrDuplicateRerunName.
+// The handler's retry loop is the consumer; the store
+// surfaces the failure rather than silently
+// overwriting.
+func TestCreateRerun_DuplicateNameReturnsError(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	prior := "boop-a-b-1-aaaaaaa"
+	if _, err := s.UpsertRun(ctx, sampleRun(prior, "a", "b", 1, "aaaaaaa", StatusSucceeded, time.Now())); err != nil {
+		t.Fatalf("upsert prior: %v", err)
+	}
+	first := "boop-a-b-1-aaaaaaa-r1"
+	if _, err := s.CreateRerun(ctx, Run{
+		ID: first, Owner: "a", Repo: "b", PRNumber: 1, CommitSHA: "aaaaaaa",
+		BaseRef: "main", ReviewNumber: 2, Status: StatusPending,
+		StartedAt: time.Now().UTC(), ParentRunID: prior,
+	}, prior); err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	// Second attempt with the same candidate name.
+	_, err := s.CreateRerun(ctx, Run{
+		ID: first, Owner: "a", Repo: "b", PRNumber: 1, CommitSHA: "aaaaaaa",
+		BaseRef: "main", ReviewNumber: 3, Status: StatusPending,
+		StartedAt: time.Now().UTC(), ParentRunID: prior,
+	}, prior)
+	if !errors.Is(err, ErrDuplicateRerunName) {
+		t.Errorf("err = %v, want ErrDuplicateRerunName", err)
+	}
+}
+
 // QUB-110: GetRun returns ErrUnknownRun for an unknown
 // id. The handler uses this to map to 404 instead of
 // 500.
@@ -1176,8 +1337,8 @@ func TestUpsertRun_FailureClassRoundTrip(t *testing.T) {
 func TestSetRunFailureClass_UnknownRun(t *testing.T) {
 	s := newTestStore(t)
 	err := s.SetRunFailureClass(context.Background(), "no-such-run", "oom_killed")
-	if !errors.Is(err, sql.ErrNoRows) {
-		t.Errorf("err = %v, want sql.ErrNoRows", err)
+	if !errors.Is(err, ErrUnknownRun) {
+		t.Errorf("err = %v, want ErrUnknownRun", err)
 	}
 }
 
@@ -1228,8 +1389,8 @@ func TestTouchRunHeartbeat_UpdatesAndMissing(t *testing.T) {
 	if got.LastHeartbeatAt == nil {
 		t.Fatalf("last_heartbeat_at not set")
 	}
-	if err := s.TouchRunHeartbeat(ctx, "missing"); !errors.Is(err, sql.ErrNoRows) {
-		t.Errorf("err = %v, want sql.ErrNoRows", err)
+	if err := s.TouchRunHeartbeat(ctx, "missing"); !errors.Is(err, ErrUnknownRun) {
+		t.Errorf("err = %v, want ErrUnknownRun", err)
 	}
 }
 

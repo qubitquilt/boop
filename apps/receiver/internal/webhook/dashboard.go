@@ -81,6 +81,17 @@ func (h *Handler) ListInstallations(w http.ResponseWriter, r *http.Request) {
 			if err := h.store.UpsertInstallations(ctx, installs); err == nil {
 				rows = installs
 				fetchedAt = time.Now().UTC()
+			} else {
+				// EH-010: a failed upsert here used to
+				// be silently swallowed. The dashboard
+				// would then render an empty list and the
+				// operator would have no idea why. A
+				// warn-level log is enough — the next
+				// background poll will retry — but the
+				// operator now sees the failure in the
+				// receiver's log stream and can correlate
+				// it with their dashboard complaint.
+				h.logger.Warn("cold start upsert installations", "err", err)
 			}
 		} else {
 			h.logger.Warn("cold start refresh installations", "err", ferr)
@@ -157,23 +168,19 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	page, err := h.store.ListRuns(r.Context(), f)
+	// SP-006: bulk fetch (runs + telemetry in one batch)
+	// replaces the N+1 GetTelemetry loop. The dashboard's
+	// run-list wants every run with its cost column, so
+	// the join is the load-bearing shape.
+	page, err := h.store.ListRunsWithTelemetry(r.Context(), f)
 	if err != nil {
 		h.logger.Warn("list runs", "err", err)
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
-
-	telemByRun := map[string]store.Telemetry{}
-	for _, run := range page.Runs {
-		if t, err := h.store.GetTelemetry(r.Context(), run.ID); err == nil {
-			telemByRun[run.ID] = t
-		}
-	}
-
 	out := make([]RunWithTelemetry, 0, len(page.Runs))
-	for _, run := range page.Runs {
-		out = append(out, RunWithTelemetry{Run: run, Telemetry: telemByRun[run.ID]})
+	for _, rt := range page.Runs {
+		out = append(out, RunWithTelemetry{Run: rt.Run, Telemetry: rt.Telemetry})
 	}
 	writeJSON(w, http.StatusOK, ListRunsResponse{
 		Runs:       out,
@@ -469,7 +476,7 @@ func (h *Handler) RecordStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	_, err := h.store.UpdateRunStatus(r.Context(), id, st, body.EndedAt, body.DurationMS, body.Error)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, store.ErrUnknownRun) {
 			// Runner started before the receiver committed
 			// the row. The runner will retry on the next
 			// stage transition. Return 202 so the runner
@@ -635,7 +642,7 @@ func (h *Handler) RecordHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.store.TouchRunHeartbeat(r.Context(), id); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, store.ErrUnknownRun) {
 			w.WriteHeader(http.StatusAccepted)
 			return
 		}

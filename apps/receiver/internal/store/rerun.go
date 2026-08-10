@@ -23,6 +23,16 @@ package store
 // to coexist (the original webhook's dedup is by head SHA,
 // but a re-run is operator-initiated and may legitimately
 // run while the original is still active).
+//
+// RD-002: the Job-name convention used to live in three
+// packages — webhook/handler.go's buildJobName, webhook/
+// rerun.go's buildJobNameRerun, and this file's
+// buildJobNamePrefix — each with its own copy of the
+// `[^a-z0-9-]` sanitizer regex. Three copies is three
+// places a future contributor could change one and miss
+// the others. The canonical helpers now live here as
+// BuildJobName / BuildRerunJobName / ShortSHA; the
+// webhook package calls them.
 
 import (
 	"context"
@@ -31,10 +41,53 @@ import (
 	"strings"
 )
 
+// jobNameSanitizer matches any character that is not a
+// lower-case letter, digit, or hyphen. The Job name lives
+// in a K8s namespace where DNS-1123 rules require this
+// subset; an un-sanitized value (e.g. owner="Org/Name")
+// would fail the Job-create API call. The single regex
+// here is the load-bearing source of truth for the
+// receiver.
+var jobNameSanitizer = regexp.MustCompile(`[^a-z0-9-]`)
+
+// ShortSHA returns the first 7 characters of sha, or sha
+// itself when shorter. Job names embed the 7-char prefix
+// because K8s labels are limited to 63 chars and the full
+// SHA pushes the Job name over the limit on some names.
+func ShortSHA(sha string) string {
+	if len(sha) >= 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+// BuildJobName constructs the Job name for an (owner,
+// repo, pr, sha) tuple. Sanitises the input so an owner
+// or repo with mixed case / non-ASCII characters does not
+// break the K8s name rules. The format is the receiver's
+// canonical contract — every Job the webhook creates and
+// every re-run the dashboard creates follows the same
+// shape.
+func BuildJobName(owner, repo string, pr int, sha string) string {
+	raw := fmt.Sprintf("boop-%s-%s-%d-%s", owner, repo, pr, ShortSHA(sha))
+	return jobNameSanitizer.ReplaceAllString(strings.ToLower(raw), "-")
+}
+
+// BuildRerunJobName constructs the Job name for a re-run,
+// layering the -r{N} suffix on top of BuildJobName. n=1
+// for the first re-run.
+func BuildRerunJobName(owner, repo string, pr int, sha string, n int) string {
+	if n < 1 {
+		n = 1
+	}
+	return fmt.Sprintf("%s-r%d", BuildJobName(owner, repo, pr, sha), n)
+}
+
 // rerunSuffix is the regex that recognizes a re-run Job
 // name. The capture group is the integer attempt number
-// ("", "1", "2", ...). Used by NextRerunJobName to count
-// existing re-runs for a (owner, repo, pr, sha7) tuple.
+// ("", "1", "2", ...). Used by CountRerunJobsForSHA to
+// count existing re-runs for a (owner, repo, pr, sha7)
+// tuple.
 var rerunSuffix = regexp.MustCompile(`-r(\d+)$`)
 
 // CountRerunJobsForSHA returns the number of existing
@@ -42,7 +95,7 @@ var rerunSuffix = regexp.MustCompile(`-r(\d+)$`)
 // new re-run's attempt number is this count + 1, since the
 // first re-run is "-r1" (count=0 → 1).
 func (s *Store) CountRerunJobsForSHA(ctx context.Context, owner, repo string, pr int, sha7 string) (int, error) {
-	prefix := buildJobNamePrefix(owner, repo, pr, sha7) + "-r"
+	prefix := BuildJobName(owner, repo, pr, sha7) + "-r"
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id FROM runs WHERE id LIKE ? || '%' AND id LIKE '%-r%'
 	`, prefix)
@@ -70,23 +123,6 @@ func (s *Store) CountRerunJobsForSHA(ctx context.Context, owner, repo string, pr
 	}
 	return count, nil
 }
-
-// buildJobNamePrefix is the part of the Job name that is
-// shared between the original and every re-run. Used by
-// CountRerunJobsForSHA and the handler's rerun Job
-// construction.
-func buildJobNamePrefix(owner, repo string, pr int, sha7 string) string {
-	sanitized := jobNameSanitizerRerun.ReplaceAllString(strings.ToLower(
-		fmt.Sprintf("boop-%s-%s-%d-%s", owner, repo, pr, sha7),
-	), "-")
-	return sanitized
-}
-
-// jobNameSanitizerRerun mirrors handler.go's
-// jobNameSanitizer. The handler's version is unexported
-// and the rerun code lives in a different package, so the
-// regex is duplicated here.
-var jobNameSanitizerRerun = regexp.MustCompile(`[^a-z0-9-]`)
 
 // Lineage is the result of walking the parent_run_id
 // chain from a run. WalkUp is the chain from this run to

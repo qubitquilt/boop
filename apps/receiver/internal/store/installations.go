@@ -52,6 +52,14 @@ type Installation struct {
 // into the INSERT. The whole thing is one transaction so
 // the operator's choice is never visible as a momentary
 // default to a concurrent dashboard read.
+//
+// CQ-006: split the two halves of the dance into helpers
+// so the top-level method reads as the four steps it is
+// (begin → read prior → delete + insert → commit). The
+// 96-line original mixed transaction control, the
+// preservation read, and the per-row insert column
+// derivation into one block; each helper now owns one
+// concern and the cyclomatic complexity drops.
 func (s *Store) UpsertInstallations(ctx context.Context, installs []Installation) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -59,50 +67,78 @@ func (s *Store) UpsertInstallations(ctx context.Context, installs []Installation
 	}
 	defer tx.Rollback()
 
-	// Collect the operator-controlled values for the ids
-	// the poll is about to upsert, BEFORE the DELETE wipes
-	// them. The map is keyed by id; missing ids get the
-	// defaults. The dashboard only ever reads from the
-	// final post-commit state, so this read inside the
-	// transaction is invisible to concurrent readers.
-	prior := make(map[int64]struct {
-		paused     int
-		lensOptRaw string
-	}, len(installs))
-	if len(installs) > 0 {
-		ids := make([]any, 0, len(installs))
-		placeholders := make([]string, 0, len(installs))
-		for _, ins := range installs {
-			ids = append(ids, ins.ID)
-			placeholders = append(placeholders, "?")
-		}
-		rows, err := tx.QueryContext(ctx,
-			`SELECT id, paused, COALESCE(lens_opt_out, '[]') FROM installations WHERE id IN (`+
-				strings.Join(placeholders, ",")+`)`, ids...)
-		if err != nil {
-			return fmt.Errorf("store: read prior controls: %w", err)
-		}
-		for rows.Next() {
-			var id int64
-			var p int
-			var r string
-			if err := rows.Scan(&id, &p, &r); err != nil {
-				rows.Close()
-				return fmt.Errorf("store: scan prior controls: %w", err)
-			}
-			prior[id] = struct {
-				paused     int
-				lensOptRaw string
-			}{p, r}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("store: prior controls rows: %w", err)
-		}
+	prior, err := readPriorInstallationControls(ctx, tx, installs)
+	if err != nil {
+		return err
 	}
+	if err := replaceInstallations(ctx, tx, installs, prior); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit installations: %w", err)
+	}
+	return nil
+}
 
+// installControls is the slice of the installations row an
+// operator (or the dashboard) can change. The poll preserves
+// these fields so a GitHub-side re-fetch never wipes the
+// operator's choice.
+type installControls struct {
+	paused     int
+	lensOptRaw string
+}
+
+// readPriorInstallationControls returns the operator-controlled
+// fields for the given incoming ids. Missing ids get the
+// zero value (paused=0, lens_opt_out="[]"), which the insert
+// step interprets as "this is a new install — use the
+// defaults". Reads inside the transaction so the operator's
+// choice is invisible to concurrent dashboard reads.
+func readPriorInstallationControls(ctx context.Context, tx *sql.Tx, installs []Installation) (map[int64]installControls, error) {
+	prior := make(map[int64]installControls, len(installs))
+	if len(installs) == 0 {
+		return prior, nil
+	}
+	ids := make([]any, 0, len(installs))
+	placeholders := make([]string, 0, len(installs))
+	for _, ins := range installs {
+		ids = append(ids, ins.ID)
+		placeholders = append(placeholders, "?")
+	}
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id, paused, COALESCE(lens_opt_out, '[]') FROM installations WHERE id IN (`+
+			strings.Join(placeholders, ",")+`)`, ids...)
+	if err != nil {
+		return nil, fmt.Errorf("store: read prior controls: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var c installControls
+		if err := rows.Scan(&id, &c.paused, &c.lensOptRaw); err != nil {
+			return nil, fmt.Errorf("store: scan prior controls: %w", err)
+		}
+		prior[id] = c
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: prior controls rows: %w", err)
+	}
+	return prior, nil
+}
+
+// replaceInstallations is the DELETE + INSERT half. The two
+// operations are kept together because (a) the per-row insert
+// derives its paused/lens_opt_out from the prior map, and
+// (b) every operator-controlled value resolution is in one
+// place — a future field added to installControls only
+// changes this function, not the surrounding one.
+func replaceInstallations(ctx context.Context, tx *sql.Tx, installs []Installation, prior map[int64]installControls) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM installations`); err != nil {
 		return fmt.Errorf("store: clear installations: %w", err)
+	}
+	if len(installs) == 0 {
+		return nil
 	}
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO installations (
@@ -115,37 +151,38 @@ func (s *Store) UpsertInstallations(ctx context.Context, installs []Installation
 	}
 	defer stmt.Close()
 	for _, ins := range installs {
-		var installedAt any
-		if !ins.InstalledAt.IsZero() {
-			installedAt = ins.InstalledAt.UTC().Format(time.RFC3339Nano)
-		}
-		// Respect the caller's FetchedAt when set; fall back to
-		// now() so a caller that doesn't care still gets a
-		// sensible row. The dashboard's TTL check reads this
-		// back, so the caller is the one that knows when the
-		// data was actually pulled from GitHub.
-		fetchedAt := time.Now().UTC()
-		if !ins.FetchedAt.IsZero() {
-			fetchedAt = ins.FetchedAt.UTC()
-		}
-		// Default values for a row we never saw before this
-		// poll: paused=0, lens_opt_out="[]". For a row we
-		// DID see, copy the operator's choice.
-		paused := 0
-		lensOptRaw := "[]"
-		if p, ok := prior[ins.ID]; ok {
-			paused = p.paused
-			lensOptRaw = p.lensOptRaw
-		}
-		if _, err := stmt.ExecContext(ctx,
-			ins.ID, ins.AccountLogin, ins.AccountType, ins.RepositorySelection, installedAt,
-			fetchedAt.Format(time.RFC3339Nano), paused, lensOptRaw,
-		); err != nil {
-			return fmt.Errorf("store: insert installation %d: %w", ins.ID, err)
+		if err := insertOneInstallation(ctx, stmt, ins, prior[ins.ID]); err != nil {
+			return err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("store: commit installations: %w", err)
+	return nil
+}
+
+// insertOneInstallation writes one row, picking installed_at /
+// fetched_at from the input (or a sensible now() default) and
+// paused / lens_opt_out from the prior map (or the new-install
+// default). Extracted so the per-row column derivation is
+// visible without scrolling through the prepared-statement
+// dance.
+func insertOneInstallation(ctx context.Context, stmt *sql.Stmt, ins Installation, prior installControls) error {
+	var installedAt any
+	if !ins.InstalledAt.IsZero() {
+		installedAt = ins.InstalledAt.UTC().Format(time.RFC3339Nano)
+	}
+	fetchedAt := time.Now().UTC()
+	if !ins.FetchedAt.IsZero() {
+		fetchedAt = ins.FetchedAt.UTC()
+	}
+	paused, lensOptRaw := 0, "[]"
+	if prior.paused != 0 || prior.lensOptRaw != "" {
+		paused = prior.paused
+		lensOptRaw = prior.lensOptRaw
+	}
+	if _, err := stmt.ExecContext(ctx,
+		ins.ID, ins.AccountLogin, ins.AccountType, ins.RepositorySelection, installedAt,
+		fetchedAt.Format(time.RFC3339Nano), paused, lensOptRaw,
+	); err != nil {
+		return fmt.Errorf("store: insert installation %d: %w", ins.ID, err)
 	}
 	return nil
 }

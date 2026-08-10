@@ -120,10 +120,11 @@ func (s *Store) ListRunStages(ctx context.Context, runID string) ([]RunStage, er
 // never advances = "hung LLM call" (different operator
 // response: re-queue vs. investigate model latency).
 //
-// Returns sql.ErrNoRows if the run is missing (the runner
+// Returns ErrUnknownRun if the run is missing (the runner
 // started before UpsertRun committed — same as
 // UpdateRunStatus, the heartbeat loop retries on the next
-// tick).
+// tick). RD-003: returns ErrUnknownRun (not sql.ErrNoRows)
+// so the HTTP boundary has a single shape for "unknown run".
 func (s *Store) TouchRunHeartbeat(ctx context.Context, runID string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.db.ExecContext(ctx, `
@@ -137,7 +138,7 @@ func (s *Store) TouchRunHeartbeat(ctx context.Context, runID string) error {
 		return fmt.Errorf("store: touch heartbeat rows: %w", err)
 	}
 	if n == 0 {
-		return sql.ErrNoRows
+		return ErrUnknownRun
 	}
 	return nil
 }

@@ -27,11 +27,12 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 
@@ -114,7 +115,7 @@ func (h *Handler) RerunPreview(w http.ResponseWriter, r *http.Request) {
 	if telem.Model != "" {
 		preview.Prior.Model = telem.Model
 	}
-	sha7 := shortSHARerun(prior.CommitSHA)
+	sha7 := store.ShortSHA(prior.CommitSHA)
 	count, err := h.store.CountRerunJobsForSHA(r.Context(), prior.Owner, prior.Repo, prior.PRNumber, sha7)
 	if err != nil {
 		h.logger.Warn("rerun preview count", "run", id, "err", err)
@@ -148,6 +149,36 @@ type rerunRequest struct {
 // {original}-r{N} convention; the runner is told the
 // prior run's id via BOOP_PARENT_RUN_ID so it can reuse
 // the prior review's findings (Phase 4 follow-up).
+//
+// Every successful Rerun appends an audit row tagged
+// with the runner-derived actor. The dashboard's
+// serveRerun (form path) and this handler (API path)
+// write the same action type so a compliance review can
+// see "who re-ran this?" across both entry points.
+// Without the API-side write, a runner-initiated rerun
+// (e.g. an automated tool calling the API) is invisible
+// in the audit_events table — a gap a future reviewer
+// would flag as "no entry point for non-operator
+// actions". The actor is a SHA-256 prefix of the
+// RunnerToken, the same shape the dashboard uses for
+// BOOP_DASHBOARD_TOKEN, so the row is traceable to a
+// token (not to a user) but stable across calls.
+// rerunResponse is the body of POST /api/runs/{id}/rerun.
+// The shape is stable: every field is a documented part of
+// the API contract, and clients can decode into this struct
+// without `map[string]any` round-trips. Adding a new field
+// is a one-call-site change with the JSON tag as the
+// single source of truth. The earlier shape used a
+// free-form map; future clients could not rely on the
+// field set, and a "permanent note" field that was
+// always empty lived in the wire shape as a permanent
+// drift. (EH-009.)
+type rerunResponse struct {
+	NewRunID    string `json:"new_run_id"`
+	PriorRunID  string `json:"prior_run_id"`
+	ParentRunID string `json:"parent_run_id"`
+}
+
 func (h *Handler) Rerun(w http.ResponseWriter, r *http.Request) {
 	// QUB-127: auth gate. Every other dashboard POST
 	// handler calls checkRunnerToken(r) before any work.
@@ -204,16 +235,47 @@ func (h *Handler) Rerun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rerun create", http.StatusInternalServerError)
 		return
 	}
+	if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
+		Action:   "rerun.create",
+		Actor:    h.runnerActor(),
+		TargetID: newID,
+		Details: store.MarshalDetails(map[string]any{
+			"prior_run_id": id,
+			"reason":       body.Reason,
+			"source":       "api",
+		}),
+	}); err != nil {
+		// Non-fatal: the dashboard's audit view will
+		// surface a gap, which is preferable to a
+		// 5xx that loses the operator's requeue.
+		h.logger.Warn("rerun audit", "run", newID, "err", err)
+	}
 	h.logger.Info("rerun created",
 		"prior", prior.ID,
 		"new", newID,
 		"reason", body.Reason,
 	)
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"new_run_id":    newID,
-		"prior_run_id":  prior.ID,
-		"parent_run_id": prior.ID,
+	writeJSON(w, http.StatusAccepted, rerunResponse{
+		NewRunID:    newID,
+		PriorRunID:  prior.ID,
+		ParentRunID: prior.ID,
 	})
+}
+
+// runnerActor derives the audit-log actor for an
+// API-initiated runner action. Mirrors the dashboard's
+// actor() (sha256 prefix of the token), but prefixed
+// "runner:" so a compliance view can split the two
+// entry points in one query. Empty RunnerToken yields
+// "runner:unconfigured" — the auth gate rejects such
+// callers before this point, so the value never lands
+// in audit_events.
+func (h *Handler) runnerActor() string {
+	if h.cfg.RunnerToken == "" {
+		return "runner:unconfigured"
+	}
+	sum := sha256.Sum256([]byte(h.cfg.RunnerToken))
+	return "runner:" + hex.EncodeToString(sum[:4])
 }
 
 // CreateRerunJob is the cross-package helper the
@@ -234,12 +296,21 @@ func (h *Handler) Rerun(w http.ResponseWriter, r *http.Request) {
 // The new run row is persisted BEFORE the K8s Job is
 // created, matching the QUB-101 order in submitJob: the
 // runner's first POST can find the parent row by the
-// time the Job starts. If UpsertRun fails, no K8s side
-// effect is attempted. If createJob fails, the new row
-// stays in pending state; the receiver's retention loop
-// will eventually prune it. A re-run is operator-
-// initiated so the "stuck pending" surface is small
-// (one row, one log line).
+// time the Job starts. The persistence path uses
+// CreateRerun, which writes the new row and the prior's
+// superseded_by_id pointer in one transaction so a crash
+// between the two cannot leave a half-linked chain
+// (EH-005). If the prior was retention-pruned between
+// the operator's click and the write, CreateRerun
+// returns sql.ErrNoRows and the new row still lands —
+// the WalkUp view still works via parent_run_id, only
+// the WalkDown pill on the prior goes missing. If
+// UpsertRun-class failure happens, no K8s side effect
+// is attempted. If createJob fails, the new row stays
+// in pending state; the receiver's retention loop will
+// eventually prune it. A re-run is operator-initiated
+// so the "stuck pending" surface is small (one row, one
+// log line).
 func (h *Handler) CreateRerunJob(ctx context.Context, prior store.Run, reason string) (string, error) {
 	if h.store == nil {
 		return "", fmt.Errorf("webhook: rerun: data layer disabled")
@@ -256,33 +327,43 @@ func (h *Handler) CreateRerunJob(ctx context.Context, prior store.Run, reason st
 	if prior.Status != store.StatusSucceeded && prior.Status != store.StatusFailed {
 		return "", fmt.Errorf("webhook: rerun: prior status %q is not terminal", prior.Status)
 	}
-	sha7 := shortSHARerun(prior.CommitSHA)
-	count, err := h.store.CountRerunJobsForSHA(ctx, prior.Owner, prior.Repo, prior.PRNumber, sha7)
-	if err != nil {
-		return "", fmt.Errorf("count reruns: %w", err)
-	}
-	newName := buildRerunJobName(prior.Owner, prior.Repo, prior.PRNumber, sha7, count+1)
-	if _, err := h.store.UpsertRun(ctx, store.Run{
-		ID:             newName,
-		Owner:          prior.Owner,
-		Repo:           prior.Repo,
-		PRNumber:       prior.PRNumber,
-		CommitSHA:      prior.CommitSHA,
-		BaseRef:        prior.BaseRef,
-		ReviewNumber:   prior.ReviewNumber + 1,
-		Reason:         "rerun: " + reason,
-		InstallationID: prior.InstallationID,
-		Status:         store.StatusPending,
-		StartedAt:      time.Now().UTC(),
-		ParentRunID:    prior.ID,
-	}); err != nil {
-		return "", fmt.Errorf("upsert rerun: %w", err)
-	}
-	if err := h.store.SetSupersededBy(ctx, prior.ID, newName); err != nil {
-		// Non-fatal — the new run row already exists;
-		// the lineage view will still work via
-		// parent_run_id. Log and continue.
-		h.logger.Warn("rerun supersede", "prior", prior.ID, "new", newName, "err", err)
+	sha7 := store.ShortSHA(prior.CommitSHA)
+	// EH-008: the count + insert has a TOCTOU race
+	// when two re-runs of the same prior race. We
+	// retry with count+1 when the store's UNIQUE
+	// constraint fires; the bounded loop caps the
+	// "stuck" surface if the race is somehow hotter
+	// than the design assumes.
+	const maxRerunAttempts = 8
+	var newName string
+	for attempt := 0; attempt < maxRerunAttempts; attempt++ {
+		count, err := h.store.CountRerunJobsForSHA(ctx, prior.Owner, prior.Repo, prior.PRNumber, sha7)
+		if err != nil {
+			return "", fmt.Errorf("count reruns: %w", err)
+		}
+		newName = buildRerunJobName(prior.Owner, prior.Repo, prior.PRNumber, sha7, count+1)
+		_, err = h.store.CreateRerun(ctx, store.Run{
+			ID:             newName,
+			Owner:          prior.Owner,
+			Repo:           prior.Repo,
+			PRNumber:       prior.PRNumber,
+			CommitSHA:      prior.CommitSHA,
+			BaseRef:        prior.BaseRef,
+			ReviewNumber:   prior.ReviewNumber + 1,
+			Reason:         "rerun: " + reason,
+			InstallationID: prior.InstallationID,
+			Status:         store.StatusPending,
+			StartedAt:      time.Now().UTC(),
+			ParentRunID:    prior.ID,
+		}, prior.ID)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, store.ErrDuplicateRerunName) {
+			h.logger.Info("rerun name collision, retrying", "prior", prior.ID, "attempt", attempt+1, "name", newName)
+			continue
+		}
+		return "", fmt.Errorf("create rerun: %w", err)
 	}
 	// Resolve the image fresh from the boop-config
 	// ConfigMap so the rerun picks up the same
@@ -295,7 +376,7 @@ func (h *Handler) CreateRerunJob(ctx context.Context, prior store.Run, reason st
 		Repo:              prior.Repo,
 		Number:            fmt.Sprintf("%d", prior.PRNumber),
 		SHA:               prior.CommitSHA,
-		SHA7:              shortSHARerun(prior.CommitSHA),
+		SHA7:              store.ShortSHA(prior.CommitSHA),
 		BaseRef:           prior.BaseRef,
 		PreviousHeadSHA:   "", // reruns do not chain; the prior's previous head SHA is irrelevant
 		Image:             image,
@@ -374,30 +455,10 @@ func (h *Handler) CreateRerunJob(ctx context.Context, prior store.Run, reason st
 	return newName, nil
 }
 
-// buildRerunJobName constructs the Job name for the
-// (owner, repo, pr, sha7) tuple with a -r{n} suffix.
-// n starts at 1 for the first re-run.
+// buildRerunJobName is a thin shim over store.BuildRerunJobName
+// (RD-002: the canonical helper lives in the store package so
+// the regex / format lives in one place; the webhook package
+// re-exports it for callers that already import webhook).
 func buildRerunJobName(owner, repo string, pr int, sha7 string, n int) string {
-	if n < 1 {
-		n = 1
-	}
-	return fmt.Sprintf("%s-r%d", buildJobNameRerun(owner, repo, pr, sha7), n)
-}
-
-// shortSHARerun / buildJobNameRerun mirror handler.go's
-// helpers. Duplicated here because handler.go's are
-// unexported and the re-run flow needs them. The
-// implementations match exactly.
-func shortSHARerun(sha string) string {
-	if len(sha) >= 7 {
-		return sha[:7]
-	}
-	return sha
-}
-
-var rerunJobNameSanitizer = regexp.MustCompile(`[^a-z0-9-]`)
-
-func buildJobNameRerun(owner, repo string, pr int, sha string) string {
-	raw := fmt.Sprintf("boop-%s-%s-%d-%s", owner, repo, pr, shortSHARerun(sha))
-	return rerunJobNameSanitizer.ReplaceAllString(strings.ToLower(raw), "-")
+	return store.BuildRerunJobName(owner, repo, pr, sha7, n)
 }

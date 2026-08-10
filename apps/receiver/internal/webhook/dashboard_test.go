@@ -377,6 +377,160 @@ func TestRecordStatus_UnknownRunReturns202(t *testing.T) {
 	}
 }
 
+// CQ-005: RecordStage is the load-bearing endpoint for
+// the dashboard's waterfall. The start POST stamps
+// started_at; the end POST stamps ended_at and the
+// dashboard's durMS() derives DurationMS from the
+// EndedAt - StartedAt delta (the handler MUST NOT
+// stamp duration_ms = 0 — EH-003). The runner posts
+// both shapes for every stage; pinning both here
+// guards against the regression of the handler
+// regressing to "always set duration_ms".
+func TestRecordStage_StartAndEndStampsClock(t *testing.T) {
+	h := newTestHandlerWithStore(t)
+	ctx := context.Background()
+	if _, err := h.store.UpsertRun(ctx, store.Run{
+		ID: "boop-a-b-1-aaaaaaa", Owner: "a", Repo: "b", PRNumber: 1,
+		CommitSHA: "aaaaaaa", Status: store.StatusRunning,
+		StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Start POST.
+	rr := doRequest(t, h, "POST", "/api/runs/boop-a-b-1-aaaaaaa/stages", `{"stage":"clone","meta":"{\"path\":\"x\"}"}`, map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
+	if rr.Code != 204 {
+		t.Fatalf("start status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	// End POST.
+	rr = doRequest(t, h, "POST", "/api/runs/boop-a-b-1-aaaaaaa/stages", `{"stage":"clone","ended":true}`, map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
+	if rr.Code != 204 {
+		t.Fatalf("end status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	stages, err := h.store.ListRunStages(ctx, "boop-a-b-1-aaaaaaa")
+	if err != nil {
+		t.Fatalf("list stages: %v", err)
+	}
+	if len(stages) != 1 {
+		t.Fatalf("stages = %d, want 1", len(stages))
+	}
+	got := stages[0]
+	if got.Stage != "clone" {
+		t.Errorf("stage = %q, want clone", got.Stage)
+	}
+	if got.StartedAt.IsZero() {
+		t.Errorf("started_at zero")
+	}
+	if got.EndedAt == nil {
+		t.Fatalf("ended_at nil")
+	}
+	if got.EndedAt.Before(got.StartedAt) {
+		t.Errorf("ended_at before started_at")
+	}
+	// EH-003: DurationMS MUST remain nil on the end POST.
+	// The dashboard's durMS() falls back to
+	// EndedAt - StartedAt when DurationMS is nil. A
+	// handler that stamps duration_ms=0 on every end
+	// POST clobbers the real duration via the SQL
+	// COALESCE(excluded, existing) and the waterfall
+	// renders 0ms bars regardless of how long the
+	// stage actually took.
+	if got.DurationMS != nil {
+		t.Errorf("duration_ms = %d, want nil (dashboard computes from EndedAt-StartedAt)", *got.DurationMS)
+	}
+}
+
+// CQ-005: a stage POST for a run the receiver has
+// not yet persisted (the runner raced ahead of the
+// webhook) returns 202, not 500. The runner's
+// postWithRetry drops 5xx, so a 500 here loses the
+// stage row entirely. This is the same shape as
+// TestRecordStatus_UnknownRunReturns202 and pins
+// the same contract for stages.
+func TestRecordStage_UnknownRunReturns202(t *testing.T) {
+	h := newTestHandlerWithStore(t)
+	rr := doRequest(t, h, "POST", "/api/runs/nonexistent/stages", `{"stage":"clone"}`, map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
+	if rr.Code != 202 {
+		t.Errorf("status = %d, want 202", rr.Code)
+	}
+}
+
+// CQ-005: RecordHeartbeat updates last_heartbeat_at
+// on the run row. The dashboard's "stuck" panel
+// reads the gap; a heartbeat that 500s (instead of
+// 202) would silently break the stuck-run detection
+// for a not-yet-persisted run.
+func TestRecordHeartbeat_HappyPath(t *testing.T) {
+	h := newTestHandlerWithStore(t)
+	ctx := context.Background()
+	if _, err := h.store.UpsertRun(ctx, store.Run{
+		ID: "boop-a-b-1-aaaaaaa", Owner: "a", Repo: "b", PRNumber: 1,
+		CommitSHA: "aaaaaaa", Status: store.StatusRunning,
+		StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	rr := doRequest(t, h, "POST", "/api/runs/boop-a-b-1-aaaaaaa/heartbeat", "", map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
+	if rr.Code != 204 {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	run, err := h.store.GetRun(ctx, "boop-a-b-1-aaaaaaa")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if run.LastHeartbeatAt == nil {
+		t.Errorf("last_heartbeat_at nil after heartbeat")
+	}
+}
+
+func TestRecordHeartbeat_UnknownRunReturns202(t *testing.T) {
+	h := newTestHandlerWithStore(t)
+	rr := doRequest(t, h, "POST", "/api/runs/nonexistent/heartbeat", "", map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
+	if rr.Code != 202 {
+		t.Errorf("status = %d, want 202", rr.Code)
+	}
+}
+
+// CQ-005: RecordLensTelemetry replaces the per-lens
+// rows for the run. The dashboard's "Costs & lenses"
+// view reads this; a 500 here (for a not-yet-persisted
+// run) would drop the entire cost rollup silently.
+func TestRecordLensTelemetry_HappyPath(t *testing.T) {
+	h := newTestHandlerWithStore(t)
+	ctx := context.Background()
+	if _, err := h.store.UpsertRun(ctx, store.Run{
+		ID: "boop-a-b-1-aaaaaaa", Owner: "a", Repo: "b", PRNumber: 1,
+		CommitSHA: "aaaaaaa", Status: store.StatusRunning,
+		StartedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	body := `{"lenses":[
+		{"lens":"security","model":"openrouter/anthropic/claude-3.5-sonnet","input_tokens":100,"output_tokens":50,"cost_usd":0.01,"step_count":1},
+		{"lens":"deep","model":"openrouter/anthropic/claude-3.5-sonnet","input_tokens":200,"output_tokens":100,"cost_usd":0.02,"step_count":2}
+	]}`
+	rr := doRequest(t, h, "POST", "/api/runs/boop-a-b-1-aaaaaaa/lens_telemetry", body, map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
+	if rr.Code != 204 {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	lenses, err := h.store.ListLensTelemetry(ctx, "boop-a-b-1-aaaaaaa")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(lenses) != 2 {
+		t.Fatalf("lenses = %d, want 2", len(lenses))
+	}
+}
+
+func TestRecordLensTelemetry_UnknownRunReturns202(t *testing.T) {
+	h := newTestHandlerWithStore(t)
+	body := `{"lenses":[{"lens":"security","input_tokens":100,"output_tokens":50,"cost_usd":0.01,"step_count":1}]}`
+	rr := doRequest(t, h, "POST", "/api/runs/nonexistent/lens_telemetry", body, map[string]string{"X-BOOP-Runner-Token": "test-runner-token"})
+	if rr.Code != 202 {
+		t.Errorf("status = %d, want 202", rr.Code)
+	}
+}
+
 // doRequest routes a request through the same ServeMux the
 // receiver uses in main.go so r.PathValue("id") is populated
 // for the {id}-style paths. The alternative — calling the
@@ -390,6 +544,9 @@ func doRequest(t *testing.T, h *Handler, method, path, body string, headers map[
 	mux.HandleFunc("GET /api/stats", h.Stats)
 	mux.HandleFunc("POST /api/runs/{id}/telemetry", h.RecordTelemetry)
 	mux.HandleFunc("POST /api/runs/{id}/status", h.RecordStatus)
+	mux.HandleFunc("POST /api/runs/{id}/stages", h.RecordStage)
+	mux.HandleFunc("POST /api/runs/{id}/heartbeat", h.RecordHeartbeat)
+	mux.HandleFunc("POST /api/runs/{id}/lens_telemetry", h.RecordLensTelemetry)
 
 	var bodyReader io.Reader
 	if body != "" {

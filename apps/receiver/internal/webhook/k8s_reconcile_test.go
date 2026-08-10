@@ -307,3 +307,79 @@ func newReconcileTestHandler(t *testing.T, st *store.Store, jobs ...*batchv1.Job
 		kube:   kube,
 	}
 }
+
+// CQ-005: the failureClassFromContainerState / mapExitReason
+// / mapWaitingReason trio is the K8s -> dashboard taxonomy
+// map the exception-dock filter chips depend on. Future
+// K8s-side reason strings (a new "Err*" value, a new
+// "ImagePullBackOff" variant) will silently fall into the
+// "container_<reason>" / "stuck_<reason>" default branches
+// without these tests pinning the explicit mapping. Each
+// case here is a one-shot regression guard.
+func TestFailureClassFromContainerState_Terminated(t *testing.T) {
+	cases := []struct {
+		name     string
+		reason   string
+		exitCode int32
+		want     string
+	}{
+		{"oom_killed", "OOMKilled", 137, "oom_killed"},
+		{"completed", "Completed", 0, ""},
+		{"completed_zero", "", 0, ""},
+		{"error_nonzero_no_reason", "", 1, "container_error"},
+		{"error_explicit", "Error", 1, "container_error"},
+		{"unknown_preserved", "WeirdNewReason", 1, "container_WeirdNewReason"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := failureClassFromContainerState(corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{
+					Reason:   c.reason,
+					ExitCode: c.exitCode,
+				},
+			})
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestFailureClassFromContainerState_Waiting(t *testing.T) {
+	cases := []struct {
+		name   string
+		reason string
+		want   string
+	}{
+		{"crash_loop", "CrashLoopBackOff", "crash_loop"},
+		{"image_pull_backoff", "ImagePullBackOff", "image_pull"},
+		{"err_image_pull", "ErrImagePull", "image_pull"},
+		{"config_error", "CreateContainerConfigError", "config_error"},
+		{"empty_reason", "", ""},
+		{"unknown_preserved", "WeirdNewWait", "stuck_WeirdNewWait"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := failureClassFromContainerState(corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: c.reason},
+			})
+			if got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestFailureClassFromContainerState_Running(t *testing.T) {
+	// A running container has no Terminated or Waiting
+	// state — failureClassFromContainerState returns ""
+	// so the run row stays without a class pill. The
+	// reconciler only sets the class on terminal or
+	// stuck-waiting states.
+	got := failureClassFromContainerState(corev1.ContainerState{
+		Running: &corev1.ContainerStateRunning{},
+	})
+	if got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
