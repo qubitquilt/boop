@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@octokit/rest": "22.0.1",
-    "@openrouter/sdk": "1.2.8",
+    "@openrouter/sdk": "1.2.11",
     "jsonwebtoken": "9.0.3"
   }
 }
