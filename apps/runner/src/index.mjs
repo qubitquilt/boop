@@ -319,6 +319,21 @@ export async function run(env = process.env, overrides = {}) {
     // stage handles its own skip (first review / no botLogin) and
     // best-effort error swallow so the orchestrator stays
     // straightforward.
+    //
+    // SP-004 / DP-005: the run is created as "pending" in the
+    // receiver. The receiver's live view filters by
+    // store.StatusRunning; without an explicit transition here,
+    // every in-flight review renders as "pending" and the live
+    // panel is empty. The "running" post lands before any stage
+    // starts (the stage POSTs run on a per-stage cadence) and
+    // is fire-and-forget — a 4xx from a misconfigured
+    // BOOP_DASHBOARD_TOKEN is surfaced at error level by
+    // postWithRetry (EH-007).
+    await postDashboardStatus("running", ctx, {
+      log: log.log,
+      errlog: log.errlog,
+      fetchImpl: deps.fetchImpl,
+    });
     await runStages(ctx, deps, overrides, state, {
       onStagePassed,
     });

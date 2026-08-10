@@ -180,6 +180,31 @@ test("postStatus does NOT retry on 202 (run not yet persisted)", async () => {
   assert.equal(fr.calls(), 1, "202 is not retryable — the runner will retry on the next stage");
 });
 
+test("postStatus surfaces 401 at error level so token-misconfig is visible (EH-007)", async () => {
+  // A misconfigured BOOP_DASHBOARD_TOKEN silently drops
+  // every telemetry row while the operator stares at an
+  // empty dashboard. The 401 path now calls errlog()
+  // instead of the generic "post rejected" log() so the
+  // misconfig is visible in the runner's stderr.
+  sent.length = 0;
+  const errs = [];
+  const fr = makeFetchRetry([401]);
+  await postStatus(
+    "done",
+    makeCtx(),
+    {
+      log: () => {},
+      errlog: (...args) => errs.push(args),
+      fetchImpl: fr.fetch,
+    },
+  );
+  assert.equal(fr.calls(), 1, "401 is not retryable");
+  assert.equal(errs.length, 1, "401 emits exactly one errlog call");
+  const [, msg] = errs[0];
+  assert.ok(msg.includes("auth rejected"), "errlog msg = " + msg);
+  assert.ok(msg.includes("BOOP_DASHBOARD_TOKEN"), "errlog msg points at the env var: " + msg);
+});
+
 test("postStatus attaches the reason to the payload as `error` (QUB-102)", async () => {
   // The QUB-102 dashboard plumbing forwards the abort or
   // gate-failure reason as the `error` field in the
