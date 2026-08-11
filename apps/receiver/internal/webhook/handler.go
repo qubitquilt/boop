@@ -30,8 +30,6 @@ import (
 
 	"github.com/google/go-github/v68/github"
 	"golang.org/x/time/rate"
-	batchv1 "k8s.io/api/batch/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
 	boopgithub "github.com/michaelruelas/boop-receiver/internal/github"
@@ -678,7 +676,7 @@ func renderStatusBody(stage, sha, by string, reviewNumber int) string {
 // a duplicate ack. On kube errors it writes a 500 and status "error".
 // A failed job is deleted so a fresh one can be created.
 func (h *Handler) claimJobSlot(ctx context.Context, delivery, owner, repo string, number int, headSHA string, w http.ResponseWriter) (bool, string) {
-	jobName := buildJobName(owner, repo, number, headSHA)
+	jobName := store.BuildJobName(owner, repo, number, headSHA)
 	jobStatus, err := h.jobStatus(ctx, jobName)
 	if err != nil {
 		h.logger.Error("check job", "delivery", delivery, "job", jobName, "err", err)
@@ -770,7 +768,7 @@ func boolToString(b bool) string {
 }
 
 func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery, owner, repo string, number int, headSHA, baseRef, previousHeadSHA, reason string, reactionCommentID, statusCommentID int64, triggeredBy string, installationID int64, reviewNumber int, labels []string, noStatusComment bool) (bool, error) {
-	jobName := buildJobName(owner, repo, number, headSHA)
+	jobName := store.BuildJobName(owner, repo, number, headSHA)
 
 	// QUB-94: resolve the BOOP_USE_OPENROUTER_SDK value for this
 	// PR. The cluster default + the per-PR label form the value;
@@ -927,92 +925,6 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 	return true, nil
 }
 
-// boopConfigMapName is the ConfigMap the receiver reads for
-// JOB_IMAGE. Defined as a constant so the test can use the same
-// value when seeding the fake client. The ConfigMap lives in the
-// receiver's own namespace (TARGET_NAMESPACE, default "dev-tools")
-// and is owned by ArgoCD, not the receiver.
-const boopConfigMapName = "boop-config"
-
-// jobImageKey is the data key under which JOB_IMAGE is stored in
-// the boop-config ConfigMap. Must match apps/k8s/base/config.yaml.
-const jobImageKey = "JOB_IMAGE"
-
-// currentJobImage reads JOB_IMAGE from the boop-config ConfigMap
-// in the receiver's namespace and returns the freshest value ArgoCD
-// has synced. Falls back to the env-var snapshot (h.cfg.JobImage)
-// when the read fails so a transient K8s API hiccup doesn't block
-// a review. Not cached: the K8s API round-trip is cheap relative to
-// the rest of the webhook handler (token mint + GitHub API calls),
-// and skipping the cache keeps the recovery time at "next webhook"
-// after ArgoCD syncs a new digest.
-//
-// The receiver's Role grants configmaps:get/list/watch in
-// TARGET_NAMESPACE — see apps/k8s/base/role.yaml. The ConfigMap is
-// namespace-scoped, so the receiver can only read it from its own
-// namespace, which is the right blast-radius.
-func (h *Handler) currentJobImage(ctx context.Context) (string, error) {
-	cm, err := h.kube.CoreV1().ConfigMaps(h.cfg.TargetNamespace).Get(ctx, boopConfigMapName, metav1.GetOptions{})
-	if err != nil {
-		return "", fmt.Errorf("get %s/%s: %w", h.cfg.TargetNamespace, boopConfigMapName, err)
-	}
-	v, ok := cm.Data[jobImageKey]
-	if !ok || v == "" {
-		return "", fmt.Errorf("%s/%s missing %q key", h.cfg.TargetNamespace, boopConfigMapName, jobImageKey)
-	}
-	return v, nil
-}
-
-// resolveJobImageForSubmit wraps currentJobImage with the
-// fallback-to-env-snapshot policy and the consecutive-failure
-// counter. Always returns a non-empty image suitable for the Job
-// template: a successful ConfigMap read returns the live digest;
-// a failed read returns the env-var snapshot and increments the
-// counter (escalating to Error-level logging after
-// consecutiveFallbackAlertAt). On success, the counter resets to
-// 0 — a single successful read is enough to declare "the API is
-// fine, the previous failures were transient."
-//
-// Returned source is "configmap" or "fallback" so tests can
-// assert the path taken without inspecting logs.
-func (h *Handler) resolveJobImageForSubmit(ctx context.Context) (image, source string) {
-	cm, err := h.currentJobImage(ctx)
-	if err == nil {
-		h.resetConfigMapFallbacks()
-		return cm, "configmap"
-	}
-	count := h.bumpConfigMapFallbacks()
-	level := slog.LevelWarn
-	if count >= consecutiveFallbackAlertAt {
-		level = slog.LevelError
-	}
-	h.logger.Log(ctx, level, "read boop-config for JOB_IMAGE, using startup value",
-		"err", err,
-		"consecutive_fallbacks", count,
-		"alert_threshold", consecutiveFallbackAlertAt,
-	)
-	return h.cfg.JobImage, "fallback"
-}
-
-// bumpConfigMapFallbacks increments the consecutive-fallback
-// counter under a lock and returns the new value. The lock is a
-// separate mutex (not the dedup mutex) so the read-then-increment
-// pattern stays a single critical section.
-func (h *Handler) bumpConfigMapFallbacks() int {
-	h.consecutiveConfigMapFallbacksLock.Lock()
-	defer h.consecutiveConfigMapFallbacksLock.Unlock()
-	h.consecutiveConfigMapFallbacks++
-	return h.consecutiveConfigMapFallbacks
-}
-
-// resetConfigMapFallbacks zeroes the counter on a successful
-// ConfigMap read. Lock-protected for the same reason as bump.
-func (h *Handler) resetConfigMapFallbacks() {
-	h.consecutiveConfigMapFallbacksLock.Lock()
-	defer h.consecutiveConfigMapFallbacksLock.Unlock()
-	h.consecutiveConfigMapFallbacks = 0
-}
-
 type templateVars struct {
 	Owner             string
 	Repo              string
@@ -1071,40 +983,6 @@ type prMeta struct {
 // carry it so the receiver acks the webhook as ignored and never
 // schedules a review Job.
 const skipReviewLabel = "skip-review"
-
-// sdkEnabledLabel is the GitHub label that opts a PR into the
-// OpenRouter SDK path for its next review. The cluster-wide
-// default (Config.OpenRouterSDKDefault, sourced from
-// BOOP_USE_OPENROUTER_SDK on the receiver) still applies; the
-// label is a per-PR override. QUB-98 made the SDK the runner's
-// only invocation path; the label is preserved for the QUB-N
-// rollout, where clusters that have not yet flipped the default
-// to "1" still route through the SDK in the runner.
-const sdkEnabledLabel = "boop:openrouter-sdk"
-
-func hasLabel(labels []string, name string) bool {
-	for _, l := range labels {
-		if strings.EqualFold(l, name) {
-			return true
-		}
-	}
-	return false
-}
-
-// resolveSDKEnabled picks the BOOP_USE_OPENROUTER_SDK value for
-// the next review Job on a PR. The cluster default
-// (h.cfg.OpenRouterSDKDefault) sets the floor; the per-PR label
-// is an opt-in. The decision is logged so the operator can see
-// why a given Job landed on either value.
-func (h *Handler) resolveSDKEnabled(labels []string) string {
-	if hasLabel(labels, sdkEnabledLabel) {
-		return "1"
-	}
-	if h.cfg.OpenRouterSDKDefault == "1" {
-		return "1"
-	}
-	return "0"
-}
 
 // parseInstallationID reads the X-GitHub-Installation-ID header and
 // returns the installation ID. Returns an error if the header is
@@ -1247,47 +1125,6 @@ func (h *Handler) isPaused(ctx context.Context, delivery string, installationID 
 		h.logger.Info("installation paused, dropping webhook", "delivery", delivery, "installation", installationID)
 	}
 	return paused
-}
-
-// buildJobName is a thin shim over store.BuildJobName kept
-// for in-package callers (RD-002: the canonical helper now
-// lives in the store package so the regex / format lives in
-// one place; the webhook package re-exports it for callers
-// that already import webhook).
-func buildJobName(owner, repo string, number int, sha string) string {
-	return store.BuildJobName(owner, repo, number, sha)
-}
-
-// jobStatus returns one of: "missing", "active", "failed", "succeeded".
-// Used to decide whether to create, skip (duplicate), or replace
-// (failed) a Job for a given head SHA.
-func (h *Handler) jobStatus(ctx context.Context, name string) (string, error) {
-	job, err := h.kube.BatchV1().Jobs(h.cfg.TargetNamespace).Get(ctx, name, metav1.GetOptions{})
-	if err != nil {
-		if isNotFound(err) {
-			return "missing", nil
-		}
-		return "", err
-	}
-	if job.Status.Failed > 0 {
-		return "failed", nil
-	}
-	if job.Status.Succeeded > 0 {
-		return "succeeded", nil
-	}
-	return "active", nil
-}
-
-func (h *Handler) deleteJob(ctx context.Context, name string) error {
-	propagation := metav1.DeletePropagationBackground
-	return h.kube.BatchV1().Jobs(h.cfg.TargetNamespace).Delete(ctx, name, metav1.DeleteOptions{
-		PropagationPolicy: &propagation,
-	})
-}
-
-func (h *Handler) createJob(ctx context.Context, job *batchv1.Job) error {
-	_, err := h.kube.BatchV1().Jobs(h.cfg.TargetNamespace).Create(ctx, job, metav1.CreateOptions{})
-	return err
 }
 
 func verifySignature(header string, body []byte, secret string) bool {

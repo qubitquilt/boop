@@ -32,6 +32,7 @@ import {
   GITCONFIG_PATH,
 } from "./lib/config.mjs";
 import { makeLogger } from "./lib/log.mjs";
+import { OctokitSlot, StatusCommentSlot } from "./lib/slots.mjs";
 import { assertSafeRef, assertSafeSha } from "./lib/security.mjs";
 import { createCleanupRegistry, cloneRepo } from "./lib/git.mjs";
 import { runStages } from "./lib/workflow.mjs";
@@ -57,11 +58,14 @@ const execFileAsync = promisify(execFile);
 // `deps`; tests can swap any field (spawnFn, fetchImpl, OctokitCtor)
 // to drive a deterministic scenario.
 //
-// The octokit slot is shared between the handshake stage (which
-// writes it after minting the installation token) and the
-// `postStatus` closure (which reads it at PATCH time). The slot
-// pattern lets the stage functions stay in workflow.mjs without
-// reaching back into index.mjs to mutate module state.
+// RF-010: the two slot fields (octokit, status comment id) are
+// instances of the OctokitSlot / StatusCommentSlot classes in
+// lib/slots.mjs. The slot pattern lets the stage functions in
+// workflow.mjs read the live values without reaching back into
+// index.mjs to mutate module state; the classes own the value,
+// the getter, and the setter, so makeDeps shrinks to thin
+// method-binding for the public API (setOctokit, getOctokit,
+// currentCtx, postStatus).
 //
 // QUB-99: the status-comment slot mirrors the octokit slot.
 // BOOP_STATUS_COMMENT_ID may arrive unset (the receiver no longer
@@ -78,24 +82,21 @@ const execFileAsync = promisify(execFile);
 // statusCommentId and the caller should skip — the same shape
 // the env-var snapshot has on day one.
 function makeDeps(ctx, log, cleanup) {
-  const octokitSlot = { value: null };
-  const statusCommentSlot = { value: ctx.statusCommentId || null };
-  const getOctokit = () => octokitSlot.value;
-  const currentCtx = () =>
-    statusCommentSlot.value ? { ...ctx, statusCommentId: statusCommentSlot.value } : ctx;
+  const octokitSlot = new OctokitSlot();
+  const statusCommentSlot = new StatusCommentSlot(ctx.statusCommentId);
   const patchStatusWithCtx = (stage, detail) =>
-    postStatus(stage, detail, currentCtx(), {
+    postStatus(stage, detail, statusCommentSlot.applyTo(ctx), {
       log: log.log,
       errlog: log.errlog,
-      octokit: getOctokit(),
+      octokit: octokitSlot.get(),
     });
   const postStatusWrapper = async (stage, detail) => {
-    if (!getOctokit()) {
+    if (!octokitSlot.isReady()) {
       log.log("status", "skip (no octokit yet)", { stage });
       return;
     }
     await ensureStatusComment(
-      getOctokit(),
+      octokitSlot.get(),
       ctx,
       { log: log.log, errlog: log.errlog },
       statusCommentSlot,
@@ -110,6 +111,14 @@ function makeDeps(ctx, log, cleanup) {
     jwt,
     fetchImpl: fetch,
     OctokitCtor: undefined, // lib/github.mjs falls back to the real Octokit
+    // RF-004: the env snap is set in one place (makeDeps) and
+    // updated in one place (handshakeStage after the key file
+    // is read). Every lib function reads deps.env.OPENROUTER_API_KEY
+    // via the `...deps` spread, so no caller has to forward the
+    // key explicitly. Empty string until the handshake loads the
+    // real value; the SDK's `if (!apiKey) throw` guard surfaces
+    // a misconfiguration as a clean failure.
+    env: { OPENROUTER_API_KEY: "" },
     paths: {
       repoDir: ctx.repoDir,
       configSrc: ctx.configSrc,
@@ -119,9 +128,9 @@ function makeDeps(ctx, log, cleanup) {
     cleanup,
     log: log.log,
     errlog: log.errlog,
-    setOctokit: (octokit) => { octokitSlot.value = octokit; },
-    getOctokit,
-    currentCtx,
+    setOctokit: (octokit) => octokitSlot.set(octokit),
+    getOctokit: () => octokitSlot.get(),
+    currentCtx: () => statusCommentSlot.applyTo(ctx),
     postStatus: postStatusWrapper,
     // cloneRepo is wrapped so its postStatus call goes through the
     // same lazy octokit-resolution + status-comment-creation path

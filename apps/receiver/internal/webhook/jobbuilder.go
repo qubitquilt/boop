@@ -10,6 +10,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/michaelruelas/boop-receiver/internal/store"
 )
 
 // baseRefRegex permits the characters a legitimate git refname may
@@ -205,7 +207,7 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 	trueVal := true
 	falseVal := false
 
-	jobName := buildJobName(v.Owner, v.Repo, number, v.SHA)
+	jobName := store.BuildJobName(v.Owner, v.Repo, number, v.SHA)
 
 	// Pod-level security context. runAsNonRoot + runAsUser 1000
 	// are required for the distroless-style posture: a misbehaving

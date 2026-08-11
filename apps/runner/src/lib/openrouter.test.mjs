@@ -1469,7 +1469,13 @@ test("buildBoopPrompt source preserves H5 ordering invariant", () => {
   // Lock the marker ordering at the source level too — even if a
   // future refactor extracts buildBoopPrompt's body to a helper, the
   // marker ordering in the prompt must remain SYSTEM-before-DATA.
-  const src = readFileSync(fileURLToPath(new URL("./openrouter.mjs", import.meta.url)), "utf8");
+  // RF-001 split: the prompt builder now lives in
+  // openrouter/prompt.mjs; the shim at openrouter.mjs re-exports it
+  // but the body itself is in the new module.
+  const src = readFileSync(
+    fileURLToPath(new URL("./openrouter/prompt.mjs", import.meta.url)),
+    "utf8",
+  );
   const fnMatch = src.match(/export async function buildBoopPrompt\([^)]*\) \{[\s\S]*?^\}/m);
   assert.ok(fnMatch, "could not locate buildBoopPrompt");
   const body = fnMatch[0];

@@ -185,8 +185,8 @@ func applyMigrations(db *sql.DB) error {
 // same as the pre-QUB-101 schema; QUB-101 changed the
 // migration driver (this function) but not the data model.
 func migrateV1(ctx context.Context, db *sql.DB) error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS runs (
+	m := newMigration(ctx, db, "migration v1")
+	m.createTable(`CREATE TABLE IF NOT EXISTS runs (
 			id              TEXT PRIMARY KEY,
 			owner           TEXT NOT NULL,
 			repo            TEXT NOT NULL,
@@ -203,13 +203,13 @@ func migrateV1(ctx context.Context, db *sql.DB) error {
 			error           TEXT,
 			created_at      TEXT NOT NULL,
 			updated_at      TEXT NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_runs_owner_repo ON runs(owner, repo)`,
-		`CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)`,
-		`CREATE INDEX IF NOT EXISTS idx_runs_owner_repo_started ON runs(owner, repo, started_at DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_runs_installation ON runs(installation_id)`,
-		`CREATE TABLE IF NOT EXISTS telemetry (
+		)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_runs_owner_repo ON runs(owner, repo)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_runs_owner_repo_started ON runs(owner, repo, started_at DESC)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_runs_installation ON runs(installation_id)`)
+	m.createTable(`CREATE TABLE IF NOT EXISTS telemetry (
 			run_id              TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
 			model               TEXT NOT NULL,
 			provider            TEXT,
@@ -221,22 +221,16 @@ func migrateV1(ctx context.Context, db *sql.DB) error {
 			cost_usd            REAL NOT NULL DEFAULT 0,
 			step_count          INTEGER NOT NULL DEFAULT 0,
 			recorded_at         TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS installations (
+		)`)
+	m.createTable(`CREATE TABLE IF NOT EXISTS installations (
 			id                INTEGER PRIMARY KEY,
 			account_login     TEXT NOT NULL,
 			account_type      TEXT NOT NULL,
 			repository_selection TEXT,
 			installed_at      TEXT,
 			fetched_at        TEXT NOT NULL
-		)`,
-	}
-	for i, stmt := range stmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v1 statement %d: %w", i, err)
-		}
-	}
-	return nil
+		)`)
+	return m.migrationError()
 }
 
 // migrateV2 (QUB-108) is the dashboard foundation. It must
@@ -254,8 +248,8 @@ func migrateV1(ctx context.Context, db *sql.DB) error {
 // of the same stage hits the conflict and gets ON CONFLICT
 // DO UPDATE, not a duplicate row.
 func migrateV2(ctx context.Context, db *sql.DB) error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS run_stages (
+	m := newMigration(ctx, db, "migration v2")
+	m.createTable(`CREATE TABLE IF NOT EXISTS run_stages (
 			id          INTEGER PRIMARY KEY,
 			run_id      TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
 			stage       TEXT NOT NULL,
@@ -264,71 +258,32 @@ func migrateV2(ctx context.Context, db *sql.DB) error {
 			duration_ms INTEGER,
 			meta        TEXT,
 			UNIQUE(run_id, stage)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_run_stages_run_id ON run_stages(run_id)`,
-		`CREATE TABLE IF NOT EXISTS refunds (
+		)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_run_stages_run_id ON run_stages(run_id)`)
+	m.createTable(`CREATE TABLE IF NOT EXISTS refunds (
 			id           INTEGER PRIMARY KEY,
 			run_id       TEXT,
 			lens         TEXT,
 			tokens       INTEGER,
 			refunded_at  TEXT NOT NULL,
 			refunded_by  TEXT NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_refunds_run_id ON refunds(run_id)`,
-	}
-	for i, stmt := range stmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v2 statement %d: %w", i, err)
-		}
-	}
-
-	// Column adds. ALTER TABLE ADD COLUMN fails if the column
-	// already exists, so each one is guarded by a pragma
-	// check. The hasColumn() helper is the only SQLite-
-	// compatible way to do "ADD COLUMN IF NOT EXISTS" on
-	// 3.32 and earlier.
-	colAdds := []struct {
-		table string
-		col   string
-		def   string
-	}{
-		{"runs", "failure_class", "TEXT"},
-		{"runs", "last_heartbeat_at", "TEXT"},
-		// installations needs to exist before its ALTERs run;
-		// v1 created it so this is fine for the in-place
-		// upgrade path. A fresh install also has it from v1.
-		{"installations", "paused", "INTEGER NOT NULL DEFAULT 0"},
-		{"installations", "lens_opt_out", "TEXT NOT NULL DEFAULT '[]'"},
-	}
-	for _, c := range colAdds {
-		has, err := hasColumn(ctx, db, c.table, c.col)
-		if err != nil {
-			return fmt.Errorf("migration v2 hasColumn %s.%s: %w", c.table, c.col, err)
-		}
-		if has {
-			continue
-		}
-		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", c.table, c.col, c.def)
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v2 alter %s.%s: %w", c.table, c.col, err)
-		}
-	}
-
+		)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_refunds_run_id ON refunds(run_id)`)
+	// installations needs to exist before its ALTERs run;
+	// v1 created it so this is fine for the in-place
+	// upgrade path. A fresh install also has it from v1.
+	m.addColumn("runs", "failure_class", "TEXT")
+	m.addColumn("runs", "last_heartbeat_at", "TEXT")
+	m.addColumn("installations", "paused", "INTEGER NOT NULL DEFAULT 0")
+	m.addColumn("installations", "lens_opt_out", "TEXT NOT NULL DEFAULT '[]'")
 	// Indices that touch the new columns. The
 	// failure_class index makes the exception dock's
 	// `WHERE failure_class IN (...)` a single B-tree walk
 	// instead of a full scan; the heartbeat index feeds
 	// Phase 2's stuck-runs panel.
-	idxStmts := []string{
-		`CREATE INDEX IF NOT EXISTS idx_runs_failure_class ON runs(failure_class)`,
-		`CREATE INDEX IF NOT EXISTS idx_runs_last_heartbeat_at ON runs(last_heartbeat_at)`,
-	}
-	for i, stmt := range idxStmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v2 index %d: %w", i, err)
-		}
-	}
-	return nil
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_runs_failure_class ON runs(failure_class)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_runs_last_heartbeat_at ON runs(last_heartbeat_at)`)
+	return m.migrationError()
 }
 
 // hasColumn reports whether the given table already has the
@@ -376,8 +331,8 @@ func hasColumn(ctx context.Context, db *sql.DB, table, col string) (bool, error)
 // change ever does a per-lens UPSERT the constraint is
 // already there to back it up.
 func migrateV3(ctx context.Context, db *sql.DB) error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS lens_telemetry (
+	m := newMigration(ctx, db, "migration v3")
+	m.createTable(`CREATE TABLE IF NOT EXISTS lens_telemetry (
 			id                INTEGER PRIMARY KEY,
 			run_id            TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
 			lens              TEXT NOT NULL,
@@ -392,16 +347,10 @@ func migrateV3(ctx context.Context, db *sql.DB) error {
 			step_count        INTEGER NOT NULL DEFAULT 0,
 			recorded_at       TEXT NOT NULL,
 			UNIQUE(run_id, lens)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_lens_telemetry_run_id ON lens_telemetry(run_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_lens_telemetry_lens ON lens_telemetry(lens)`,
-	}
-	for i, stmt := range stmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v3 statement %d: %w", i, err)
-		}
-	}
-	return nil
+		)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_lens_telemetry_run_id ON lens_telemetry(run_id)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_lens_telemetry_lens ON lens_telemetry(lens)`)
+	return m.migrationError()
 }
 
 // migrateV4 (QUB-110) adds the re-run lineage columns.
@@ -416,37 +365,15 @@ func migrateV3(ctx context.Context, db *sql.DB) error {
 // vertical-timeline render is one B-tree descent per
 // generation.
 func migrateV4(ctx context.Context, db *sql.DB) error {
-	colAdds := []struct {
-		table string
-		col   string
-		def   string
-	}{
-		{"runs", "parent_run_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL"},
-		{"runs", "superseded_by_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL"},
-	}
-	for _, c := range colAdds {
-		has, err := hasColumn(ctx, db, c.table, c.col)
-		if err != nil {
-			return fmt.Errorf("migration v4 hasColumn %s.%s: %w", c.table, c.col, err)
-		}
-		if has {
-			continue
-		}
-		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", c.table, c.col, c.def)
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v4 alter %s.%s: %w", c.table, c.col, err)
-		}
-	}
-	idxStmts := []string{
-		`CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id)`,
-		`CREATE INDEX IF NOT EXISTS idx_runs_superseded_by ON runs(superseded_by_id)`,
-	}
-	for i, stmt := range idxStmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v4 index %d: %w", i, err)
-		}
-	}
-	return nil
+	m := newMigration(ctx, db, "migration v4")
+	m.addColumn("runs", "parent_run_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL")
+	m.addColumn("runs", "superseded_by_id", "TEXT REFERENCES runs(id) ON DELETE SET NULL")
+	// idx_runs_parent feeds the dashboard's
+	// vertical-timeline render; without it the lineage
+	// walk is a full table scan.
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_runs_parent ON runs(parent_run_id)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_runs_superseded_by ON runs(superseded_by_id)`)
+	return m.migrationError()
 }
 
 // migrateV5 (QUB-112) adds the audit_events table. The
@@ -472,26 +399,20 @@ func migrateV4(ctx context.Context, db *sql.DB) error {
 // shape that does not force a migration per new
 // action.
 func migrateV5(ctx context.Context, db *sql.DB) error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS audit_events (
+	m := newMigration(ctx, db, "migration v5")
+	m.createTable(`CREATE TABLE IF NOT EXISTS audit_events (
 			id          INTEGER PRIMARY KEY,
 			action      TEXT NOT NULL,
 			actor       TEXT NOT NULL,
 			target_id   TEXT,
 			occurred_at TEXT NOT NULL,
 			details     TEXT
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor)`,
-		`CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action)`,
-		`CREATE INDEX IF NOT EXISTS idx_audit_events_occurred_at ON audit_events(occurred_at DESC)`,
-		`CREATE INDEX IF NOT EXISTS idx_audit_events_target ON audit_events(target_id)`,
-	}
-	for i, stmt := range stmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v5 statement %d: %w", i, err)
-		}
-	}
-	return nil
+		)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_audit_events_action ON audit_events(action)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_audit_events_occurred_at ON audit_events(occurred_at DESC)`)
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_audit_events_target ON audit_events(target_id)`)
+	return m.migrationError()
 }
 
 // migrateV6 (QUB-105) widens the telemetry table to
@@ -549,52 +470,27 @@ func migrateV5(ctx context.Context, db *sql.DB) error {
 //     error message without a pod-log round trip.
 //     Nullable TEXT.
 func migrateV6(ctx context.Context, db *sql.DB) error {
-	colAdds := []struct {
-		table string
-		col   string
-		def   string
-	}{
-		{"telemetry", "total_tokens", "INTEGER NOT NULL DEFAULT 0"},
-		{"telemetry", "cost_prompt_usd", "REAL NOT NULL DEFAULT 0"},
-		{"telemetry", "cost_completion_usd", "REAL NOT NULL DEFAULT 0"},
-		{"telemetry", "cost_upstream_usd", "REAL NOT NULL DEFAULT 0"},
-		{"telemetry", "is_byok", "INTEGER NOT NULL DEFAULT 0"},
-		{"telemetry", "server_tool_calls_executed", "INTEGER NOT NULL DEFAULT 0"},
-		{"telemetry", "server_tool_calls_requested", "INTEGER NOT NULL DEFAULT 0"},
-		{"telemetry", "request_id", "TEXT"},
-		{"telemetry", "duration_ms", "INTEGER"},
-		{"telemetry", "error", "TEXT"},
-		{"telemetry", "error_status_code", "INTEGER"},
-		{"telemetry", "error_content_type", "TEXT"},
-		{"telemetry", "error_body", "TEXT"},
-	}
-	for _, c := range colAdds {
-		has, err := hasColumn(ctx, db, c.table, c.col)
-		if err != nil {
-			return fmt.Errorf("migration v6 hasColumn %s.%s: %w", c.table, c.col, err)
-		}
-		if has {
-			continue
-		}
-		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", c.table, c.col, c.def)
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v6 alter %s.%s: %w", c.table, c.col, err)
-		}
-	}
+	m := newMigration(ctx, db, "migration v6")
+	m.addColumn("telemetry", "total_tokens", "INTEGER NOT NULL DEFAULT 0")
+	m.addColumn("telemetry", "cost_prompt_usd", "REAL NOT NULL DEFAULT 0")
+	m.addColumn("telemetry", "cost_completion_usd", "REAL NOT NULL DEFAULT 0")
+	m.addColumn("telemetry", "cost_upstream_usd", "REAL NOT NULL DEFAULT 0")
+	m.addColumn("telemetry", "is_byok", "INTEGER NOT NULL DEFAULT 0")
+	m.addColumn("telemetry", "server_tool_calls_executed", "INTEGER NOT NULL DEFAULT 0")
+	m.addColumn("telemetry", "server_tool_calls_requested", "INTEGER NOT NULL DEFAULT 0")
+	m.addColumn("telemetry", "request_id", "TEXT")
+	m.addColumn("telemetry", "duration_ms", "INTEGER")
+	m.addColumn("telemetry", "error", "TEXT")
+	m.addColumn("telemetry", "error_status_code", "INTEGER")
+	m.addColumn("telemetry", "error_content_type", "TEXT")
+	m.addColumn("telemetry", "error_body", "TEXT")
 	// idx_telemetry_is_byok feeds the dashboard's
 	// BYOK-vs-routed split; the column is low-cardinality
 	// (boolean) so the index is small. Without it the
 	// dashboard's "filter to BYOK only" query is a full
 	// scan.
-	idxStmts := []string{
-		`CREATE INDEX IF NOT EXISTS idx_telemetry_is_byok ON telemetry(is_byok)`,
-	}
-	for i, stmt := range idxStmts {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("migration v6 index %d: %w", i, err)
-		}
-	}
-	return nil
+	m.createIndex(`CREATE INDEX IF NOT EXISTS idx_telemetry_is_byok ON telemetry(is_byok)`)
+	return m.migrationError()
 }
 
 // readUserVersion returns the current PRAGMA user_version, or 0

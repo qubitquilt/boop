@@ -151,6 +151,14 @@ function recordingDeps(overrides = {}) {
     cloneRepo: async () => {},
     setOctokit: () => {},
     getOctokit: () => null,
+    // RF-004: handshakeStage mutates deps.env.OPENROUTER_API_KEY
+    // after reading the secret file. The test fixture mimics
+    // the production makeDeps shape so the handshake code path
+    // works without a runtime check. The dummy key is a string
+    // so any code that reads it sees a non-empty value; tests
+    // that exercise the real SDK override deps.callOpenRouter
+    // and never read this field.
+    env: { OPENROUTER_API_KEY: "test-key" },
     // QUB-95 + multi-expert: walkthrough + expert overrides
     // default to no-ops so the sub-workflow runs without
     // making real LLM calls. Tests that want a real

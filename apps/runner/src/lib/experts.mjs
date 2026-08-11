@@ -36,7 +36,14 @@ import {
   emptyTelemetry,
   stripOpenRouterPrefix,
 } from "./openrouter.mjs";
+import { safeJsonParse } from "./json_shape.mjs";
+import { stripFrontmatter } from "./prompt_parts.mjs";
 import { buildAgentTools, toolsAvailable } from "./tools.mjs";
+import {
+  EXPERTS,
+  LENS_TO_EXPERT,
+  EXPERT_TO_LENS,
+} from "./experts/registry.mjs";
 
 // pickExperts is the orchestrator. Maps a PR type to a
 // list of expert names. The default mapping is a starting
@@ -68,39 +75,24 @@ export function pickExperts(classification) {
   }
 }
 
-// LENS_TO_EXPERT maps a lens file name (without the .md) to
-// the expert name in the pool. The mapping is a contract:
-// renaming a lens file means updating this map.
-const LENS_TO_EXPERT = {
-  "review-code-quality": null, // not yet a per-expert lens
-  "review-design-pattern": "design-pattern",
-  "review-error-handling": "error-handling",
-  "review-readability": "readability",
-  "review-solid-principles": null, // not yet a per-expert lens
-  "review-test-quality": "test-quality",
-  "review-deep": "regression-hunter", // deep ↔ regression-hunter for now
-};
+// LENS_TO_EXPERT, EXPERT_TO_LENS, and EXPERTS now live in
+// ./experts/registry.mjs as the single source of truth (RF-008).
+// Renaming an expert or adding a new one is one edit there.
+// EXPERT_POOL is the function-binding map and stays in this
+// file because it depends on `defaultExpert` (defined below).
 
 // EXPERT_POOL is the registry of expert functions. Each
 // function is an async (ctx, deps, shared) -> { findings }.
 // The default implementations are real LLM calls; a test
 // can override any expert via deps.expertOverrides (a
-// {expertName: function} map) or via the EXPERT_POOL global.
-export const EXPERT_POOL = {
-  "regression-hunter": defaultExpert.bind(null, "regression-hunter"),
-  "test-quality": defaultExpert.bind(null, "test-quality"),
-  "api-design": defaultExpert.bind(null, "api-design"),
-  "error-handling": defaultExpert.bind(null, "error-handling"),
-  "design-pattern": defaultExpert.bind(null, "design-pattern"),
-  "readability": defaultExpert.bind(null, "readability"),
-};
-
-// EXPERT_TO_LENS is the reverse map. Used by defaultExpert
-// to find the lens file for an expert name.
-const EXPERT_TO_LENS = Object.fromEntries(
-  Object.entries(LENS_TO_EXPERT)
-    .filter(([, expert]) => expert)
-    .map(([lens, expert]) => [expert, lens]),
+// {expertName: function} map) or by mutating EXPERT_POOL
+// directly (the runExperts test seam does this).
+//
+// The names are sourced from the registry's EXPERTS map so
+// adding a new expert there automatically registers a default
+// function in this pool.
+export const EXPERT_POOL = Object.fromEntries(
+  Object.keys(EXPERTS).map((name) => [name, defaultExpert.bind(null, name)]),
 );
 
 // buildExpertPrompt is the user message the expert LLM
@@ -217,7 +209,7 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
     // dispatch's gate + retry machinery surfaces the
     // misconfiguration, not a silent zero-finding run.
     throw new Error(
-      `expert "${name}" has no lens file mapped; update LENS_TO_EXPERT in lib/experts.mjs`,
+      `expert "${name}" has no lens file mapped; update EXPERTS in lib/experts/registry.mjs`,
     );
   }
   // Resolve the skill-mount path. The runner wires `paths.configSrc`
@@ -321,17 +313,32 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
 
 // readLensBody reads the lens file body (the system prompt).
 // Uses the rtk adapter when present; falls back to raw
-// fs.readFile. Frontmatter is stripped the same way the
-// single-LLM-call path strips it (the `---` block) so the
-// lens body the LLM sees is identical.
+// fs.readFile. Retries via the shared `readWithRetry` to
+// absorb the ConfigMap mount's transient symlink race
+// (RF-013: the lens loader previously had no retry; the
+// mount can be transiently inconsistent right after pod
+// start, same as the prompt builder). Frontmatter is
+// stripped via the shared `prompt_parts.stripFrontmatter`
+// so the lens body the LLM sees is identical to the boop
+// SKILL.md path in openrouter/prompt.mjs (RF-003: one
+// helper, two call sites).
 async function readLensBody(lensPath, fs, deps) {
-  let body;
-  if (deps.rtk && typeof deps.rtk.readFile === "function") {
-    body = await deps.rtk.readFile(lensPath, "utf8");
-  } else {
-    body = await fs.readFile(lensPath, "utf8");
-  }
-  return (body || "").replace(/^---[\s\S]*?---\n*/, "");
+  const reader = deps.rtk && typeof deps.rtk.readFile === "function"
+    ? (p) => deps.rtk.readFile(p, "utf8")
+    : (p) => fs.readFile(p, "utf8");
+  // Re-exported by the openrouter.mjs shim; tests can
+  // override the retry count via deps.retries to exercise
+  // the error path immediately.
+  const { readWithRetry } = await import("./openrouter.mjs");
+  const attempts = deps.retries?.lens ?? 5;
+  const body = await readWithRetry(lensPath, reader, {
+    attempts,
+    onRetry: (n, err) =>
+      deps.log?.("lens", `read attempt ${n} failed`, {
+        err: String(err?.message ?? err),
+      }),
+  });
+  return stripFrontmatter(body || "");
 }
 
 // parseExpertResponse parses the LLM's JSON response. The
@@ -342,26 +349,18 @@ async function readLensBody(lensPath, fs, deps) {
 // (the lens found nothing to flag), and a non-JSON
 // response is logged + treated as a failure.
 function parseExpertResponse(text, name) {
-  const raw = (text || "").trim();
-  if (!raw) {
+  if (!text || !text.trim()) {
     return { findings: [] };
   }
-  // The LLM is asked to return a single JSON object. Strip
-  // a leading ```json fence if the LLM added one (defense
-  // against the "I'll wrap my JSON in a code block" failure
-  // mode).
-  const stripped = raw
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/```\s*$/, "")
-    .trim();
-  let parsed;
-  try {
-    parsed = JSON.parse(stripped);
-  } catch {
-    // The LLM did not return parseable JSON. Treat the
-    // whole response as a single free-form finding so the
-    // expert's analysis is not silently dropped. The
-    // narrate stage may downgrade severity to "info".
+  // The LLM is asked to return a single JSON object. The
+  // shared json_shape helper strips a leading ```json fence
+  // (defense against the "I'll wrap my JSON in a code block"
+  // failure mode) and parses-or-defaults. A parse failure
+  // still gets a free-form finding so the expert's analysis
+  // is not silently dropped; the narrate stage may
+  // downgrade severity to "info".
+  const parsed = safeJsonParse(text, null);
+  if (!parsed || typeof parsed !== "object") {
     return {
       findings: [
         {
@@ -369,7 +368,7 @@ function parseExpertResponse(text, name) {
           expert: name,
           severity: "info",
           title: `${name} (unparsed response)`,
-          body: stripped.slice(0, 2000),
+          body: (text || "").trim().slice(0, 2000),
         },
       ],
     };
@@ -555,11 +554,6 @@ export async function defaultNarrate(findings, _ctx, _deps) {
     telemetry: null,
   };
 }
-
-// _LENS_TO_EXPERT re-exported for tests. The mapping is
-// loaded at module init; tests can pin or override it via
-// the EXPERT_POOL or deps.expertOverrides hooks.
-export const _INTERNAL = { LENS_TO_EXPERT, EXPERT_TO_LENS };
 
 // PLACEHOLDER_NARRATE_SUMMARY is the markdown body the
 // placeholder review posts to the PR. The shape is pinned by

@@ -120,7 +120,7 @@ func (h *Handler) RerunPreview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
 	}
-	newName := buildRerunJobName(prior.Owner, prior.Repo, prior.PRNumber, sha7, count+1)
+	newName := store.BuildRerunJobName(prior.Owner, prior.Repo, prior.PRNumber, sha7, count+1)
 	preview.New = rerunPreviewRun{
 		RunID:   newName,
 		JobName: newName,
@@ -338,7 +338,7 @@ func (h *Handler) CreateRerunJob(ctx context.Context, prior store.Run, reason st
 		if err != nil {
 			return "", fmt.Errorf("count reruns: %w", err)
 		}
-		newName = buildRerunJobName(prior.Owner, prior.Repo, prior.PRNumber, sha7, count+1)
+		newName = store.BuildRerunJobName(prior.Owner, prior.Repo, prior.PRNumber, sha7, count+1)
 		_, err = h.store.CreateRerun(ctx, store.Run{
 			ID:             newName,
 			Owner:          prior.Owner,
@@ -450,12 +450,4 @@ func (h *Handler) CreateRerunJob(ctx context.Context, prior store.Run, reason st
 	}
 	h.logger.Info("rerun job created", "prior", prior.ID, "new", newName, "reason", reason)
 	return newName, nil
-}
-
-// buildRerunJobName is a thin shim over store.BuildRerunJobName
-// (RD-002: the canonical helper lives in the store package so
-// the regex / format lives in one place; the webhook package
-// re-exports it for callers that already import webhook).
-func buildRerunJobName(owner, repo string, pr int, sha7 string, n int) string {
-	return store.BuildRerunJobName(owner, repo, pr, sha7, n)
 }

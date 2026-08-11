@@ -157,7 +157,10 @@ func TestResolveInstallationID(t *testing.T) {
 }
 
 func TestBuildJobName(t *testing.T) {
-	got := buildJobName("michaelruelas", "homelab-infra", 42, "abc1234567890def")
+	// RF-006: the canonical helper is store.BuildJobName;
+	// the webhook shim was removed. Test pins the contract
+	// from the canonical side.
+	got := store.BuildJobName("michaelruelas", "homelab-infra", 42, "abc1234567890def")
 	want := "boop-michaelruelas-homelab-infra-42-abc1234"
 	if got != want {
 		t.Errorf("buildJobName = %q, want %q", got, want)
@@ -165,11 +168,9 @@ func TestBuildJobName(t *testing.T) {
 }
 
 func TestShortSHA(t *testing.T) {
-	// RD-002: shortSHA used to live in this package as
-	// an unexported helper; the canonical version is now
-	// store.ShortSHA. The test pins the contract from
-	// the canonical side; the webhook shim is a thin
-	// pass-through.
+	// RD-002: ShortSHA is in the store package; the
+	// webhook shim was removed in RF-006. Test pins the
+	// contract from the canonical side.
 	if got := store.ShortSHA("abc1234567890"); got != "abc1234" {
 		t.Errorf("shortSHA long = %q, want abc1234", got)
 	}

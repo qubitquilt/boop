@@ -267,6 +267,69 @@ export function statusStageFor(id) {
   return stage ? stage.statusStage : null;
 }
 
+// walkStages is the shared loop body for runStages and
+// runSubWorkflow (RF-009: lifted the near-duplicate retry /
+// skip / state-update logic). The two callers differ in three
+// ways — the skip-list source, the skip behaviour
+// (continue vs abort), and the per-stage side effects
+// (postStage start/end, onPass callbacks) — so walkStages
+// takes a config object that lets each caller customise
+// those seams.
+//
+//   skipList()            returns the list of already-passed
+//                         stage ids. Called once per stage; the
+//                         caller reads from state (state.passed
+//                         for the macro executor,
+//                         state.sub[macroId] for the sub-executor).
+//                         Async because the caller may read from
+//                         the store / status comment in a future
+//                         revision.
+//   onSkip(stage, passed) called when stage.id is in
+//                         skipList(). Return { aborted: true,
+//                         reason } to stop the loop (runStages
+//                         QUB-102 abort) or { aborted: false }
+//                         to continue (runSubWorkflow resume).
+//                         May be async (e.g. to await a status
+//                         POST before signalling abort).
+//   onStart(stage)        fires before the retry. runStages posts
+//                         the stage-start here; the sub-executor
+//                         does nothing.
+//   onEnd(stage)          fires after the retry, even on a
+//                         thrown error. runStages posts the
+//                         stage-end here.
+//   onPass(stage)         fires after a successful retry.
+//                         runStages appends to state.passed and
+//                         fires onStagePassed; the sub-executor
+//                         appends to state.sub.
+async function walkStages(stages, ctx, deps, overrides, state, config = {}) {
+  const {
+    skipList = async () => [],
+    onSkip = () => ({ aborted: false }),
+    onStart = () => {},
+    onEnd = async () => {},
+    onPass = () => {},
+  } = config;
+  for (const stage of stages) {
+    const passed = await skipList();
+    if (passed.includes(stage.id)) {
+      const result = await onSkip(stage, passed);
+      if (result && result.aborted) {
+        return { aborted: true, reason: result.reason };
+      }
+      continue;
+    }
+    await onStart(stage);
+    try {
+      await withRetry(stage, ctx, deps, overrides, state);
+    } finally {
+      await onEnd(stage);
+    }
+    if (state.parseFailed) return { parseFailed: true };
+    await onPass(stage);
+  }
+  return { ok: true };
+}
+
 // runStages walks the macro-stage list in order. Each stage is
 // invoked through withRetry, which applies the bounded-attempt /
 // exponential-backoff policy. A failed gate (after retries) is
@@ -302,109 +365,119 @@ export function statusStageFor(id) {
 export async function runStages(ctx, deps, overrides, state, options = {}) {
   const onStagePassed = options.onStagePassed || (() => {});
   const postStage = deps.postStage || defaultPostStage;
-  for (const stage of STAGES) {
-    if (state.passed && state.passed.includes(stage.id)) {
-      // QUB-102: another pod of this Job already passed this
-      // stage. Abort the current run to prevent duplicate
-      // GitHub side effects (summary comment, inline review
-      // threads) — see jobbuilder.go:59 (jobBackoffLimit=0)
-      // for the primary defense.
+  // QUB-109: post the start of the stage, then run, then
+  // post the end. The receiver stamps both timestamps
+  // with its own clock; the runner's wall time is
+  // intentionally ignored. Failures in the post are
+  // absorbed by the helper so a dashboard blip never
+  // aborts a review.
+  //
+  // EH-004: the start POST is fire-and-forget — the
+  // helper's contract says "failures are logged but never
+  // raised", and awaiting it on the orchestrator path
+  // makes the start POST's 5s timeout * N stages a real
+  // drag on a degraded receiver. The finally block still
+  // awaits the end POST because that one is the
+  // "bar finally closed" signal the dashboard reads;
+  // if it lands, the dashboard renders the bar; if it
+  // times out, the start POST is the visible record and
+  // the operator can correlate "bar didn't close" with
+  // the runner's logged timeout.
+  await walkStages(STAGES, ctx, deps, overrides, state, {
+    skipList: async () => state.passed || [],
+    onSkip: async (stage, passed) => {
+      // QUB-102: another pod of this Job already passed
+      // this stage. Abort the current run to prevent
+      // duplicate GitHub side effects (summary comment,
+      // inline review threads) — see jobbuilder.go:59
+      // (jobBackoffLimit=0) for the primary defense.
       //
-      // The reason lists the full passed set so the operator
-      // sees the prior pod's progress at a glance from the
-      // status timeline. The merge in index.mjs runs after
-      // the per-iteration push, so the array order can shift
-      // (e.g. ["fetch","handshake"] instead of
-      // ["handshake","fetch"]); the items are the same, the
-      // order is cosmetic. The orchestrator reads
-      // state.failureReason and forwards it to the dashboard
-      // so the operator's primary view is not just "failed"
-      // with no context.
-      const reason = `another pod already passed [${state.passed.join(", ")}]; refusing to duplicate the review`;
+      // The reason lists the full passed set so the
+      // operator sees the prior pod's progress at a
+      // glance from the status timeline. The merge in
+      // index.mjs runs after the per-iteration push, so
+      // the array order can shift (e.g.
+      // ["fetch","handshake"] instead of
+      // ["handshake","fetch"]); the items are the same,
+      // the order is cosmetic. The orchestrator reads
+      // state.failureReason and forwards it to the
+      // dashboard so the operator's primary view is not
+      // just "failed" with no context.
+      const reason = `another pod already passed [${passed.join(", ")}]; refusing to duplicate the review`;
       deps.errlog("abort", reason, {
         stage: stage.id,
-        passed: state.passed,
+        passed,
       });
       state.failureReason = reason;
-      await deps.postStatus("failed", reason);
       state.parseFailed = true;
-      return state;
-    }
-    // QUB-109: post the start of the stage, then run, then
-    // post the end. The receiver stamps both timestamps
-    // with its own clock; the runner's wall time is
-    // intentionally ignored. Failures in the post are
-    // absorbed by the helper so a dashboard blip never
-    // aborts a review.
-    //
-    // EH-004: the start POST is fire-and-forget — the
-    // helper's contract says "failures are logged but never
-    // raised", and awaiting it on the orchestrator path
-    // makes the start POST's 5s timeout * N stages a real
-    // drag on a degraded receiver. The finally block still
-    // awaits the end POST because that one is the
-    // "bar finally closed" signal the dashboard reads;
-    // if it lands, the dashboard renders the bar; if it
-    // times out, the start POST is the visible record and
-    // the operator can correlate "bar didn't close" with
-    // the runner's logged timeout.
-    postStage(stage.id, ctx, deps);
-    const wasPassed = state.parseFailed;
-    try {
-      await withRetry(stage, ctx, deps, overrides, state);
-    } finally {
+      await deps.postStatus("failed", reason);
+      return { aborted: true, reason };
+    },
+    onStart: (stage) => postStage(stage.id, ctx, deps),
+    onEnd: async (stage) => {
       // Always post the end, even on a thrown error —
       // a waterfall that hangs open on a thrown stage
       // misleads the operator into thinking the run is
       // still working on it.
       await postStage(stage.id, ctx, deps, { ended: true });
-    }
-    if (state.parseFailed && !wasPassed) return state;
-    if (state.parseFailed) return state;
-    // The stage passed. Append to state.passed and notify.
-    state.passed = state.passed || [];
-    if (!state.passed.includes(stage.id)) state.passed.push(stage.id);
-    await onStagePassed(stage.id, state);
-  }
+    },
+    onPass: async (stage) => {
+      // The stage passed. Append to state.passed and notify.
+      state.passed = state.passed || [];
+      if (!state.passed.includes(stage.id)) state.passed.push(stage.id);
+      await onStagePassed(stage.id, state);
+    },
+  });
   return state;
 }
 
-// runSubWorkflow walks a sub-workflow stage list in order. Same
-// shape as runStages. Honors state.sub[macroId] (a list of
-// sub-stage ids) for the macro stage's sub-workflow; the
-// orchestrator in index.mjs is responsible for setting
-// state.sub[macroId] when reading the workflow state. A
-// sub-stage whose id is in the per-macro list is skipped.
+// runSubWorkflow walks a sub-workflow stage list in order.
+// Built on the same walkStages helper as runStages; the
+// differences are encoded in the config below.
+//
+//   - skipList reads from state.sub[macroId] (the per-macro
+//     sub-stage skip list) instead of state.passed.
+//   - onSkip continues instead of aborting (sub-stages are
+//     resumable; the macro executor is the unit of QUB-102
+//     abort).
+//   - onStart / onEnd are no-ops; sub-stages are silent on
+//     the status thread (the parent macro posts the single
+//     "review" line).
+//   - onPass appends to state.sub[macroId] so the macro
+//     executor's onStagePassed callback picks up the new
+//     sub-stage id and persists it.
 export async function runSubWorkflow(stages, ctx, deps, overrides, state) {
   const macroId = state._subWorkflowOf;
-  const subPassed =
-    macroId && state.sub && Array.isArray(state.sub[macroId])
-      ? state.sub[macroId]
-      : null;
-  for (const stage of stages) {
-    if (subPassed && subPassed.includes(stage.id)) {
-      deps.log("resume", `sub-stage ${stage.id} already passed; skipping`, {
-        sub: subPassed,
-      });
-      continue;
-    }
-    const wasPassed = state.parseFailed;
-    await withRetry(stage, ctx, deps, overrides, state);
-    if (state.parseFailed && !wasPassed) return state;
-    if (state.parseFailed) return state;
-    // Sub-stage passed. Append to state.sub[macroId] if we know
-    // the macro id. The orchestrator's onStagePassed callback
-    // (fired by the macro executor after the macro stage
-    // returns) will pick up the updated sub list and persist
-    // the state.
-    if (macroId) {
-      state.sub = state.sub || {};
-      state.sub[macroId] = state.sub[macroId] || [];
-      if (!state.sub[macroId].includes(stage.id)) {
-        state.sub[macroId].push(stage.id);
+  const result = await walkStages(stages, ctx, deps, overrides, state, {
+    skipList: async () => {
+      if (!macroId || !state.sub || !Array.isArray(state.sub[macroId])) {
+        return [];
       }
-    }
-  }
+      return state.sub[macroId];
+    },
+    onSkip: (stage, sub) => {
+      deps.log("resume", `sub-stage ${stage.id} already passed; skipping`, {
+        sub,
+      });
+      return { aborted: false };
+    },
+    onPass: (stage) => {
+      if (macroId) {
+        state.sub = state.sub || {};
+        state.sub[macroId] = state.sub[macroId] || [];
+        if (!state.sub[macroId].includes(stage.id)) {
+          state.sub[macroId].push(stage.id);
+        }
+      }
+    },
+  });
+  // The original runSubWorkflow returns state on the parseFailed
+  // early-return so callers (tests, the sniff macro stage) can
+  // assert "yes, the sub-workflow aborted" by checking the
+  // return value. On normal completion it returns undefined
+  // because the sub-workflow is silent on the status thread and
+  // the state mutations are the contract.
+  if (result.parseFailed) return state;
 }
 
 // withRetry applies the bounded-attempt / exponential-backoff
@@ -589,17 +662,16 @@ async function handshakeStage(ctx, deps, overrides, state) {
   );
   state.installationToken = installationToken;
   state.openrouterApiKey = OPENROUTER_API_KEY;
-  // QUB-120: thread the key through deps.env so the
-  // multi-expert dispatch (experts.mjs:233) forwards it
-  // to callOpenRouter via { ...deps }. The single-LLM
-  // path (openrouter.mjs:75) keeps its explicit env
-  // override. Without this, callOpenRouter defaults to
-  // process.env and OPENROUTER_API_KEY is unset (the
-  // runner loads the key from a file, not env), tripping
-  // the guard at openrouter.mjs:188-191 on every expert
-  // dispatch. The walkthrough stage (walkthrough.mjs:131)
-  // also spreads ...deps and picks up the same env.
-  deps.env = { OPENROUTER_API_KEY: OPENROUTER_API_KEY };
+  // QUB-120 + RF-004: thread the key through deps.env so the
+  // multi-expert dispatch (experts.mjs defaultExpert) and the
+  // walkthrough (walkthrough.mjs generateWalkthrough) forward
+  // it to callOpenRouter via { ...deps }. The orchestrator
+  // (openrouter/orchestrator.mjs) also reads it the same way.
+  // RF-004 collapsed the per-call `env: { ... }` override
+  // into a single snap in makeDeps; we mutate the same object
+  // rather than replace it so any other field in deps.env
+  // (none today) survives the handshake.
+  deps.env.OPENROUTER_API_KEY = OPENROUTER_API_KEY;
   state.octokit = overrides.makeOctokit
     ? overrides.makeOctokit(installationToken)
     : makeOctokit(installationToken);
