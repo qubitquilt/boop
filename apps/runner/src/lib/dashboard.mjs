@@ -231,8 +231,28 @@ async function postWithRetry(url, body, token, deps) {
       });
       clearTimeout(timer);
       if (res.status >= 200 && res.status < 300) return;
-      // 202 (run not yet persisted) and 4xx (auth/validation)
-      // are not retryable. 5xx is.
+      // 401 (auth): a token-misconfig is a permanent
+      // failure — the same header will keep failing.
+      // The runner's "post rejected" log line was
+      // indistinguishable from a 4xx body-validation
+      // error, so a misconfigured BOOP_DASHBOARD_TOKEN
+      // would silently drop every telemetry row while
+      // the operator's eyes were on the dashboard.
+      // Surface 401 at error level so the misconfig
+      // shows up in the runner's log stream on the
+      // first POST. (EH-007.) Fall back to log() when
+      // errlog is not provided so tests that pass only
+      // log() (e.g. a focused unit test) still work.
+      if (res.status === 401) {
+        const emit = deps.errlog || deps.log;
+        emit("dashboard", "auth rejected: check BOOP_DASHBOARD_TOKEN matches the receiver's secret", {
+          url,
+          status: 401,
+        });
+        return;
+      }
+      // 202 (run not yet persisted) and other 4xx
+      // (validation) are not retryable. 5xx is.
       if (res.status < 500 && res.status !== 202) {
         deps.log("dashboard", "post rejected", { url, status: res.status });
         return;

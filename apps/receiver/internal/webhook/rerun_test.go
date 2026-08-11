@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http/httptest"
@@ -263,6 +264,68 @@ func TestRerun_RejectsEmptyConfirm_WithToken(t *testing.T) {
 	}
 }
 
+// CQ-005: RerunPreview is the diff endpoint the
+// dashboard shows before the operator confirms a
+// requeue. Returns 200 with a prior/new run pair, 404
+// for an unknown run, 409 for a non-terminal prior.
+// The new.name follows the {original}-r{N} convention.
+func TestRerunPreview_HappyPath(t *testing.T) {
+	h := newTestHandlerWithStoreAndKube(t)
+	seedTestRun(t, h, store.StatusFailed)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/runs/boop-a-b-1-aaaaaaa/rerun-preview", nil)
+	req.SetPathValue("id", "boop-a-b-1-aaaaaaa")
+	h.RerunPreview(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp rerunPreviewResponse
+	if err := jsonDecode(rr, &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Prior.RunID != "boop-a-b-1-aaaaaaa" {
+		t.Errorf("prior.run_id = %q", resp.Prior.RunID)
+	}
+	if resp.New.RunID != "boop-a-b-1-aaaaaaa-r1" {
+		t.Errorf("new.run_id = %q, want ...-r1", resp.New.RunID)
+	}
+	if resp.New.Status != string(store.StatusPending) {
+		t.Errorf("new.status = %q, want pending", resp.New.Status)
+	}
+}
+
+func TestRerunPreview_UnknownRunReturns404(t *testing.T) {
+	h := newTestHandlerWithStoreAndKube(t)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/runs/no-such/rerun-preview", nil)
+	req.SetPathValue("id", "no-such")
+	h.RerunPreview(rr, req)
+	if rr.Code != 404 {
+		t.Errorf("status = %d, want 404", rr.Code)
+	}
+}
+
+func TestRerunPreview_NonTerminalPriorReturns409(t *testing.T) {
+	h := newTestHandlerWithStoreAndKube(t)
+	seedTestRun(t, h, store.StatusRunning)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/runs/boop-a-b-1-aaaaaaa/rerun-preview", nil)
+	req.SetPathValue("id", "boop-a-b-1-aaaaaaa")
+	h.RerunPreview(rr, req)
+	if rr.Code != 409 {
+		t.Errorf("status = %d, want 409", rr.Code)
+	}
+}
+
+// jsonDecode is a tiny helper that decodes a ResponseRecorder
+// body as JSON. The dashboards_test.go file has the same
+// helper locally; the rerun tests don't pull that file in
+// to keep the test surface narrow.
+func jsonDecode(rr *httptest.ResponseRecorder, v any) error {
+	return json.Unmarshal(rr.Body.Bytes(), v)
+}
+
 // QUB-127: the rerun handler must check X-BOOP-Runner-Token
 // before any work. A POST without the token returns 401
 // without touching the K8s client or the store. The QUB-115
@@ -299,6 +362,9 @@ func TestRerun_RejectsWrongToken(t *testing.T) {
 
 // QUB-127 happy path: with the right token + confirm + reason,
 // the rerun returns 202. Mirrors the production CLI path.
+// EH-009: pins the response shape so a future
+// refactor cannot quietly add a `note` field or rename
+// the existing keys.
 func TestRerun_HappyPath(t *testing.T) {
 	h := newTestHandlerWithStoreAndKube(t)
 	seedTestRun(t, h, store.StatusFailed)
@@ -311,6 +377,70 @@ func TestRerun_HappyPath(t *testing.T) {
 	h.Rerun(rr, req)
 	if rr.Code != 202 {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var resp rerunResponse
+	if err := jsonDecode(rr, &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.NewRunID != "boop-a-b-1-aaaaaaa-r1" {
+		t.Errorf("new_run_id = %q, want ...-r1", resp.NewRunID)
+	}
+	if resp.PriorRunID != "boop-a-b-1-aaaaaaa" {
+		t.Errorf("prior_run_id = %q", resp.PriorRunID)
+	}
+	if resp.ParentRunID != "boop-a-b-1-aaaaaaa" {
+		t.Errorf("parent_run_id = %q", resp.ParentRunID)
+	}
+	// No extra fields in the response. (EH-009: the
+	// earlier shape was a free-form map[string]any and
+	// any caller had to guess the contract; a future
+	// refactor that adds a `note` field would slip
+	// through clients that decoded into a struct.)
+	var raw map[string]any
+	if err := jsonDecode(rr, &raw); err != nil {
+		t.Fatalf("decode raw: %v", err)
+	}
+	if len(raw) != 3 {
+		t.Errorf("response keys = %d (%v), want exactly 3", len(raw), raw)
+	}
+}
+
+// EH-006: every successful API Rerun must append an
+// audit row tagged with the runner-derived actor. The
+// dashboard's serveRerun (form path) and this handler
+// (API path) write the same action type so a
+// compliance review can see "who re-ran this?" across
+// both entry points. Without the API-side write, a
+// runner-initiated rerun is invisible in
+// audit_events.
+func TestRerun_WritesAuditEvent(t *testing.T) {
+	h := newTestHandlerWithStoreAndKube(t)
+	seedTestRun(t, h, store.StatusFailed)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/runs/boop-a-b-1-aaaaaaa/rerun", strings.NewReader(`{"reason":"api rerun","confirm":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-BOOP-Runner-Token", "test-runner-token")
+	req.SetPathValue("id", "boop-a-b-1-aaaaaaa")
+	h.Rerun(rr, req)
+	if rr.Code != 202 {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	events, err := h.store.ListAuditEvents(context.Background(), 10)
+	if err != nil {
+		t.Fatalf("list audit: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("audit events = %d, want 1", len(events))
+	}
+	if events[0].Action != "rerun.create" {
+		t.Errorf("action = %q, want rerun.create", events[0].Action)
+	}
+	if !strings.HasPrefix(events[0].Actor, "runner:") {
+		t.Errorf("actor = %q, want runner: prefix", events[0].Actor)
+	}
+	if !strings.Contains(events[0].Details, `"source":"api"`) {
+		t.Errorf("details = %q, want to contain source=api", events[0].Details)
 	}
 }
 

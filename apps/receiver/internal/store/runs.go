@@ -136,9 +136,18 @@ func (s *Store) UpsertRun(ctx context.Context, r Run) (Run, error) {
 //
 // The status is the only required field; ended/duration/error are
 // only updated when the caller supplies them. Returns the updated
-// row, or sql.ErrNoRows if the run does not exist (the runner
+// row, or ErrUnknownRun if the run does not exist (the runner
 // started before the receiver committed the row, which is fine —
 // the runner will retry on the next stage).
+//
+// RD-003: this method (and TouchRunHeartbeat) used to return the
+// raw sql.ErrNoRows for the missing-row case. The HTTP boundary
+// then had three different shapes for "unknown run" — ErrUnknownRun
+// for some reads, sql.ErrNoRows for the status/heartbeat
+// writes, and the FK-violation detection on the POSTs. Every
+// store method that signals "the run does not exist" now
+// returns ErrUnknownRun; HTTP handlers match on that single
+// shape.
 func (s *Store) UpdateRunStatus(ctx context.Context, id string, status RunStatus, endedAt *time.Time, durationMS *int64, errMsg string) (Run, error) {
 	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `
@@ -165,7 +174,7 @@ func (s *Store) UpdateRunStatus(ctx context.Context, id string, status RunStatus
 		return Run{}, fmt.Errorf("store: update run status rows: %w", err)
 	}
 	if n == 0 {
-		return Run{}, sql.ErrNoRows
+		return Run{}, ErrUnknownRun
 	}
 	return s.GetRun(ctx, id)
 }
@@ -219,10 +228,12 @@ func (s *Store) UpdateRunStatusIfRunning(ctx context.Context, id string, status 
 // reconciler do an empty-string clear ("no failure class
 // known") without coupling that to a status update.
 //
-// Returns sql.ErrNoRows if the run has been pruned between
+// Returns ErrUnknownRun if the run has been pruned between
 // the reconciler's read of the Job and the write here — the
 // reconciler treats that as a no-op so it doesn't have to
-// retry on a retention race.
+// retry on a retention race. RD-003: returns ErrUnknownRun
+// (not sql.ErrNoRows) so the HTTP boundary has a single
+// shape for "unknown run".
 func (s *Store) SetRunFailureClass(ctx context.Context, id, failureClass string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.db.ExecContext(ctx, `
@@ -236,9 +247,149 @@ func (s *Store) SetRunFailureClass(ctx context.Context, id, failureClass string)
 		return fmt.Errorf("store: set run failure class rows: %w", err)
 	}
 	if n == 0 {
-		return sql.ErrNoRows
+		return ErrUnknownRun
 	}
 	return nil
+}
+
+// CreateRerun persists a new re-run row and backfills
+// the prior's superseded_by_id pointer in a single
+// transaction. The re-run flow (webhook/rerun.go:
+// CreateRerunJob) used to do the two writes as separate
+// statements; a crash between them would leave a new
+// pending row with no lineage pointer or, worse, a prior
+// row that already points at a non-existent new id. The
+// dashboard's "Lineage" view (run_detail.html) reads
+// both, so a partial state is a silent corruption: the
+// "WalkDown" pill on the prior row would 404.
+//
+// The next.ID is expected to be the candidate name; the
+// caller computes it from CountRerunJobsForSHA + 1.
+// The INSERT runs first; if it lands, the UPDATE
+// supersedes the prior. The single-transaction shape
+// guarantees both writes land together or neither does.
+//
+// EH-008: the prior shape had a TOCTOU race between
+// CountRerunJobsForSHA (read) and the INSERT — two
+// concurrent re-runs of the same prior would both read
+// count=0, both try to insert "X-r1", and the second
+// would either silently overwrite (ON CONFLICT) or fail.
+// We close the race by removing the ON CONFLICT from
+// the INSERT and returning ErrDuplicateRerunName when
+// SQLite's UNIQUE constraint fires. The caller
+// (CreateRerunJob) retries with count+1; after a
+// bounded number of attempts the race is so unlikely
+// that an error is the right answer.
+//
+// Returns the persisted new row (post-merge, same shape
+// UpsertRun returns). Returns sql.ErrNoRows if the prior
+// row does not exist — the caller can treat that as
+// "retention pruned the prior between the operator's
+// click and the write", log it, and proceed without
+// lineage (the new row's parent_run_id is still set so
+// the up-chain view works). Returns the prior's id
+// unchanged when the prior was already superseded
+// (UPDATE rows=0 from the second write), so a double-
+// click on the operator's "Requeue" button is a no-op
+// rather than a clobber.
+func (s *Store) CreateRerun(ctx context.Context, next Run, priorID string) (Run, error) {
+	if next.ID == "" {
+		return Run{}, errors.New("store: CreateRerun: empty id")
+	}
+	if priorID == "" {
+		return Run{}, errors.New("store: CreateRerun: empty prior id")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Run{}, fmt.Errorf("store: begin rerun tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := time.Now().UTC()
+	if next.CreatedAt.IsZero() {
+		next.CreatedAt = now
+	}
+	next.UpdatedAt = now
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO runs (
+			id, owner, repo, pr_number, commit_sha, base_ref,
+			review_number, reason, installation_id, status,
+			started_at, ended_at, duration_ms, error,
+			failure_class,
+			parent_run_id, superseded_by_id,
+			created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		next.ID, next.Owner, next.Repo, next.PRNumber, next.CommitSHA, next.BaseRef,
+		next.ReviewNumber, nullString(next.Reason), nullInt64(next.InstallationID), string(next.Status),
+		next.StartedAt.UTC().Format(time.RFC3339Nano), nullTimePtr(next.EndedAt), nullInt64Ptr(next.DurationMS), nullString(next.Error),
+		nullString(next.FailureClass),
+		nullString(next.ParentRunID), nullString(next.SupersededByID),
+		next.CreatedAt.UTC().Format(time.RFC3339Nano), next.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		if isUniqueConstraintError(err) {
+			// EH-008: a concurrent re-run got the
+			// same candidate name. The caller
+			// retries with count+1.
+			return Run{}, ErrDuplicateRerunName
+		}
+		return Run{}, fmt.Errorf("store: insert rerun: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE runs SET superseded_by_id = ?, updated_at = ?
+		WHERE id = ? AND (superseded_by_id IS NULL OR superseded_by_id = '' OR superseded_by_id = ?)
+	`, nullString(next.ID), now.UTC().Format(time.RFC3339Nano), priorID, next.ID)
+	if err != nil {
+		return Run{}, fmt.Errorf("store: supersede prior: %w", err)
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return Run{}, fmt.Errorf("store: supersede prior rows: %w", err)
+	} else if n == 0 {
+		// Prior was either pruned or already pointed
+		// at this re-run. Read it inside the same tx
+		// so we can distinguish the two cases for the
+		// caller.
+		var id string
+		err := tx.QueryRowContext(ctx, `SELECT id FROM runs WHERE id = ?`, priorID).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return Run{}, sql.ErrNoRows
+		}
+		if err != nil {
+			return Run{}, fmt.Errorf("store: prior probe: %w", err)
+		}
+		// Prior exists with a different superseded_by_id.
+		// Idempotent no-op: the second call sees the
+		// already-set pointer and skips the write.
+	}
+
+	if err := tx.Commit(); err != nil {
+		return Run{}, fmt.Errorf("store: commit rerun: %w", err)
+	}
+	return s.GetRun(ctx, next.ID)
+}
+
+// ErrDuplicateRerunName is returned by CreateRerun when
+// the candidate name (computed from a stale
+// CountRerunJobsForSHA) collides with a row that landed
+// in the gap between the count and the INSERT. The
+// caller (webhook.CreateRerunJob) is expected to retry
+// with a count+1 candidate. EH-008 closes the
+// count-then-insert race that the previous shape
+// silently lost to.
+var ErrDuplicateRerunName = errors.New("store: duplicate rerun name (concurrent re-run)")
+
+// isUniqueConstraintError reports whether err is a
+// SQLite UNIQUE constraint violation. The error
+// message is the only stable signal; matching the
+// substring is the same approach the rest of the store
+// uses for FK violations.
+func isUniqueConstraintError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 // SetSupersededBy writes just the superseded_by_id column
@@ -253,6 +404,12 @@ func (s *Store) SetRunFailureClass(ctx context.Context, id, failureClass string)
 // the new run row still lands and the operator's
 // "show me the lineage" view is consistent (the prior
 // just renders as "(pruned)" on the dashboard side).
+//
+// CreateRerun is the preferred entry point for the
+// re-run flow; SetSupersededBy is left for tests and
+// future narrow callers (e.g. a "link this prior to
+// that new id" admin action that does not also insert
+// a new row).
 func (s *Store) SetSupersededBy(ctx context.Context, priorID, newID string) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	res, err := s.db.ExecContext(ctx, `
@@ -366,6 +523,144 @@ type ListRunsFilter struct {
 type ListRunsResult struct {
 	Runs       []Run
 	NextCursor string
+}
+
+// RunWithTelemetry is one run joined with its telemetry row.
+// The two live on different tables (runs.id →
+// telemetry.run_id) but every dashboard run-list cell
+// renders them as one row, so the join is the load-bearing
+// shape for the dashboard's data layer.
+//
+// SP-006: ListRunsWithTelemetry is the bulk version. The
+// prior shape was "ListRuns + N×GetTelemetry" — N+1 to
+// the database, the same shape the audit flagged. This
+// helper does one runs query + one telemetry batch so
+// the dashboard can render a 200-row run list in two
+// round-trips rather than 201.
+type RunWithTelemetry struct {
+	Run       Run
+	Telemetry Telemetry
+}
+
+// ListRunsWithTelemetryPage is the page variant — it
+// returns the bulk shape keyed with the next-cursor from
+// the runs side so callers that paginate can keep the
+// cursor flowing.
+type ListRunsWithTelemetryPage struct {
+	Runs       []RunWithTelemetry
+	NextCursor string
+}
+
+// ListRunsWithTelemetry returns the same page ListRuns
+// would, with each row carrying its telemetry fields
+// (zero-valued when no telemetry row exists for the run).
+// Two round-trips: one for the runs page, one for the
+// matching telemetry rows. The cursor is preserved so a
+// paginated caller can chain calls.
+//
+// The store-side test TestListRunsWithTelemetry pins the
+// join shape.
+func (s *Store) ListRunsWithTelemetry(ctx context.Context, f ListRunsFilter) (ListRunsWithTelemetryPage, error) {
+	runsPage, err := s.ListRuns(ctx, f)
+	if err != nil {
+		return ListRunsWithTelemetryPage{}, err
+	}
+	if len(runsPage.Runs) == 0 {
+		return ListRunsWithTelemetryPage{NextCursor: runsPage.NextCursor}, nil
+	}
+	ids := make([]any, 0, len(runsPage.Runs))
+	placeholders := make([]string, 0, len(runsPage.Runs))
+	for _, run := range runsPage.Runs {
+		ids = append(ids, run.ID)
+		placeholders = append(placeholders, "?")
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT run_id, model, provider,
+			input_tokens, output_tokens, total_tokens,
+			reasoning_tokens, cache_read_tokens, cache_write_tokens,
+			cost_usd, cost_prompt_usd, cost_completion_usd, cost_upstream_usd,
+			is_byok,
+			server_tool_calls_executed, server_tool_calls_requested,
+			request_id, duration_ms, step_count,
+			error, error_status_code, error_content_type, error_body
+		FROM telemetry WHERE run_id IN (`+strings.Join(placeholders, ",")+`)`,
+		ids...)
+	if err != nil {
+		return ListRunsWithTelemetryPage{}, fmt.Errorf("store: list telemetry batch: %w", err)
+	}
+	defer rows.Close()
+	telemByRun := make(map[string]Telemetry, len(runsPage.Runs))
+	for rows.Next() {
+		var t Telemetry
+		if err := scanTelemetryInto(&t, rows); err != nil {
+			return ListRunsWithTelemetryPage{}, fmt.Errorf("store: scan telemetry: %w", err)
+		}
+		telemByRun[t.RunID] = t
+	}
+	if err := rows.Err(); err != nil {
+		return ListRunsWithTelemetryPage{}, fmt.Errorf("store: telemetry rows: %w", err)
+	}
+	out := make([]RunWithTelemetry, 0, len(runsPage.Runs))
+	for _, run := range runsPage.Runs {
+		out = append(out, RunWithTelemetry{
+			Run:       run,
+			Telemetry: telemByRun[run.ID],
+		})
+	}
+	return ListRunsWithTelemetryPage{Runs: out, NextCursor: runsPage.NextCursor}, nil
+}
+
+// scanTelemetryInto fills a *Telemetry from a row that
+// already has the run_id as the first column. The shape
+// matches the SELECT above.
+func scanTelemetryInto(t *Telemetry, r rowScanner) error {
+	var (
+		errPtr     sql.NullString
+		contType   sql.NullString
+		body       sql.NullString
+		requestID  sql.NullString
+		dur        sql.NullInt64
+		errCode    sql.NullInt64
+		provider   sql.NullString
+	)
+	if err := r.Scan(
+		&t.RunID, &t.Model, &provider,
+		&t.InputTokens, &t.OutputTokens, &t.TotalTokens,
+		&t.ReasoningTokens, &t.CacheReadTokens, &t.CacheWriteTokens,
+		&t.CostUSD, &t.CostPromptUSD, &t.CostCompletionUSD, &t.CostUpstreamUSD,
+		&t.IsByok,
+		&t.ServerToolCallsExec, &t.ServerToolCallsReq,
+		&requestID, &dur, &t.StepCount,
+		&errPtr, &errCode, &contType, &body,
+	); err != nil {
+		return err
+	}
+	t.Provider = provider.String
+	if requestID.Valid {
+		v := requestID.String
+		t.RequestID = &v
+	}
+	if dur.Valid {
+		v := dur.Int64
+		t.DurationMS = &v
+	}
+	if errPtr.Valid {
+		v := errPtr.String
+		t.Error = &v
+	}
+	if errCode.Valid {
+		v := errCode.Int64
+		t.ErrorStatusCode = &v
+	}
+	if contType.Valid {
+		v := contType.String
+		t.ErrorContentType = &v
+	}
+	if body.Valid {
+		v := body.String
+		t.ErrorBody = &v
+	}
+	return nil
 }
 
 // ListRuns returns runs ordered newest-first by (started_at, id).

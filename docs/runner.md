@@ -40,12 +40,13 @@ apps/runner/
 │       ├── classify.mjs           # PR classifier stub (QUB-94 sub-workflow)
 │       ├── experts.mjs            # multi-expert review (QUB-95), meta-review (QUB-96)
 │       ├── rtk.mjs                # rtk adapter (QUB-85) — readFile with rtk + raw fallback
+│       ├── tools.mjs              # agent tool set (PR #191): run_command, read_file, git_diff
 │       ├── workflow.mjs           # macro + sub-workflow executor
 │       └── github.mjs             # mintInstallationToken, postStatus, postReview, postInlineComments, cleanupPriorReview
 ├── rtk/
 │   ├── config.toml                # rtk runtime config (baked into the image)
 │   └── filters.toml               # boop custom filter (trusted at build time)
-├── package.json                   # @octokit/rest, @openrouter/sdk, jsonwebtoken
+├── package.json                   # @octokit/rest, @openrouter/agent, jsonwebtoken
 ├── Dockerfile                     # ubuntu 24.04, node 22, rtk 0.44.2, npm ci
 └── Makefile                       # install / build / docker
 ```
@@ -62,10 +63,10 @@ real `git`.
 | Package | Why |
 |---|---|
 | `@octokit/rest` | GitHub API: post/edit comments, post inline review comments, react. |
-| `@openrouter/sdk` | In-process OpenRouter chat completion. The runner builds the prompt and sends it through one `client.chat.send` call. |
+| `@openrouter/agent` | In-process OpenRouter Responses API via `callModel`. The runner drives the agent loop, auto-executes a tool set (`run_command`, `read_file`, `git_diff`) for the experts + narrator, and pins a bounded step count + the 25-min wall-clock timer so tool loops cannot eat the Job's 30-min ceiling. The walkthrough stays single-shot (no tools) — only the experts + narrator get the tool set. |
 | `jsonwebtoken` | Mint the App JWT for installation-token exchange. |
 
-Node 22 required (matches the `@openrouter/sdk` version's test matrix).
+Node 22 required (matches the `@openrouter/agent` version's test matrix).
 
 ## Environment
 
@@ -165,31 +166,52 @@ Shallow clone (50 commits), then a deep-enough fetch of the base ref and
 head SHA so the diff between them is reachable. The checkout puts the
 working tree at the PR head. Each step has a 5-min timeout.
 
-## OpenRouter SDK invocation
+## OpenRouter agent invocation
 
-The runner calls `@openrouter/sdk` in-process. One chat completion
-covers the whole review: the prompt is the assembled boop message,
-the model comes from `OPENROUTER_MODEL` (or a default the operator
-sets in the Job template), the API key is loaded from the mounted
-`boop-secrets` file at startup and passed via `env.OPENROUTER_API_KEY`.
+The runner calls `@openrouter/agent` in-process via `client.callModel`.
+The agent SDK runs on top of the OpenResponses API and gives the
+runner three things the pre-swap `chatSend` path lacked:
 
-The SDK is configured with the same 25-min hard-kill timer the
-runner has always used. The timer races the SDK call; on timeout,
-`AbortController.abort()` surfaces an `AbortError` and the runner
-treats it as a clean failure (`postStatus("failed", "openrouter run
-exceeded 25-min timeout")`).
+1. **Tool auto-execution.** The runner hands the agent a tool set
+   (`run_command`, `read_file`, `git_diff` — see `lib/tools.mjs`)
+   and the SDK loops the model through tool calls until the model
+   produces a text response or the step budget runs out. The
+   walkthrough stays single-shot (no tools); the experts and
+   narrator opt in.
+2. **Bounded step count.** `callModel({ ..., stopWhen:
+   stepCountIs(STEP_CAP) })` with `STEP_CAP = 10` keeps a runaway
+   agent from eating the 25-min wall-clock budget; the timer still
+   races the call as a hard kill.
+3. **Structured response access.** `result.getText()` returns the
+   final text after tool execution; `result.getResponse()` returns
+   the OpenResponses response (`{ id, model, output, usage }`) so
+   `extractUsage` can map the camelCase `Usage` shape into the
+   runner's snake_case telemetry contract.
+
+The model comes from `OPENROUTER_MODEL`; the API key is loaded
+from the mounted `boop-secrets` file at startup and passed via
+`env.OPENROUTER_API_KEY`. The 25-min hard-kill timer races the
+SDK call; on timeout, `AbortController.abort()` surfaces an
+`AbortError` and the runner treats it as a clean failure
+(`postStatus("failed", "openrouter run exceeded 25-min timeout")`).
 
 The SDK response carries the assistant text and the usage block
-(`prompt_tokens`, `completion_tokens`, `cost`, optional
-`cached_tokens` and `reasoning_tokens`). `buildTelemetry` rolls the
+(`inputTokens`, `outputTokens`, `totalTokens`, `cost`, optional
+`cachedTokens` and `reasoningTokens`). `buildTelemetry` rolls the
 SDK response into the runner's telemetry shape and the dashboard
 endpoint POSTs it on the runner's last status update.
 
-No subprocess. No PTY wrap. No env-scrub allowlist (the SDK is
-in-process, so a prompt-injected LLM that runs `env` sees the
-`{ OPENROUTER_API_KEY: <key> }` object the runner forwarded to it,
-which is the same surface a `cat .env` would reveal — the key has
-to be in the call regardless).
+No subprocess. No PTY wrap. The tool execute functions run in the
+runner process (uid 1000 in the K8s Job); the `run_command`
+guard denies network primitives and secret-mount references, and
+strips the runner's process env from the spawned shell (PATH +
+HOME + NODE_ENV only). The prompt's instruction hierarchy is the
+primary control against a prompt-injected LLM trying to exfil;
+the guard is the belt.
+
+The runner's prompt is the assembled boop message; the agent
+loops tool calls until it produces the final `=== SUMMARY === … ===
+END ===` block or the step budget runs out.
 
 ## Prompt construction (`buildBoopPrompt`)
 
@@ -347,7 +369,7 @@ Tests are granular — one file per module under `src/lib/`:
 - `src/lib/log.test.mjs` — `makeLogger` shape and JSON stamping.
 - `src/lib/security.test.mjs` — `assertSafeRef`, `assertSafeSha`, `shortSha`, `readSecretFile`.
 - `src/lib/git.test.mjs` — `createCleanupRegistry` (parallel + idempotent) and `cloneRepo` (with mock fs + execFile; verifies each git argv, env, and the netrc/gitconfig content).
-- `src/lib/openrouter.test.mjs` — `callOpenRouter` (fake client, success / 4xx / abort / no text / token mapping), `buildTelemetry` (success / failure stamp), `parseReviewOutput` (structure sanity check + the five 2026-08-03 failure shapes), `buildBoopPrompt` (mock fs; verifies H5 markers, lens ordering, frontmatter stripping, re-review vs first-review diff range, `stripOpenRouterPrefix`, and the QUB-85 rtk-adapter path), and `runOpenCodeSkill` (SDK branch happy path, SDK failure, AbortError).
+- `src/lib/openrouter.test.mjs` — `callOpenRouter` (fake `callModel` returning a ModelResult-shaped object, success / 4xx / abort / no text / token mapping for both OpenResponses `inputTokens`/`outputTokens` and the legacy ChatUsage `promptTokens`/`completionTokens` shapes), `buildTelemetry` (success / failure stamp), `parseReviewOutput` (structure sanity check + the five 2026-08-03 failure shapes), `buildBoopPrompt` (mock fs; verifies H5 markers, lens ordering, frontmatter stripping, re-review vs first-review diff range, `stripOpenRouterPrefix`, the QUB-85 rtk-adapter path, and the QUB-<next tools-enabled / tools-disabled "What you are receiving" variants), `runOpenCodeSkill` (agent branch happy path, SDK failure, AbortError, toolCount log line), and the `extractAssistantText` legacy chat-completion fallback.
 - `src/lib/rtk.test.mjs` — `createRtkAdapter` (QUB-85: BOOP_RTK_DISABLED bypass, missing-binary fallback, rtk CLI shape, per-call overrides, rtk-failure raw fallback, init memoisation, source getter, single-fallback-log, custom binary name).
 - `src/lib/github.test.mjs` — `mintInstallationToken`, `postStatus`, `postReview`, `postInlineComments` (parallel + partial failures), `cleanupPriorReview` (parallel fetches + pagination + error counting).
 

@@ -19,6 +19,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	boopgithub "github.com/michaelruelas/boop-receiver/internal/github"
+	"github.com/michaelruelas/boop-receiver/internal/store"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -164,10 +165,15 @@ func TestBuildJobName(t *testing.T) {
 }
 
 func TestShortSHA(t *testing.T) {
-	if got := shortSHA("abc1234567890"); got != "abc1234" {
+	// RD-002: shortSHA used to live in this package as
+	// an unexported helper; the canonical version is now
+	// store.ShortSHA. The test pins the contract from
+	// the canonical side; the webhook shim is a thin
+	// pass-through.
+	if got := store.ShortSHA("abc1234567890"); got != "abc1234" {
 		t.Errorf("shortSHA long = %q, want abc1234", got)
 	}
-	if got := shortSHA("abc"); got != "abc" {
+	if got := store.ShortSHA("abc"); got != "abc" {
 		t.Errorf("shortSHA short = %q, want abc", got)
 	}
 }

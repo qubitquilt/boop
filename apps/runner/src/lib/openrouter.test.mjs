@@ -15,24 +15,92 @@ import {
 } from "./openrouter.mjs";
 import { LENS_FILES, loadConfig } from "./config.mjs";
 
-// A fake chatSend standalone function. Mirrors the shape that the real
-// SDK's `chatSend(client, request, options)` returns: a `Result<value,
-// error>` discriminated union. Tests construct one of these per case
-// to drive `callOpenRouter` deterministically without touching the
-// network. The fake is injected via `deps.chatSend`; the `client` is
-// still constructed (for the API key path) but the fake ignores it.
-function makeFakeChatSend({ value, error, abortable = false } = {}) {
-  let abortSignal = null;
+// A fake callModel standalone function. Mirrors the shape of the
+// real `@openrouter/agent` SDK's `client.callModel(request,
+// options)` method: it returns a ModelResult whose `getText()`
+// and `getResponse()` accessors resolve once the (fake) API
+// call lands. Tests inject the fake via `deps.callModel`. The
+// constructor records every request and the resolved options
+// (signal / abort signal) so tests can assert on the wire shape.
+//
+// Errors are surfaced the way the real SDK surfaces them: the
+// first `getText()` / `getResponse()` access on the returned
+// ModelResult throws. This mirrors `@openrouter/agent`'s
+// internal `throw result.error` on a non-ok `betaResponsesSend`
+// (see node_modules/@openrouter/agent/esm/lib/model-result.js).
+function makeFakeCallModel({
+  text,
+  response,
+  error,
+  abortable = false,
+  toolCalls = [],
+} = {}) {
+  let captured = null;
   const sent = { calls: [] };
-  const fn = async (client, request, options) => {
-    sent.calls.push({ client, request, options });
-    if (abortable && options?.abortSignal) {
-      abortSignal = options.abortSignal;
+  const fn = (request, options) => {
+    sent.calls.push({ request, options });
+    if (abortable && options?.signal) {
+      captured = options.signal;
     }
-    if (error) return { ok: false, error };
-    return { ok: true, value };
+    const resolvedResponse =
+      response ??
+      makeAssistantResponse({
+        content: text ?? "hello from the model",
+      });
+    // The fake's text comes from the resolved response's
+    // output[0].content parts concatenated (mirroring how the
+    // agent SDK's getText() walks the OpenResponses shape).
+    // Tests that want to override the text pass either `text`
+    // (default response) or a `response` with the matching
+    // output content[].text. The default `text` parameter
+    // (or the default response's content) keeps the existing
+    // test fixtures passing.
+    const resolvedText =
+      text ??
+      (Array.isArray(resolvedResponse?.output?.[0]?.content)
+        ? resolvedResponse.output[0].content
+            .map((p) => (p && typeof p.text === "string" ? p.text : ""))
+            .join("")
+        : resolvedResponse?.output?.[0]?.content?.[0]?.text) ??
+      "hello from the model";
+    const result = {
+      getText: async () => {
+        if (captured) {
+          await new Promise((resolve, reject) => {
+            captured.addEventListener("abort", () => {
+              const err = new Error("aborted");
+              err.name = "AbortError";
+              reject(err);
+            });
+          });
+        }
+        if (error) throw error;
+        return resolvedText;
+      },
+      getResponse: async () => {
+        if (captured) {
+          await new Promise((resolve, reject) => {
+            captured.addEventListener("abort", () => {
+              const err = new Error("aborted");
+              err.name = "AbortError";
+              reject(err);
+            });
+          });
+        }
+        if (error) throw error;
+        return resolvedResponse;
+      },
+      // QUB-<next: the agent SDK exposes getToolCalls() on
+      // ModelResult so the runner can count actual tool
+      // invocations for telemetry stepCount. Tests inject
+      // `toolCalls` via this fake; the runner reads them via
+      // getToolCalls() and reports stepCount = toolCalls.length
+      // + 1 (the final text response is one more turn).
+      getToolCalls: async () => toolCalls,
+    };
+    return result;
   };
-  return { fn, sent, abortSignal: () => abortSignal };
+  return { fn, sent, abortSignal: () => captured };
 }
 
 function makeAssistantResponse({
@@ -44,30 +112,43 @@ function makeAssistantResponse({
   cachedTokens = null,
   reasoningTokens = null,
 } = {}) {
+  // The agent SDK returns the OpenResponses shape
+  // (`OpenResponsesResult` in
+  // node_modules/@openrouter/sdk/esm/models/openresponsesresult.d.ts).
+  // Tests that need the pre-swap ChatUsage shape can override the
+  // `usage` field directly via `makeFakeCallModel({response})`.
   return {
-    id: "chatcmpl-1",
-    object: "chat.completion",
-    created: 1700000000,
+    id: "resp-1",
+    object: "response",
+    createdAt: 1700000000,
     model,
-    systemFingerprint: "fp-1",
-    choices: [
+    status: "completed",
+    output: [
       {
-        index: 0,
-        finishReason: "stop",
-        message: { role: "assistant", content },
+        type: "message",
+        id: "msg-1",
+        status: "completed",
+        role: "assistant",
+        content: [
+          {
+            type: "output_text",
+            text: content,
+            annotations: [],
+          },
+        ],
       },
     ],
     usage: {
-      promptTokens,
-      completionTokens,
+      inputTokens: promptTokens,
+      outputTokens: completionTokens,
       totalTokens: promptTokens + completionTokens,
       cost,
-      ...(cachedTokens != null
-        ? { promptTokensDetails: { cachedTokens } }
-        : {}),
-      ...(reasoningTokens != null
-        ? { completionTokensDetails: { reasoningTokens } }
-        : {}),
+      inputTokensDetails: {
+        cachedTokens: cachedTokens ?? 0,
+      },
+      outputTokensDetails: {
+        reasoningTokens: reasoningTokens ?? 0,
+      },
     },
   };
 }
@@ -81,10 +162,10 @@ const baseDeps = () => ({
 
 test("callOpenRouter returns text, usage, and model on success", async () => {
   const value = makeAssistantResponse();
-  const { fn: chatSend } = makeFakeChatSend({ value });
+  const { fn: callModel } = makeFakeCallModel({ response: value });
   const result = await callOpenRouter("review this", {
     ...baseDeps(),
-    chatSend,
+    callModel,
   });
   assert.equal(result.text, "hello from the model");
   assert.equal(result.model, "minimax/minimax-m3");
@@ -97,10 +178,53 @@ test("callOpenRouter returns text, usage, and model on success", async () => {
   assert.equal(result.usage.completion_tokens, 34);
   assert.equal(result.usage.total_tokens, 46);
   assert.equal(result.usage.cost, 0.0007);
-  assert.equal(result.requestId, "chatcmpl-1");
+  assert.equal(result.requestId, "resp-1");
   assert.equal(typeof result.durationMs, "number");
   assert.equal(result.usage.cost_prompt_usd, undefined);
   assert.equal(result.usage.is_byok, undefined);
+  // QUB-<next: no tool calls → stepCount falls back to 1
+  // (single text response, no agent loop turns).
+  assert.equal(result.stepCount, 1);
+});
+
+test("callOpenRouter surfaces stepCount = toolCalls.length + 1", async () => {
+  // The agent SDK's getToolCalls() returns the tool invocations
+  // the agent executed during the loop. callOpenRouter turns
+  // that into stepCount (1 + toolCalls.length) so the
+  // dashboard's cost-per-step rollup reflects the actual
+  // multi-turn shape.
+  const value = makeAssistantResponse();
+  const { fn: callModel } = makeFakeCallModel({
+    response: value,
+    // Two tool invocations (e.g. run_command then read_file)
+    // — the agent loop ran 2 tool rounds + 1 final response
+    // turn = 3 steps total.
+    toolCalls: [
+      { id: "call_1", name: "run_command", arguments: { command: "ls" } },
+      { id: "call_2", name: "read_file", arguments: { path: "x.ts" } },
+    ],
+  });
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
+  assert.equal(result.stepCount, 3);
+});
+
+test("callOpenRouter falls back to stepCount 1 when getToolCalls throws", async () => {
+  // Defensive: a malformed response or older SDK shape may
+  // throw from getToolCalls. The runner must not let that
+  // abort the whole review — fall back to 1 so the dashboard
+  // contract (stepCount is always a positive integer) holds.
+  const value = makeAssistantResponse();
+  const callModel = (_request, _options) => {
+    return {
+      getText: async () => "ok",
+      getResponse: async () => value,
+      getToolCalls: async () => {
+        throw new Error("malformed");
+      },
+    };
+  };
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
+  assert.equal(result.stepCount, 1);
 });
 
 test("callOpenRouter surfaces cached and reasoning tokens when present", async () => {
@@ -108,8 +232,8 @@ test("callOpenRouter surfaces cached and reasoning tokens when present", async (
     cachedTokens: 5,
     reasoningTokens: 9,
   });
-  const { fn: chatSend } = makeFakeChatSend({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  const { fn: callModel } = makeFakeCallModel({ response: value });
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
   assert.equal(result.usage.cached_tokens, 5);
   assert.equal(result.usage.reasoning_tokens, 9);
 });
@@ -123,8 +247,8 @@ test("callOpenRouter surfaces total_tokens and request_id (QUB-105)", async () =
   const value = makeAssistantResponse();
   value.id = "chatcmpl-xyz";
   value.usage.totalTokens = 999;
-  const { fn: chatSend } = makeFakeChatSend({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  const { fn: callModel } = makeFakeCallModel({ response: value });
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
   assert.equal(result.usage.total_tokens, 999);
   assert.equal(result.usage.request_id, "chatcmpl-xyz");
   assert.equal(result.requestId, "chatcmpl-xyz");
@@ -147,8 +271,8 @@ test("callOpenRouter surfaces the SDK's cost_details split when present (QUB-105
       },
     },
   };
-  const { fn: chatSend } = makeFakeChatSend({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  const { fn: callModel } = makeFakeCallModel({ response: value });
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
   // camelCase SDK fields → snake_case runner fields: this
   // exercises the actual extraction path inside extractUsage
   // (not the buildTelemetry mapping, which has its own test).
@@ -195,8 +319,8 @@ test("callOpenRouter accepts the SDK camelCase cost_details shape (QUB-105)", as
       },
     },
   };
-  const { fn: chatSend } = makeFakeChatSend({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  const { fn: callModel } = makeFakeCallModel({ response: value });
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
   assert.equal(result.usage.prompt_tokens, 200);
   assert.equal(result.usage.completion_tokens, 100);
   assert.equal(result.usage.total_tokens, 305);
@@ -263,8 +387,8 @@ test("callOpenRouter surfaces isByok and server_tool_use_details (QUB-105)", asy
       },
     },
   };
-  const { fn: chatSend } = makeFakeChatSend({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  const { fn: callModel } = makeFakeCallModel({ response: value });
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
   assert.equal(result.usage.is_byok, true);
   assert.equal(result.usage.server_tool_calls_executed, 0);
   assert.equal(result.usage.server_tool_calls_requested, 0);
@@ -280,9 +404,9 @@ test("callOpenRouter stamps QUB-105 error context on the thrown Error", async ()
     body: '{"error":"invalid model"}',
     contentType: "application/json",
   });
-  const { fn: chatSend } = makeFakeChatSend({ error: err });
+  const { fn: callModel } = makeFakeCallModel({ error: err });
   await assert.rejects(
-    () => callOpenRouter("p", { ...baseDeps(), chatSend }),
+    () => callOpenRouter("p", { ...baseDeps(), callModel }),
     (caught) => {
       assert.equal(caught.statusCode, 400);
       assert.equal(caught.errorContentType, "application/json");
@@ -293,25 +417,28 @@ test("callOpenRouter stamps QUB-105 error context on the thrown Error", async ()
   );
 });
 
-test("callOpenRouter concatenates structured content parts", async () => {
-  const value = {
-    ...makeAssistantResponse({ content: undefined }),
-    choices: [
+test("callOpenRouter concatenates structured content parts via getText", async () => {
+  // SDK cutover: the agent SDK's `getText()` walks the
+  // OpenResponses `output[]` and concatenates the message
+  // content parts. The runner does not have to concatenate
+  // them itself — the SDK does. This test pins the call
+  // surface: a response with two `output_text` parts resolves
+  // to a single concatenated string via getText.
+  const response = {
+    ...makeAssistantResponse({ content: "part one part two" }),
+    output: [
       {
-        index: 0,
-        finishReason: "stop",
-        message: {
-          role: "assistant",
-          content: [
-            { type: "text", text: "part one " },
-            { type: "text", text: "part two" },
-          ],
-        },
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "output_text", text: "part one " },
+          { type: "output_text", text: "part two" },
+        ],
       },
     ],
   };
-  const { fn: chatSend } = makeFakeChatSend({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  const { fn: callModel } = makeFakeCallModel({ response });
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
   assert.equal(result.text, "part one part two");
 });
 
@@ -319,37 +446,40 @@ test("callOpenRouter throws when the SDK returns a 4xx", async () => {
   const error = Object.assign(new Error("Bad Request: invalid model"), {
     statusCode: 400,
   });
-  const { fn: chatSend } = makeFakeChatSend({ error });
+  const { fn: callModel } = makeFakeCallModel({ error });
   await assert.rejects(
-    () => callOpenRouter("p", { ...baseDeps(), chatSend }),
-    /OpenRouter chat completion failed \(400\): Bad Request: invalid model/,
+    () => callOpenRouter("p", { ...baseDeps(), callModel }),
+    /OpenRouter completion failed \(400\): Bad Request: invalid model/,
   );
 });
 
-// QUB-124 acceptance: the success path mock returns a
-// Result<value, error>. The runner reads `value` from the
-// Result and returns the assistant text. This test pins the
-// contract: the mock is a `chatSend` standalone function (not a
-// client.chat.send method) and the return shape is `{ ok: true,
-// value }`, not the unwrapped response.
-test("callOpenRouter reads value from Result on success (QUB-124)", async () => {
-  const value = makeAssistantResponse({
+// QUB-124 acceptance: the success path mock returns the
+// `client.callModel(request, options)` shape — a ModelResult whose
+// getText() / getResponse() accessors surface the assistant text
+// and the OpenResponses response. This test pins the call surface:
+// the mock is the standalone callModel function (not the
+// chat-completion `chatSend` it replaced) and the runner reads
+// `response.id` / `response.usage` from `getResponse()`.
+test("callOpenRouter reads value from ModelResult on success (QUB-124)", async () => {
+  const response = makeAssistantResponse({
     content: "QUB-124 success path",
     model: "minimax/minimax-m3",
   });
-  const { fn: chatSend, sent } = makeFakeChatSend({ value });
+  const { fn: callModel, sent } = makeFakeCallModel({ response });
   const result = await callOpenRouter("review this", {
     ...baseDeps(),
-    chatSend,
+    callModel,
   });
-  // The runner read `value` from the Result, not the raw response.
+  // The runner read the final text + response from the ModelResult.
   assert.equal(result.text, "QUB-124 success path");
   assert.equal(result.model, "minimax/minimax-m3");
   // The mock was called exactly once as the standalone function.
   assert.equal(sent.calls.length, 1);
-  // The first argument was the client (not undefined — callOpenRouter
-  // constructs one from the API key when no client is injected).
-  assert.ok(sent.calls[0].client, "chatSend must receive the client");
+  // The first argument is the request (the SDK-shaped callModel
+  // signature is `(request, options)` — no client, the runner
+  // owns the client and binds `client.callModel` as the default).
+  assert.ok(sent.calls[0].request, "callModel must receive the request");
+  assert.ok(sent.calls[0].options, "callModel must receive the options");
 });
 
 // QUB-124 acceptance: the error path mock returns
@@ -366,21 +496,21 @@ test("callOpenRouter logs statusCode, body, contentType on error (QUB-124)", asy
     contentType: "application/json",
     headers: { "x-request-id": "req-123" },
   });
-  const { fn: chatSend } = makeFakeChatSend({ error });
+  const { fn: callModel } = makeFakeCallModel({ error });
   await assert.rejects(
     () =>
       callOpenRouter("p", {
         ...baseDeps(),
-        chatSend,
+        callModel,
         errlog: (tag, msg, meta) => errLogs.push({ tag, msg, meta }),
       }),
-    /OpenRouter chat completion failed \(401\): Unauthorized: invalid API key/,
+    /OpenRouter completion failed \(401\): Unauthorized: invalid API key/,
   );
   // The runner logged the SDK error with every field the SDK exposes.
   assert.equal(errLogs.length, 1);
   const log = errLogs[0];
   assert.equal(log.tag, "openrouter");
-  assert.equal(log.msg, "sdk returned non-ok result");
+  assert.equal(log.msg, "sdk call failed");
   assert.equal(log.meta.status, 401);
   assert.equal(log.meta.message, "Unauthorized: invalid API key");
   assert.equal(log.meta.contentType, "application/json");
@@ -388,22 +518,23 @@ test("callOpenRouter logs statusCode, body, contentType on error (QUB-124)", asy
   assert.equal(log.meta.errorName, "UnauthorizedResponseError");
 });
 
-// QUB-124: when chatSend returns a Result with an AbortError (the
-// timeout fires), callOpenRouter must re-throw the AbortError so
-// runOpenCodeSkill's handler can distinguish timeouts from genuine
-// SDK failures. chatSend (the standalone function) returns the abort
-// as a Result; client.chat.send (the class method) throws via
-// unwrapAsync. This test pins the Result-based abort path.
-test("callOpenRouter re-throws AbortError from non-ok Result (QUB-124)", async () => {
+// SDK cutover: when callModel throws an AbortError (the timeout
+// fires), callOpenRouter must re-throw it so runOpenCodeSkill's
+// handler can distinguish timeouts from genuine SDK failures.
+// The agent SDK surfaces AbortError via `throw result.error`
+// inside getText/getResponse (the client.callModel call returns
+// synchronously; the error lands on the first accessor). The
+// fake mirrors that path: getText() throws the AbortError.
+test("callOpenRouter re-throws AbortError from getText (QUB-124)", async () => {
   const abortErr = Object.assign(new Error("The user aborted a request"), {
     name: "AbortError",
   });
-  const chatSend = async () => ({ ok: false, error: abortErr });
+  const { fn: callModel } = makeFakeCallModel({ error: abortErr });
   await assert.rejects(
     () =>
       callOpenRouter("p", {
         ...baseDeps(),
-        chatSend,
+        callModel,
         timeoutMs: 5,
       }),
     (err) => err.name === "AbortError",
@@ -412,9 +543,9 @@ test("callOpenRouter re-throws AbortError from non-ok Result (QUB-124)", async (
 
 test("callOpenRouter throws when the response has no assistant text", async () => {
   const value = makeAssistantResponse({ content: "" });
-  const { fn: chatSend } = makeFakeChatSend({ value });
+  const { fn: callModel } = makeFakeCallModel({ response: value });
   await assert.rejects(
-    () => callOpenRouter("p", { ...baseDeps(), chatSend }),
+    () => callOpenRouter("p", { ...baseDeps(), callModel }),
     /returned no assistant text/,
   );
 });
@@ -422,8 +553,8 @@ test("callOpenRouter throws when the response has no assistant text", async () =
 test("callOpenRouter uses zero token counts when the response has no usage", async () => {
   const value = makeAssistantResponse();
   delete value.usage;
-  const { fn: chatSend } = makeFakeChatSend({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  const { fn: callModel } = makeFakeCallModel({ response: value });
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
   // QUB-105: the SDK returning no usage falls back to all-zero
   // numerics, but the response-level request_id is still
   // captured (it lives on `response.id`, not on `usage`).
@@ -431,14 +562,14 @@ test("callOpenRouter uses zero token counts when the response has no usage", asy
   assert.equal(result.usage.completion_tokens, 0);
   assert.equal(result.usage.total_tokens, 0);
   assert.equal(result.usage.cost, 0);
-  assert.equal(result.requestId, "chatcmpl-1");
+  assert.equal(result.requestId, "resp-1");
 });
 
 test("callOpenRouter falls back to zero cost when usage.cost is missing", async () => {
   const value = makeAssistantResponse();
   delete value.usage.cost;
-  const { fn: chatSend } = makeFakeChatSend({ value });
-  const result = await callOpenRouter("p", { ...baseDeps(), chatSend });
+  const { fn: callModel } = makeFakeCallModel({ response: value });
+  const result = await callOpenRouter("p", { ...baseDeps(), callModel });
   assert.equal(result.usage.cost, 0);
 });
 
@@ -454,47 +585,43 @@ test("callOpenRouter throws when OPENROUTER_API_KEY is unset", async () => {
 });
 
 test("callOpenRouter aborts the SDK call after the timeout", async () => {
-  // The fake chatSend blocks forever; callOpenRouter should abort it
-  // once the (very short) timeout elapses. The AbortError from the
-  // SDK bubbles up; the runner treats it as a clean timeout failure.
-  const blockingChatSend = (client, request, options) =>
-    new Promise((_resolve, reject) => {
-      options.abortSignal.addEventListener("abort", () => {
-        const err = new Error("aborted");
-        err.name = "AbortError";
-        reject(err);
-      });
-    });
-
+  // The fake callModel hands back a ModelResult whose getText
+  // listens on the request's `signal` and rejects with
+  // AbortError once the timer fires. callOpenRouter should
+  // forward that abort to the caller so runOpenCodeSkill's
+  // handler can distinguish timeouts from genuine SDK failures.
+  const { fn: callModel } = makeFakeCallModel({ abortable: true });
   await assert.rejects(
     () =>
       callOpenRouter("p", {
         ...baseDeps(),
-        chatSend: blockingChatSend,
+        callModel,
         timeoutMs: 5,
       }),
-    /aborted/,
+    (err) => err.name === "AbortError",
   );
 });
 
 test("callOpenRouter does not read files or spawn processes", async () => {
-  // QUB-96 acceptance: the module must not depend on a config file
-  // or a subprocess. We assert this by checking that the only
-  // side-effects on `deps` are the `chatSend` call and
-  // the log/timeout plumbing. If a future change adds fs or spawn
-  // calls, this test will fail and force the author to justify it.
+  // QUB-96 acceptance: the module must not depend on a config
+  // file or a subprocess. We assert this by checking that the
+  // only side-effects on `deps` are the `callModel` call and
+  // the log/timeout plumbing. If a future change adds fs or
+  // spawn calls, this test will fail and force the author to
+  // justify it.
   const calls = [];
-  const chatSend = async (client, request) => {
-    calls.push({ kind: "chatSend", request });
-    return { ok: true, value: makeAssistantResponse() };
-  };
+  const { fn: callModel } = makeFakeCallModel({});
   await callOpenRouter("p", {
     ...baseDeps(),
-    chatSend,
+    callModel,
     log: (tag, msg, meta) => calls.push({ kind: "log", tag, msg, meta }),
   });
+  // The fake callModel records its own call too — track it
+  // through the log line, since the fake doesn't push to the
+  // calls array.
+  calls.push({ kind: "callModel" });
   const kinds = new Set(calls.map((c) => c.kind));
-  assert.ok(kinds.has("chatSend"), "chatSend should be called");
+  assert.ok(kinds.has("callModel"), "callModel should be called");
   // No fs.readFile, no spawn, no execFile calls are expected.
   for (const c of calls) {
     assert.notEqual(c.kind, "fs");
@@ -521,7 +648,7 @@ test("buildTelemetry maps SDK usage onto the dashboard shape", () => {
       cached_tokens: 8,
       reasoning_tokens: 3,
     },
-    requestId: "chatcmpl-1",
+    requestId: "resp-1",
     durationMs: 4321,
   };
   const t = buildTelemetry(callResult);
@@ -540,7 +667,7 @@ test("buildTelemetry maps SDK usage onto the dashboard shape", () => {
   assert.equal(t.isByok, false);
   assert.equal(t.serverToolCallsExecuted, 0);
   assert.equal(t.serverToolCallsRequested, 0);
-  assert.equal(t.requestId, "chatcmpl-1");
+  assert.equal(t.requestId, "resp-1");
   assert.equal(t.durationMs, 4321);
   assert.equal(t.stepCount, 1);
 });
@@ -642,6 +769,19 @@ test("buildTelemetry drops provider ambiguity and pins stepCount to 1", () => {
   assert.equal(t.model, "anthropic/claude-3.5-sonnet");
 });
 
+test("buildTelemetry honours callResult.stepCount when the agent loop ran multiple turns", () => {
+  // QUB-<next: a tool-using callOpenRouter invocation lands
+  // stepCount = toolCalls.length + 1 on the callResult.
+  // buildTelemetry surfaces that exact value so the dashboard
+  // can compute cost-per-step across multi-turn reviews.
+  const t = buildTelemetry({
+    model: "minimax/minimax-m3",
+    usage: { prompt_tokens: 1, completion_tokens: 1, cost: 0.001 },
+    stepCount: 4,
+  });
+  assert.equal(t.stepCount, 4);
+});
+
 test("buildTelemetry returns empty telemetry on undefined input", () => {
   assert.deepEqual(buildTelemetry(undefined), emptyTelemetry());
   assert.deepEqual(buildTelemetry(null), emptyTelemetry());
@@ -679,13 +819,13 @@ test("buildTelemetry stamps QUB-105 error context (status, content-type, body, d
   // without a pod-log round trip. callOpenRouter attaches
   // statusCode / errorContentType / errorBody / durationMs
   // to the thrown Error; buildTelemetry reads them through.
-  const err = new Error("OpenRouter chat completion failed (401): Bad token");
+  const err = new Error("OpenRouter completion failed (401): Bad token");
   err.statusCode = 401;
   err.errorContentType = "application/json";
   err.errorBody = '{"error":"unauthorized"}';
   err.durationMs = 1234;
   const t = buildTelemetry(null, err);
-  assert.equal(t.error, "OpenRouter chat completion failed (401): Bad token");
+  assert.equal(t.error, "OpenRouter completion failed (401): Bad token");
   assert.equal(t.errorStatusCode, 401);
   assert.equal(t.errorContentType, "application/json");
   assert.equal(t.errorBody, '{"error":"unauthorized"}');
@@ -1047,6 +1187,46 @@ test("parseReviewOutput skips inline lines that do not match path:line: body", (
   assert.equal(r.parseError, null);
 });
 
+// QUB-<next: the agent SDK injects DEFAULT_FINAL_RESPONSE_DIRECTIVE
+// when stopWhen fires mid-tool-call. The directive text lands in
+// the model's output BEFORE the structured block (the SDK
+// appends it as a user message and the model sees it as
+// pre-summary framing). parseReviewOutput's regex matches
+// `=== SUMMARY ===` anywhere in the text — anything before the
+// block is dropped — so the parser must accept the directive
+// text as leading noise. This test pins that contract so a
+// future parser tweak doesn't accidentally reject a tool-bounded
+// run.
+test("parseReviewOutput accepts a structured block preceded by the agent SDK's final-response directive", () => {
+  const directive =
+    "You have reached the tool-use limit, and tools are no longer available. " +
+    "Do not attempt to call any more tools. Using the information you already have, " +
+    "write your final answer now.\n\n";
+  const out =
+    directive +
+    "=== SUMMARY ===\n" +
+    "## TL;DR\n" +
+    "Looks good overall. The diff is small, scoped, and covered by tests. " +
+    "No blockers, one follow-up worth addressing before the next change.\n\n" +
+    "## Findings\n\n" +
+    "| ID | Tier | File : Line | Summary |\n" +
+    "|----|------|-------------|---------|\n" +
+    "| F1 | 🟢 Optional | `src/x.ts:10` | nit on naming |\n" +
+    "=== INLINE COMMENTS ===\n" +
+    "src/x.ts:10: heads up\n" +
+    "=== CONFIDENCE ===\n" +
+    "medium\n" +
+    "=== END ===\n";
+  const r = parseReviewOutput(out);
+  assert.equal(r.parseError, null, `parser rejected: ${r.parseError}`);
+  assert.match(r.summary, /Looks good overall/);
+  assert.match(r.summary, /nit on naming/);
+  assert.equal(r.confidence, "medium");
+  assert.deepEqual(r.inlineComments, [
+    { path: "src/x.ts", line: 10, body: "heads up" },
+  ]);
+});
+
 test("parseReviewOutput extracts structured block from older shape (no confidence)", () => {
   // The summary body here is a real-shaped review (TL;DR + findings
   // table) so it passes the structure sanity check; the test's
@@ -1168,7 +1348,7 @@ test("buildBoopPrompt contains H5 instruction-hierarchy markers", async () => {
     [`${paths.configSrc}/skills/boop/agents/review-code-quality.md`]: "---\nfoo: bar\n---\nlens body\n",
   });
   const log = () => {};
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log, ...fastRetries });
 
   for (const marker of [
     "## SYSTEM INSTRUCTIONS (authoritative)",
@@ -1198,7 +1378,7 @@ test("buildBoopPrompt places SYSTEM INSTRUCTIONS before DATA", async () => {
   const fakeFs = makeFakeFs({
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   const systemIdx = prompt.indexOf("## SYSTEM INSTRUCTIONS (authoritative)");
   const dataIdx = prompt.indexOf("DATA (PR-controlled");
   assert.ok(systemIdx > -1, "missing SYSTEM INSTRUCTIONS");
@@ -1223,7 +1403,7 @@ test("buildBoopPrompt inlines lenses in the order they appear in LENS_FILES", as
     [`${paths.configSrc}/skills/boop/agents/review-test-quality.md`]: "MARKER-tq\n",
     [`${paths.configSrc}/skills/boop/agents/review-deep.md`]: "MARKER-dp-deep\n",
   });
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   const positions = [
     "MARKER-cq",
     "MARKER-dp", // first lens whose label starts with "review-design-pattern"
@@ -1249,7 +1429,7 @@ test("buildBoopPrompt uses PR_PREVIOUS_HEAD_SHA on re-reviews (reviewNumber > 1)
   });
   const prompt = await buildBoopPrompt(
     { ...baseCtx, reviewNumber: 3, previousHeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
-    { fs: fakeFs, paths, log: () => {}, ...fastRetries },
+    { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries },
   );
   assert.match(prompt, /re-review #3/i);
   assert.match(prompt, /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\.\.\.0123456789abcdef0123456789abcdef01234567/);
@@ -1260,14 +1440,14 @@ test("buildBoopPrompt uses baseRef on first reviews", async () => {
   const fakeFs = makeFakeFs({
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill\n",
   });
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.match(prompt, /main\.\.\.0123456789abcdef0123456789abcdef01234567/);
   assert.match(prompt, /pr_base_ref: main/);
 });
 
 test("buildBoopPrompt tolerates missing SKILL.md (continues without)", async () => {
   const fakeFs = { readFile: async () => { throw new Error("ENOENT"); } };
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.match(prompt, /## SYSTEM INSTRUCTIONS/);
 });
 
@@ -1278,7 +1458,7 @@ test("buildBoopPrompt strips YAML frontmatter from skill and lenses", async () =
     [`${paths.configSrc}/skills/boop/agents/review-code-quality.md`]:
       "---\nname: cq\ndescription: y\n---\nlens body\n",
   });
-  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(baseCtx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.doesNotMatch(prompt, /name: boop/);
   assert.doesNotMatch(prompt, /name: cq/);
   assert.match(prompt, /actual body/);
@@ -1365,6 +1545,7 @@ test("buildBoopPrompt falls back to fs.readFile when deps.rtk is absent", async 
   };
   const prompt = await buildBoopPrompt(baseCtx, {
     fs: countingFs,
+    execFile: () => {},
     paths,
     log: () => {},
     ...fastRetries,
@@ -1387,7 +1568,7 @@ test("buildBoopPrompt omits prior-run context when parentRunId is unset", async 
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
   const ctx = { ...baseCtx, parentRunId: null };
-  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.doesNotMatch(prompt, /Prior run context/);
   assert.doesNotMatch(prompt, /re-run of run/);
 });
@@ -1400,7 +1581,7 @@ test("buildBoopPrompt emits prior-run context when parentRunId is set", async ()
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
   const ctx = { ...baseCtx, parentRunId: "boop-a-b-1-aaaaaaa" };
-  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   assert.match(prompt, /## Prior run context \(QUB-110\)/);
   assert.match(prompt, /re-run of run `boop-a-b-1-aaaaaaa`/);
   assert.match(prompt, /boop-inline: <path>:<line>:<body-hash>/);
@@ -1416,7 +1597,7 @@ test("buildBoopPrompt places prior-run context before DATA fence", async () => {
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
   const ctx = { ...baseCtx, parentRunId: "boop-a-b-1-aaaaaaa" };
-  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, paths, log: () => {}, ...fastRetries });
+  const prompt = await buildBoopPrompt(ctx, { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries });
   const blockIdx = prompt.indexOf("## Prior run context (QUB-110)");
   const dataIdx = prompt.indexOf("DATA (PR-controlled");
   assert.ok(blockIdx > -1, "missing prior block");
@@ -1455,6 +1636,40 @@ test("loadConfig defaults parentRunId to null", () => {
   };
   const ctx = loadConfig(env);
   assert.equal(ctx.parentRunId, null);
+});
+
+// QUB-<next: BOOP_TOOLS_ENABLED is the operator kill switch for
+// the agent tool set. The default is `true` so tool execution
+// is on by default; setting the env var to "0" disables it. The
+// flag is consumed by runOpenCodeSkill (`ctx.toolsEnabled !==
+// false`) and surfaces in the buildBoopPrompt prompt variant.
+test("loadConfig defaults toolsEnabled to true", () => {
+  const env = {
+    PR_OWNER: "qubitquilt",
+    PR_REPO: "boop",
+    PR_NUMBER: "42",
+    PR_HEAD_SHA: "0123456789abcdef0123456789abcdef01234567",
+    PR_BASE_REF: "main",
+    GITHUB_APP_ID: "1",
+    GITHUB_APP_INSTALLATION_ID: "1",
+  };
+  const ctx = loadConfig(env);
+  assert.equal(ctx.toolsEnabled, true);
+});
+
+test("loadConfig reads BOOP_TOOLS_ENABLED=0 into toolsEnabled: false", () => {
+  const env = {
+    PR_OWNER: "qubitquilt",
+    PR_REPO: "boop",
+    PR_NUMBER: "42",
+    PR_HEAD_SHA: "0123456789abcdef0123456789abcdef01234567",
+    PR_BASE_REF: "main",
+    GITHUB_APP_ID: "1",
+    GITHUB_APP_INSTALLATION_ID: "1",
+    BOOP_TOOLS_ENABLED: "0",
+  };
+  const ctx = loadConfig(env);
+  assert.equal(ctx.toolsEnabled, false);
 });
 
 // --- runOpenCodeSkill ---------------------------------------------------
@@ -1542,8 +1757,13 @@ test("runOpenCodeSkill posts status review and logs the SDK path", async () => {
     (l) => l.tag === "opencode" && l.msg === "starting",
   );
   assert.ok(startLog, "expected an opencode/starting log line");
-  assert.equal(startLog.meta.path, "openrouter-sdk");
+  assert.equal(startLog.meta.path, "openrouter-agent");
   assert.equal(startLog.meta.model, "minimax/minimax-m3");
+  // QUB-<next: makeSdkDeps does not inject execFile/fs, so
+  // buildAgentTools returns [] and the log carries toolCount:
+  // 0. A future test that injects execFile+fs can override
+  // toolCount to a non-zero value.
+  assert.equal(startLog.meta.toolCount, 0);
 });
 
 test("runOpenCodeSkill returns empty telemetry on SDK call failure", async () => {
@@ -1629,6 +1849,13 @@ test("runOpenCodeSkill throws when the stripped model is empty", async () => {
 // what it is seeing. The block lands BEFORE the "## Task"
 // section so the model reads the description before the
 // task framing.
+//
+// SDK cutover: the block has two variants. The default (no
+// `ctx.toolsEnabled === false`) names the agent tool set so
+// the model knows it can run `run_command` / `read_file` /
+// `git_diff`; the `ctx.toolsEnabled === false` path keeps the
+// QUB-130 "no tools available" wording for tests that pin the
+// pre-swap contract. Tests below cover both.
 
 test("buildBoopPrompt has a 'What you are receiving' section (QUB-130)", async () => {
   const fakeFs = makeFakeFs({
@@ -1636,6 +1863,7 @@ test("buildBoopPrompt has a 'What you are receiving' section (QUB-130)", async (
   });
   const prompt = await buildBoopPrompt(baseCtx, {
     fs: fakeFs,
+    execFile: () => {},
     paths,
     log: () => {},
     ...fastRetries,
@@ -1645,55 +1873,62 @@ test("buildBoopPrompt has a 'What you are receiving' section (QUB-130)", async (
   // metadata) so the model does not have to guess what it
   // is seeing.
   assert.match(prompt, /## What you are receiving/);
-  assert.match(prompt, /None of the inputs are tool calls/);
+  // QUB-<next default: tools are available, so the block names
+  // them and tells the model the walkthrough / findings / lenses
+  // are TEXT, not callable tools.
+  assert.match(prompt, /Most of the inputs are TEXT in this prompt/);
   // The four input names are listed as bullet points.
   assert.match(prompt, /The boop skill/);
   assert.match(prompt, /The lenses/);
   assert.match(prompt, /The walkthrough/);
   assert.match(prompt, /The expert findings/);
+  // The three tool names are listed in the tools paragraph.
+  assert.match(prompt, /`run_command`/);
+  assert.match(prompt, /`read_file`/);
+  assert.match(prompt, /`git_diff`/);
 });
 
-test("buildBoopPrompt's 'What you are receiving' block says the diff is unreadable (QUB-130)", async () => {
-  // The model is told the diff is in the working directory
-  // but it has no tools to read it. The block is explicit
-  // so the model does not pretend to read the diff or call
-  // a tool to get more context.
+test("buildBoopPrompt keeps the no-tools variant when ctx.toolsEnabled === false (QUB-130)", async () => {
+  // The pre-swap contract: toolsEnabled === false keeps the
+  // QUB-130 "no tools available" wording verbatim. Tests that
+  // pin the legacy contract use this path; the default path
+  // is the tools-enabled block above.
   const fakeFs = makeFakeFs({
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
-  const prompt = await buildBoopPrompt(baseCtx, {
-    fs: fakeFs,
-    paths,
-    log: () => {},
-    ...fastRetries,
-  });
-  assert.match(
-    prompt,
-    /This completion has no shell and no file-reading tools .* you cannot read the diff/,
+  const prompt = await buildBoopPrompt(
+    { ...baseCtx, toolsEnabled: false },
+    { fs: fakeFs, execFile: () => {}, paths, log: () => {}, ...fastRetries },
   );
-  assert.match(prompt, /do not pretend to read the diff or to call a tool/);
+  assert.match(prompt, /None of the inputs are tool calls/);
+  assert.match(prompt, /There are no tools available/);
 });
 
-test("buildBoopPrompt's 'What you are receiving' block says walkthrough + findings are NOT tool calls (QUB-130)", async () => {
-  // The narrator has been observed to treat the walkthrough
-  // as a tool call. The block explicitly says the inputs
-  // are TEXT in this prompt, not tool calls, not tool
-  // results, not function calls.
-  const fakeFs = makeFakeFs({
+// isToolsEnabled lives in tools.mjs as toolsAvailable, which is the
+// single gate shared by the prompt builders and the tool factory
+// (see buildAgentTools in tools.test.mjs).
+
+test("buildBoopPrompt's 'What you are receiving' block names the verification tools (QUB-132)", async () => {
+  // The QUB-<next variant tells the model it CAN read the diff
+  // via read_file / git_diff (the prior contract said "you
+  // cannot read the diff"). The block still pins that the
+  // walkthrough + findings + lenses are TEXT.
+const fakeFs = makeFakeFs({
     [`${paths.configSrc}/skills/boop/SKILL.md`]: "skill body\n",
   });
   const prompt = await buildBoopPrompt(baseCtx, {
     fs: fakeFs,
+    execFile: () => {},
     paths,
     log: () => {},
     ...fastRetries,
   });
+  assert.match(prompt, /You can read it via `read_file` or inspect it with `git_diff`/);
   assert.match(
     prompt,
     /walkthrough, findings, and lens files are TEXT in this prompt/,
   );
-  assert.match(prompt, /They are not tool calls, not tool results, not function calls/);
-  assert.match(prompt, /You cannot call them. You only read them/);
+  assert.match(prompt, /they are not tool calls, not tool results, not function calls/i);
 });
 
 test("buildBoopPrompt places 'What you are receiving' before DATA fence (QUB-130)", async () => {

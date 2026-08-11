@@ -1,0 +1,39 @@
+{{define "title"}}Audit trail — Boop Dashboard{{end}}
+{{define "content"}}
+<h2>Audit trail</h2>
+<p>Every operator-initiated action lands here. The actor is a SHA-256 prefix of the auth token (stable per operator, non-reversible). The details column is the per-action JSON blob.</p>
+
+<form method="get" action="/dashboard/audit" class="toolbar">
+  <label for="limit">Limit</label>
+  <input type="text" id="limit" name="limit" value="{{.Limit}}" size="4">
+  <button type="submit">Apply</button>
+</form>
+
+{{if .Events}}
+<table>
+  <thead>
+    <tr>
+      <th>When</th>
+      <th>Action</th>
+      <th>Actor</th>
+      <th>Target</th>
+      <th>Details</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{range .Events}}
+    <tr>
+      <td>{{.OccurredAt}}</td>
+      <td><code>{{.Action}}</code></td>
+      <td><code>{{.Actor}}</code></td>
+      <td>{{if .TargetID}}<a href="/dashboard/runs/{{.TargetID}}">{{.TargetID}}</a>{{else}}<span class="muted">—</span>{{end}}</td>
+      <td><code class="meta">{{.Details}}</code></td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<div class="empty">No audit events yet. Operator-initiated actions (re-runs, install pauses, zero-out cost, mark-orphaned) will appear here.</div>
+{{end}}
+{{end}}
+{{template "layout.html" .}}

@@ -31,7 +31,6 @@ const baseCtx = {
   prBaseRef: "main",
   previousHeadSha: null,
   reviewNumber: 1,
-  isReReview: false,
   diffRange: "main...0123456789abcdef0123456789abcdef01234567",
   paths: { repoDir: "/work/repo" },
   // QUB-117: the walkthrough resolves the model name from
@@ -96,13 +95,15 @@ test("buildWalkthroughPrompt asks for a terse walkthrough with diff range", () =
 test("buildWalkthroughPrompt uses previousHeadSha on re-reviews", () => {
   const ctx = {
     ...baseCtx,
-    isReReview: true,
+    reviewNumber: 2,
     diffRange: null,
     previousHeadSha: "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
   };
   const prompt = buildWalkthroughPrompt(ctx, makeDeps(() => {}));
   // The re-review diff range is
-  // previousHeadSha...prHeadSha, not base...head.
+  // previousHeadSha...prHeadSha, not base...head. reviewRange
+  // (the shared resolver) keys off reviewNumber > 1 + a prior
+  // head, matching the ctx shape loadConfig produces.
   assert.match(
     prompt,
     /range: aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111\.\.\.0123456789abcdef/,

@@ -31,7 +31,12 @@
 // themselves are deterministic per call (no shared state
 // across retries), so re-attempts are safe.
 
-import { emptyTelemetry, stripOpenRouterPrefix } from "./openrouter.mjs";
+import {
+  callOpenRouter,
+  emptyTelemetry,
+  stripOpenRouterPrefix,
+} from "./openrouter.mjs";
+import { buildAgentTools, toolsAvailable } from "./tools.mjs";
 
 // pickExperts is the orchestrator. Maps a PR type to a
 // list of expert names. The default mapping is a starting
@@ -113,6 +118,12 @@ const EXPERT_TO_LENS = Object.fromEntries(
 // bullet per finding, no preamble.
 function buildExpertPrompt(name, ctx, deps, walkthrough) {
   const wt = walkthrough || "(walkthrough unavailable — read the diff directly)";
+  // toolsAvailable is the single source of truth for "should
+  // this prompt mention the tool set?". It mirrors
+  // buildAgentTools's gate (BOOP_TOOLS_ENABLED + deps readiness),
+  // so a future dep added to the factory shows up here
+  // automatically and the prompt + factory stay in lockstep.
+  const toolsOn = toolsAvailable(ctx, deps);
   return [
     "# Task",
     "",
@@ -137,6 +148,23 @@ function buildExpertPrompt(name, ctx, deps, walkthrough) {
     "```",
     "",
     "Read the diff. Apply your lens checklist. Report findings as JSON.",
+    ...(toolsOn
+      ? [
+          "",
+          "# Tools available for verification",
+          "",
+          "You have a small agent tool set for verification: `run_command` " +
+            "(run a shell command in the PR's working directory with a " +
+            "timeout + output cap — useful for running the PR's test suite), " +
+            "`read_file` (read a file inside the repo), and `git_diff` " +
+            "(run `git diff <range>` for a path). The tool guard rejects " +
+            "network primitives and references to the runner's secret mounts. " +
+            "Use these tools to verify a finding (e.g. confirm a test failure, " +
+            "ground a line number) before reporting it; do NOT emit raw tool-" +
+            "call JSON in your final response — the SDK runs tools natively " +
+            "and your final text must be the JSON findings object below.",
+        ]
+      : []),
     "",
     "# Output spec",
     "",
@@ -192,7 +220,15 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
       `expert "${name}" has no lens file mapped; update LENS_TO_EXPERT in lib/experts.mjs`,
     );
   }
-  const lensPath = `${ctx.paths?.configSrc || "/home/opencode/.config/opencode"}/skills/boop/agents/${lensFile}.md`;
+  // Resolve the skill-mount path. The runner wires `paths.configSrc`
+  // through `deps` (see index.mjs); `ctx` does not carry `paths`.
+  // Reading from `deps` makes the BOOP_CONFIG_SRC env override
+  // take effect (latent bug: pre-fix this read `ctx.paths.configSrc`,
+  // which is always undefined, so the fallback fired — the bug
+  // stayed invisible because the fallback path matches the K8s
+  // production mount).
+  const configSrc = deps?.paths?.configSrc || "/home/opencode/.config/opencode";
+  const lensPath = `${configSrc}/skills/boop/agents/${lensFile}.md`;
   // 2. Apply test override (deps.expertOverrides wins over
   // EXPERT_POOL; both beat the default LLM call).
   const override = deps.expertOverrides?.[name];
@@ -218,19 +254,28 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   // terse JSON, not a long review). 90s is enough for the
   // current model family.
   //
-  // The fallback matches the walkthrough pattern
-  // (walkthrough.mjs:128): tests inject a fake via
-  // deps.callOpenRouter; production resolves the real
-  // SDK call from openrouter.mjs. The multi-expert pipeline
-  // (QUB-95) inherited the deps contract but skipped the
-  // fallback here — the boop reviewer crashed with
-  // "deps.callOpenRouter is not a function" on every PR
+  // Tests inject a fake via deps.callOpenRouter; production
+  // defaults to the real SDK call imported above. The
+  // multi-expert pipeline (QUB-95) inherited the deps contract
+  // but skipped the fallback here — the boop reviewer crashed
+  // with "deps.callOpenRouter is not a function" on every PR
   // until this fallback landed.
   const EXPERT_TIMEOUT_MS = 90_000;
-  const callOpenRouter = deps.callOpenRouter || (await import("./openrouter.mjs")).callOpenRouter;
+  const callOpenRouterFn = deps.callOpenRouter || callOpenRouter;
+  // SDK cutover: the experts are the second call site that hands
+  // the reviewer the agent tool set. The test-quality / regression-
+  // hunter experts can run `npm test` / `bun test` to verify
+  // findings; the design-pattern / readability experts can use
+  // `read_file` / `git_diff` to ground line numbers. The walkthrough
+  // stays tool-free (no tools passed in walkthrough.mjs).
+  // buildAgentTools centralizes the toolsEnabled check + the
+  // deps-completeness check, so we just call it. It returns []
+  // when ctx.toolsEnabled === false (BOOP_TOOLS_ENABLED=0) OR
+  // when deps are missing.
+  const expertTools = buildAgentTools(ctx, deps);
   let callResult;
   try {
-    callResult = await callOpenRouter(userPrompt, {
+    callResult = await callOpenRouterFn(userPrompt, {
       ...deps,
       // QUB-117: the dispatch must forward a non-empty model
       // name to the SDK call. The single-LLM path resolves the
@@ -241,7 +286,14 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
       // expert dispatch with `callOpenRouter: model is required`.
       model: stripOpenRouterPrefix(ctx.openrouterModel),
       timeoutMs: EXPERT_TIMEOUT_MS,
-      system: lensBody, // the lens file as the system prompt
+      // SDK cutover: the lens body rides on the agent SDK's
+      // `instructions` field (callModel's system-prompt
+      // equivalent). Pre-swap, the chatSend path silently
+      // dropped `system`; the agent SDK actually honors it.
+      // Each expert gets its lens as the system prompt and the
+      // walkthrough + diff as the user message.
+      system: lensBody,
+      tools: expertTools,
     });
   } catch (err) {
     // A single expert failure rejects the dispatch; the

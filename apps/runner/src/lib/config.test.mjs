@@ -177,3 +177,52 @@ test("loadConfig parses BOOP_NO_STATUS_COMMENT=1", () => {
   const ctx = loadConfig({ ...validEnv, BOOP_NO_STATUS_COMMENT: "1" });
   assert.equal(ctx.noStatusComment, true);
 });
+
+// BOOP_TOOLS_ENABLED is the operator kill switch for
+// the agent tool set. Default `true` so tool execution is on
+// by default; setting the env var to "0" disables it. The flag
+// is read once at loadConfig and threaded through to the
+// runOpenCodeSkill + experts paths via ctx.toolsEnabled.
+test("loadConfig defaults toolsEnabled to true", () => {
+  const ctx = loadConfig(validEnv);
+  assert.equal(ctx.toolsEnabled, true);
+});
+
+test("loadConfig reads BOOP_TOOLS_ENABLED=0 into toolsEnabled: false", () => {
+  const ctx = loadConfig({
+    ...validEnv,
+    BOOP_TOOLS_ENABLED: "0",
+  });
+  assert.equal(ctx.toolsEnabled, false);
+});
+
+// repoDir + configSrc flow through loadConfig like every other
+// config field (BOOP_REPO_DIR / BOOP_CONFIG_SRC env overrides for
+// local dev; defaults preserve the K8s production mounts). Unlike
+// the old module-level constants, tests vary them via the env
+// fixture instead of polluting process.env at import time.
+test("loadConfig defaults repoDir to /work/repo", () => {
+  const ctx = loadConfig(validEnv);
+  assert.equal(ctx.repoDir, "/work/repo");
+});
+
+test("loadConfig reads BOOP_REPO_DIR into repoDir", () => {
+  const ctx = loadConfig({
+    ...validEnv,
+    BOOP_REPO_DIR: "/tmp/repo",
+  });
+  assert.equal(ctx.repoDir, "/tmp/repo");
+});
+
+test("loadConfig defaults configSrc to /home/opencode/.config/opencode", () => {
+  const ctx = loadConfig(validEnv);
+  assert.equal(ctx.configSrc, "/home/opencode/.config/opencode");
+});
+
+test("loadConfig reads BOOP_CONFIG_SRC into configSrc", () => {
+  const ctx = loadConfig({
+    ...validEnv,
+    BOOP_CONFIG_SRC: "/tmp/config",
+  });
+  assert.equal(ctx.configSrc, "/tmp/config");
+});

@@ -13,15 +13,17 @@
 
 // --- paths ---------------------------------------------------------------
 
-export const REPO_DIR = "/work/repo";
-
-// Source of the read-only runner-config ConfigMap (boop-runner-config).
-// The runner reads skill files (SKILL.md + the seven lens files) from
-// this mount directly. QUB-98 dropped the opencode.json key from the
-// ConfigMap and the opencode CLI entirely; only the skill files mount
-// here now.
-export const CONFIG_SRC = "/home/opencode/.config/opencode";
-
+// QUB-<next> Option A local-run support: production runs on a
+// K8s Job that mounts the cloned repo at /work/repo and the
+// runner-config ConfigMap at /home/opencode/.config/opencode.
+// Both paths are sealed on macOS workstations, so the runner
+// accepts BOOP_REPO_DIR / BOOP_CONFIG_SRC env overrides for
+// local dev. Defaults preserve the production contract.
+//
+// repoDir / configSrc flow through loadConfig like every other
+// config field (they no longer read process.env at module load,
+// so tests vary them via the env fixture the same way they vary
+// PR_OWNER).
 export const NETRC_PATH = "/tmp/boop-netrc";
 export const GITCONFIG_PATH = "/tmp/boop-gitconfig";
 
@@ -60,8 +62,8 @@ export const SHORT = {
 };
 
 // Lens files inlined into the prompt. Order matches the order the
-// orchestrator tells the model to walk them. Read from the source
-// mount at ${CONFIG_SRC}/skills/boop/.
+// orchestrator tells the model to walk them. Read from the config
+// mount (ctx.configSrc)/skills/boop/.
 export const LENS_FILES = [
   "agents/review-code-quality.md",
   "agents/review-design-pattern.md",
@@ -101,6 +103,12 @@ export function loadConfig(env = process.env) {
     prHeadSha: env.PR_HEAD_SHA,
     prBaseRef: env.PR_BASE_REF,
     previousHeadSha: env.PR_PREVIOUS_HEAD_SHA || null,
+    // Local-run override (Option A): the clone mount and the
+    // config mount are /work/repo and
+    // /home/opencode/.config/opencode in production; the env
+    // overrides unseal them on macOS workstations.
+    repoDir: env.BOOP_REPO_DIR || "/work/repo",
+    configSrc: env.BOOP_CONFIG_SRC || "/home/opencode/.config/opencode",
     githubAppId: env.GITHUB_APP_ID,
     githubAppInstallationId: env.GITHUB_APP_INSTALLATION_ID,
     privateKeyPath: env.BOOP_GITHUB_APP_PRIVATE_KEY_PATH || DEFAULT_PRIVATE_KEY_PATH,
@@ -155,6 +163,18 @@ export function loadConfig(env = process.env) {
     // fallback; QUB-98 deleted the opencode.json ConfigMap so
     // this env var is now the only source of the model name.
     openrouterModel: env.OPENROUTER_MODEL || null,
+    // QUB-132: agent tool-set kill switch. The QUB-132 SDK
+    // swap gave the reviewer a tool set (run_command, read_file,
+    // git_diff) for the experts + narrator. Set
+    // BOOP_TOOLS_ENABLED=0 to disable tools fleet-wide (the
+    // narrator gets the QUB-130 "no tools available" prompt
+    // variant and a no-tools SDK call). The walkthrough is
+    // unaffected — it never had tools. Default `true` keeps
+    // tool execution on for normal operations; this env var is
+    // the operator's escape hatch when a tool-using prompt
+    // regresses or a runner host can't safely execute
+    // subprocesses.
+    toolsEnabled: env.BOOP_TOOLS_ENABLED !== "0",
   };
 }
 

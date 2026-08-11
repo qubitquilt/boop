@@ -64,6 +64,27 @@ export function assertSafeSha(name, value) {
   return value;
 }
 
+// reviewRange resolves the git range every diff consumer walks. On a
+// re-review (reviewNumber > 1 with a previousHeadSha) the model sees
+// only the delta since the last review, so the range is
+// `previousHeadSha...prHeadSha`; on a first review it is
+// `prBaseRef...prHeadSha`. Every component passes through the public
+// asserts — this is the single gate that keeps PR-controlled refs out
+// of `git diff` argv, shared by the prompt text and the git_diff tool.
+export function reviewRange(ctx) {
+  const { reviewNumber, previousHeadSha, prBaseRef, prHeadSha } = ctx ?? {};
+  if (!prBaseRef || !prHeadSha) {
+    return undefined;
+  }
+  const baseRef = assertSafeRef("PR_BASE_REF", prBaseRef);
+  assertSafeSha("PR_HEAD_SHA", prHeadSha);
+  if (reviewNumber > 1 && previousHeadSha) {
+    assertSafeSha("PR_PREVIOUS_HEAD_SHA", previousHeadSha);
+    return `${previousHeadSha}...${prHeadSha}`;
+  }
+  return `${baseRef}...${prHeadSha}`;
+}
+
 export function shortSha(s) {
   return s && s.length >= 7 ? s.slice(0, 7) : (s || "");
 }

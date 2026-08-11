@@ -720,7 +720,7 @@ func (h *Handler) replyDuplicateReview(ctx context.Context, client ghIssueClient
 // duplicateReviewReply explains a same-SHA no-op in Boop's chrome
 // voice (friendly pug, mascot OK). Findings stay plain; this is status.
 func duplicateReviewReply(status, headSHA string) string {
-	short := shortSHA(headSHA)
+	short := store.ShortSHA(headSHA)
 	switch status {
 	case "active":
 		return fmt.Sprintf(
@@ -797,7 +797,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		Repo:              repo,
 		Number:            fmt.Sprintf("%d", number),
 		SHA:               headSHA,
-		SHA7:              shortSHA(headSHA),
+		SHA7:              store.ShortSHA(headSHA),
 		BaseRef:           baseRef,
 		PreviousHeadSHA:   previousHeadSHA,
 		Image:             image,
@@ -1249,18 +1249,13 @@ func (h *Handler) isPaused(ctx context.Context, delivery string, installationID 
 	return paused
 }
 
-var jobNameSanitizer = regexp.MustCompile(`[^a-z0-9-]`)
-
+// buildJobName is a thin shim over store.BuildJobName kept
+// for in-package callers (RD-002: the canonical helper now
+// lives in the store package so the regex / format lives in
+// one place; the webhook package re-exports it for callers
+// that already import webhook).
 func buildJobName(owner, repo string, number int, sha string) string {
-	raw := fmt.Sprintf("boop-%s-%s-%d-%s", owner, repo, number, shortSHA(sha))
-	return jobNameSanitizer.ReplaceAllString(strings.ToLower(raw), "-")
-}
-
-func shortSHA(sha string) string {
-	if len(sha) >= 7 {
-		return sha[:7]
-	}
-	return sha
+	return store.BuildJobName(owner, repo, number, sha)
 }
 
 // jobStatus returns one of: "missing", "active", "failed", "succeeded".

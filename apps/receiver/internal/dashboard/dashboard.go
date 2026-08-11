@@ -19,25 +19,31 @@
 // installations. Each view is a single template + a
 // single Go function. New views are 50-100 lines, not
 // a Redux saga.
+//
+// DP-006: the view handlers used to live in this one
+// file. They are now split across views_runs.go (the
+// run-list + run-detail shape), views_ops.go (live /
+// exceptions / costs / retention), and views_admin.go
+// (audit / installations / re-run / zero-cost /
+// mark-orphaned / health). DTOs and conversions live in
+// views.go. This file is the constructor + the route
+// table — the small kernel every other file relies on.
 package dashboard
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
-	"encoding/hex"
-	"errors"
-	"fmt"
 	"html/template"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/michaelruelas/boop-receiver/internal/store"
 )
+
+//go:embed templates/*.html
+var templateFS embed.FS
 
 // Actions is the dependency the dashboard pulls from the
 // webhook package. The dashboard's form-based actions (re-run,
@@ -65,15 +71,18 @@ type Actions struct {
 	FetchPodLogs   func(ctx context.Context, jobName string) (logs string, err error)
 }
 
-//go:embed templates/*.html
-var templateFS embed.FS
-
 // Handler is the receiver's dashboard endpoint group.
 // One Handler per receiver process; the routes are
 // mounted under /dashboard/* in main.go and gated by
 // BOOP_DASHBOARD_TOKEN.
 type Handler struct {
-	store  *store.Store
+	// store is the read+write data layer the
+	// dashboard's view handlers consume. Typed as
+	// the Store interface (SP-005) so a test
+	// double can stand in for *store.Store in
+	// the unit tests; the production wiring
+	// passes a real *store.Store.
+	store  Store
 	logger *slog.Logger
 	token  string
 	// actions are the cross-package dependencies the
@@ -92,7 +101,7 @@ type Handler struct {
 // disables form-initiated K8s actions (the re-run
 // button renders disabled and the form POSTs to a
 // 503-style "not configured" page).
-func NewHandler(st *store.Store, logger *slog.Logger, token string, actions Actions) (*Handler, error) {
+func NewHandler(st Store, logger *slog.Logger, token string, actions Actions) (*Handler, error) {
 	return &Handler{
 		store:   st,
 		logger:  logger,
@@ -198,6 +207,8 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 		h.serveCosts(w, r)
 	case path == "retention":
 		h.serveRetention(w, r)
+	case path == "audit":
+		h.serveAudit(w, r)
 	case path == "installations":
 		h.serveInstallations(w, r)
 	case strings.HasPrefix(path, "installations/"):
@@ -222,664 +233,13 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serveRuns is the /dashboard/runs list view.
-func (h *Handler) serveRuns(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	f := store.ListRunsFilter{
-		Owner: q.Get("owner"),
-		Repo:  q.Get("repo"),
-	}
-	if s := q.Get("status"); s != "" {
-		f.Status = store.RunStatus(s)
-	}
-	// QU B-113 / CQ-004: forward the failure_class
-	// filter chip value to the store. The previous
-	// shape dropped it on the floor — the dropdown
-	// rendered the chip but the result set was the
-	// whole page, so an operator who picked
-	// "OOMKilled" saw every failed run instead of
-	// the OOMKilled subset. FailureClass is a free-
-	// form string (today's values are
-	// oom_killed / container_error / crash_loop /
-	// image_pull / config_error; future
-	// failure_class taxonomy is a receiver-side
-	// concern, not a dashboard-side one).
-	if fc := q.Get("failure_class"); fc != "" {
-		f.FailureClass = fc
-	}
-	if s := q.Get("limit"); s != "" {
-		// The default (50) is fine for a dashboard page;
-		// no override needed.
-		_ = s
-	}
-	page, err := h.store.ListRuns(r.Context(), f)
-	if err != nil {
-		h.logger.Warn("dashboard runs", "err", err)
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
-	}
-	rows := make([]runsRow, 0, len(page.Runs))
-	for _, run := range page.Runs {
-		row := runsRow{Run: run}
-		row.Status = string(run.Status)
-		row.StartedAt = run.StartedAt.Format("2006-01-02 15:04")
-		if run.EndedAt != nil {
-			row.Duration = run.EndedAt.Sub(run.StartedAt).Round(time.Second).String()
-		}
-		if t, err := h.store.GetTelemetry(r.Context(), run.ID); err == nil {
-			row.Cost = fmt.Sprintf("$%.4f", t.CostUSD)
-		}
-		rows = append(rows, row)
-	}
-	data := runsView{
-		Nav:    "runs",
-		Runs:   rows,
-		Filter: runsFilter{Q: r.URL.Query().Get("q"), Status: q.Get("status"), FailureClass: q.Get("failure_class")},
-	}
-	h.renderPage(w, "runs.html", data)
-}
-
-type runsView struct {
-	Nav    string
-	Runs   []runsRow
-	Filter runsFilter
-}
-type runsFilter struct {
-	Q            string
-	Status       string
-	FailureClass string
-}
-type runsRow struct {
-	store.Run
-	Status    string
-	StartedAt string
-	Duration  string
-	Cost      string
-}
-
-// serveRunDetail is the /dashboard/runs/{id} view.
-func (h *Handler) serveRunDetail(w http.ResponseWriter, r *http.Request, id string) {
-	run, err := h.store.GetRun(r.Context(), id)
-	if err != nil {
-		http.Error(w, "run not found", http.StatusNotFound)
-		return
-	}
-	stages, _ := h.store.ListRunStages(r.Context(), id)
-	lenses, _ := h.store.ListLensTelemetry(r.Context(), id)
-	lineage, _ := h.store.WalkLineage(r.Context(), id, 32)
-
-	// K8s pod logs (best-effort). The Job is GC'd 1h
-	// after CompletionTime, so for older runs the
-	// callback returns "" and the dashboard renders
-	// "logs unavailable" rather than failing the page.
-	// Any error from the callback is logged at Debug
-	// and treated as no-logs-available; the page still
-	// renders with the structured stages + error string.
-	logs, logsErr := h.fetchLogs(r.Context(), id)
-
-	data := runDetailView{
-		Nav:     "runs",
-		Run:     runView{Run: run},
-		Stages:  renderWaterfall(stages),
-		Lenses:  lenses,
-		Lineage: lineage,
-		Logs:    logs,
-	}
-	if logsErr != nil {
-		data.LogsErr = logsErr.Error()
-	}
-	data.Run.Status = string(run.Status)
-	if !run.StartedAt.IsZero() {
-		data.Run.StartedAt = run.StartedAt.Format("2006-01-02 15:04:05")
-	}
-	if run.EndedAt != nil {
-		data.Run.EndedAt = run.EndedAt.Format("2006-01-02 15:04:05")
-		if dur := run.EndedAt.Sub(run.StartedAt); dur > 0 {
-			data.Run.Duration = dur.Round(time.Second).String()
-		}
-	}
-	// PR link: only meaningful when the row carries
-	// owner/repo/pr_number (every webhook-created row
-	// does; the synthetic "orphaned" rows from
-	// MarkOrphanedRuns do too). Compose the URL on
-	// the server side so the template doesn't have to
-	// know about GitHub's URL shape.
-	if run.Owner != "" && run.Repo != "" && run.PRNumber > 0 {
-		data.Run.PRURL = fmt.Sprintf("https://github.com/%s/%s/pull/%d", run.Owner, run.Repo, run.PRNumber)
-	}
-	h.renderPage(w, "run_detail.html", data)
-}
-
-// fetchLogs wraps the Actions.FetchPodLogs callback so the
-// handler doesn't have to nil-check it on every render. A
-// nil callback (a read-only deploy without K8s) renders the
-// "logs unavailable" path the same way a TTL'd Job does.
-func (h *Handler) fetchLogs(ctx context.Context, jobName string) (string, error) {
-	if h.actions.FetchPodLogs == nil {
-		return "", fmt.Errorf("pod log fetcher not configured")
-	}
-	return h.actions.FetchPodLogs(ctx, jobName)
-}
-
-type runDetailView struct {
-	Nav     string
-	Run     runView
-	Stages  []stageRow
-	Lenses  []store.LensTelemetry
-	Lineage store.Lineage
-	Logs    string
-	LogsErr string
-}
-type runView struct {
-	store.Run
-	Status    string
-	StartedAt string
-	EndedAt   string
-	Duration  string
-	PRURL     string
-}
-type stageRow struct {
-	Stage     string
-	Duration  int64
-	OffsetPct float64
-	WidthPct  float64
-	Meta      string
-	StartedAt string
-	EndedAt   string
-}
-
-// renderWaterfall converts the per-stage rows into
-// percentage offsets so the template can render a
-// flexbox bar without arithmetic. The earliest stage
-// is the left edge; the latest is the right edge; the
-// total span is the difference between the earliest
-// start and the latest end. A single stage gets 100%
-// width; multiple stages share the row proportionally.
-func renderWaterfall(stages []store.RunStage) []stageRow {
-	if len(stages) == 0 {
-		return nil
-	}
-	sort.Slice(stages, func(i, j int) bool { return stages[i].StartedAt.Before(stages[j].StartedAt) })
-	earliest := stages[0].StartedAt
-	var latest time.Time
-	for _, s := range stages {
-		end := s.StartedAt
-		if s.EndedAt != nil {
-			end = *s.EndedAt
-		}
-		if end.After(latest) {
-			latest = end
-		}
-	}
-	total := latest.Sub(earliest)
-	if total <= 0 {
-		// All stages share a single second; give
-		// them equal width.
-		w := 100.0 / float64(len(stages))
-		out := make([]stageRow, len(stages))
-		for i, s := range stages {
-			out[i] = fillStageRow(stageRow{
-				Stage:     s.Stage,
-				Duration:  durMS(s),
-				OffsetPct: float64(i) * w,
-				WidthPct:  w,
-			}, s)
-		}
-		return out
-	}
-	out := make([]stageRow, 0, len(stages))
-	for _, s := range stages {
-		end := s.StartedAt
-		if s.EndedAt != nil {
-			end = *s.EndedAt
-		}
-		offset := s.StartedAt.Sub(earliest).Seconds() / total.Seconds() * 100
-		width := end.Sub(s.StartedAt).Seconds() / total.Seconds() * 100
-		if width < 0.5 {
-			width = 0.5 // floor so <1s stages are still visible
-		}
-		out = append(out, fillStageRow(stageRow{
-			Stage:     s.Stage,
-			Duration:  durMS(s),
-			OffsetPct: offset,
-			WidthPct:  width,
-		}, s))
-	}
-	return out
-}
-
-// fillStageRow decorates a stageRow with the timestamps and
-// Meta blob the run-detail template renders next to each
-// stage bar. Kept as a helper so renderWaterfall's two
-// branches stay symmetric.
-func fillStageRow(r stageRow, s store.RunStage) stageRow {
-	r.StartedAt = s.StartedAt.Format("15:04:05.000")
-	if s.EndedAt != nil {
-		r.EndedAt = s.EndedAt.Format("15:04:05.000")
-	}
-	r.Meta = s.Meta
-	return r
-}
-
-func durMS(s store.RunStage) int64 {
-	if s.DurationMS != nil {
-		return *s.DurationMS
-	}
-	if s.EndedAt != nil {
-		return s.EndedAt.Sub(s.StartedAt).Milliseconds()
-	}
-	return 0
-}
-
-// serveLive is the /dashboard/live view.
-func (h *Handler) serveLive(w http.ResponseWriter, r *http.Request) {
-	running, _ := h.store.ListRuns(r.Context(), store.ListRunsFilter{Status: store.StatusRunning, Limit: 100})
-	stuck, _ := h.store.ListStuckRuns(r.Context(), 2*time.Minute, 100)
-	runRows := make([]liveRow, 0, len(running.Runs))
-	for _, run := range running.Runs {
-		row := liveRow{Run: run, Status: string(run.Status)}
-		row.StartedAt = run.StartedAt.Format("15:04:05")
-		if run.LastHeartbeatAt != nil {
-			row.LastHeartbeatAt = run.LastHeartbeatAt.Format("15:04:05")
-		}
-		runRows = append(runRows, row)
-	}
-	stuckRows := make([]liveRow, 0, len(stuck))
-	for _, run := range stuck {
-		row := liveRow{Run: run, Status: string(run.Status)}
-		row.StartedAt = run.StartedAt.Format("15:04:05")
-		if run.LastHeartbeatAt != nil {
-			row.LastHeartbeatAt = run.LastHeartbeatAt.Format("15:04:05")
-			row.SilentFor = time.Since(*run.LastHeartbeatAt).Round(time.Second).String()
-		} else {
-			row.SilentFor = time.Since(run.StartedAt).Round(time.Second).String() + " (no heartbeat ever)"
-		}
-		stuckRows = append(stuckRows, row)
-	}
-	data := liveView{
-		Nav:     "live",
-		Running: runRows,
-		Stuck:   stuckRows,
-	}
-	h.renderPage(w, "live.html", data)
-}
-
-type liveView struct {
-	Nav     string
-	Running []liveRow
-	Stuck   []liveRow
-}
-type liveRow struct {
-	store.Run
-	Status          string
-	StartedAt       string
-	LastHeartbeatAt string
-	SilentFor       string
-}
-
-// serveExceptions is the /dashboard/exceptions view.
-func (h *Handler) serveExceptions(w http.ResponseWriter, r *http.Request) {
-	class := r.URL.Query().Get("class")
-	all, _ := h.store.ListRuns(r.Context(), store.ListRunsFilter{Status: store.StatusFailed, Limit: 200})
-	rows := make([]exceptionRow, 0)
-	for _, run := range all.Runs {
-		if run.FailureClass == "" {
-			continue
-		}
-		if class != "" && run.FailureClass != class {
-			continue
-		}
-		row := exceptionRow{Run: run, Status: string(run.Status)}
-		row.StartedAt = run.StartedAt.Format("2006-01-02 15:04")
-		row.Error = run.Error
-		rows = append(rows, row)
-	}
-	data := exceptionsView{
-		Nav:        "exceptions",
-		Exceptions: rows,
-		Filter:     exceptionsFilter{Class: class},
-	}
-	h.renderPage(w, "exceptions.html", data)
-}
-
-type exceptionsView struct {
-	Nav        string
-	Exceptions []exceptionRow
-	Filter     exceptionsFilter
-}
-type exceptionsFilter struct {
-	Class string
-}
-type exceptionRow struct {
-	store.Run
-	Status    string
-	StartedAt string
-	Error     string
-}
-
-// serveCosts is the /dashboard/costs view.
-func (h *Handler) serveCosts(w http.ResponseWriter, r *http.Request) {
-	to := time.Now().UTC()
-	from := to.Add(-30 * 24 * time.Hour)
-	rollup, _ := h.store.LensCostSummary(r.Context(), from, to)
-	data := costsView{Nav: "costs", LensRollup: rollup}
-	h.renderPage(w, "costs.html", data)
-}
-
-type costsView struct {
-	Nav        string
-	LensRollup []store.LensCostRollup
-}
-
-// serveRetention renders /dashboard/retention — a row per
-// run with its scheduled-deletion timestamp and an
-// "imminent" flag for rows scheduled within the next 7
-// days. The retention loop prunes on a 5-min tick; the
-// schedule here is the row's started_at + DefaultRetention,
-// not the actual delete time. The page is the operator's
-// proof that retention is enforced as a schedule, not a
-// config-file promise (QUB-112).
-//
-// An empty schedule means either the data layer is empty
-// or the retention tick has already pruned everything; the
-// template renders an "empty" hint in either case. The
-// retention duration is the store's DefaultRetention (no
-// dashboard override today; a future retention-config
-// route would add one).
-func (h *Handler) serveRetention(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.store.ListRetentionSchedule(r.Context(), 0)
-	if err != nil {
-		h.logger.Warn("dashboard retention", "err", err)
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
-	}
-	now := time.Now().UTC()
-	schedule := make([]retentionRow, 0, len(rows))
-	for _, row := range rows {
-		daysOut := int(row.ScheduledDeletion.Sub(now).Hours() / 24)
-		schedule = append(schedule, retentionRow{
-			RunID:             row.RunID,
-			StartedAt:         row.StartedAt.Format("2006-01-02 15:04"),
-			ScheduledDeletion: row.ScheduledDeletion.Format("2006-01-02 15:04"),
-			DaysOut:           daysOut,
-			Imminent:          daysOut < 7,
-		})
-	}
-	data := retentionView{
-		Nav:           "retention",
-		Schedule:      schedule,
-		RetentionDays: int(store.DefaultRetention.Hours() / 24),
-	}
-	h.renderPage(w, "retention.html", data)
-}
-
-type retentionView struct {
-	Nav           string
-	Schedule      []retentionRow
-	RetentionDays int
-}
-type retentionRow struct {
-	RunID             string
-	StartedAt         string
-	ScheduledDeletion string
-	DaysOut           int
-	Imminent          bool
-}
-
-// serveInstallations is the /dashboard/installations view.
-func (h *Handler) serveInstallations(w http.ResponseWriter, r *http.Request) {
-	insts, _ := h.store.ListInstallations(r.Context())
-	rows := make([]installRow, 0, len(insts))
-	for _, ins := range insts {
-		rows = append(rows, installRow{
-			Installation:  ins,
-			LensOptOutCSV: strings.Join(ins.LensOptOut, ","),
-		})
-	}
-	data := installationsView{Nav: "installations", Installations: rows}
-	h.renderPage(w, "installations.html", data)
-}
-
-type installationsView struct {
-	Nav           string
-	Installations []installRow
-}
-type installRow struct {
-	store.Installation
-	LensOptOutCSV string
-}
-
-// serveInstallationControl handles the per-install pause
-// / lens-opt-out editor. POST body: paused (true|false),
-// lens_opt_out (comma-separated lens names). The store
-// has a single SetInstallationControls method that
-// writes both fields atomically.
-//
-// Every successful edit appends an audit row so the
-// "who paused this install?" question has a durable
-// answer. The action is one of:
-//
-//	install.pause     operator flipped paused from false to true
-//	install.resume    operator flipped paused from true to false
-//	lens_opt_out.set  operator changed the lens filter
-//
-// A single form submission that changes both fields
-// emits a single audit row tagged with the union (e.g.
-// a pause + lens edit is one "install.pause" row with
-// the new lens list in details). The dashboard's
-// audit-trail view surfaces the actor + the action +
-// the pre/post values; the union is cleaner than two
-// rows for one click.
-func (h *Handler) serveInstallationControl(w http.ResponseWriter, r *http.Request, idStr string) {
-	var id int64
-	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
-		http.Error(w, "bad id", http.StatusBadRequest)
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-	paused := r.FormValue("paused") == "true"
-	var lens []string
-	if s := r.FormValue("lens_opt_out"); s != "" {
-		for _, p := range strings.Split(s, ",") {
-			if p = strings.TrimSpace(p); p != "" {
-				lens = append(lens, p)
-			}
-		}
-	}
-	reason := strings.TrimSpace(r.FormValue("reason"))
-	prev, _ := h.store.GetInstallation(r.Context(), id)
-	if err := h.store.SetInstallationControls(r.Context(), id, paused, lens); err != nil {
-		h.logger.Warn("dashboard install control", "id", id, "err", err)
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
-	}
-	// Pick the dominant action for the audit row. A
-	// pause/resume flip is the most consequential
-	// change; a lens edit that does not also flip
-	// paused gets its own action type. Both fired in
-	// the same click is rare (and the form does not
-	// currently allow it) — we record the flip and
-	// drop the lens change on the floor, which is
-	// the same shape the existing `paused` toggle
-	// would have.
-	action := "lens_opt_out.set"
-	if prev.Paused != paused {
-		if paused {
-			action = "install.pause"
-		} else {
-			action = "install.resume"
-		}
-	}
-	if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
-		Action:   action,
-		Actor:    h.actor(),
-		TargetID: idStr,
-		Details: store.MarshalDetails(map[string]any{
-			"paused":       paused,
-			"lens_opt_out": lens,
-			"reason":       reason,
-		}),
-	}); err != nil {
-		// Non-fatal: a failed audit row is logged but
-		// does not block the operator's action. The
-		// dashboard's audit view will surface a gap
-		// for this row, which is preferable to a 5xx
-		// that flips the operator's pause back.
-		h.logger.Warn("dashboard install control audit", "id", id, "err", err)
-	}
-	http.Redirect(w, r, "/dashboard/installations", http.StatusSeeOther)
-}
-
-// serveRerun is the form-based "Requeue" handler the
-// exceptions view posts to. Persists the lineage row
-// (parent_run_id + superseded_by_id), creates the K8s
-// Job via the cross-package Actions callback, and
-// records an audit event with the actor. Returns 503
-// if the cross-package callback is not wired (a
-// read-only deploy that does not have the K8s jobbuilder).
-//
-// The id is the prior run id (the row the operator is
-// re-running from). reason is the operator's free-form
-// note; it lands on the new run's row and in the
-// audit row's details blob.
-func (h *Handler) serveRerun(w http.ResponseWriter, r *http.Request, idStr string) {
-	if h.actions.CreateRerunJob == nil {
-		http.Error(w, "rerun not configured", http.StatusServiceUnavailable)
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-	if r.FormValue("confirm") != "true" {
-		http.Error(w, "confirm: true required", http.StatusBadRequest)
-		return
-	}
-	reason := strings.TrimSpace(r.FormValue("reason"))
-	if reason == "" {
-		http.Error(w, "reason is required", http.StatusBadRequest)
-		return
-	}
-	prior, err := h.store.GetRun(r.Context(), idStr)
-	if err != nil {
-		if errors.Is(err, store.ErrUnknownRun) {
-			http.Error(w, "run not found", http.StatusNotFound)
-			return
-		}
-		h.logger.Warn("dashboard rerun get", "run", idStr, "err", err)
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
-	}
-	if prior.Status != store.StatusSucceeded && prior.Status != store.StatusFailed {
-		http.Error(w, "can only re-run a terminal run", http.StatusConflict)
-		return
-	}
-	newID, err := h.actions.CreateRerunJob(r.Context(), prior, reason)
-	if err != nil {
-		h.logger.Warn("dashboard rerun create", "run", idStr, "err", err)
-		http.Error(w, "create rerun", http.StatusInternalServerError)
-		return
-	}
-	if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
-		Action:   "rerun.create",
-		Actor:    h.actor(),
-		TargetID: newID,
-		Details:  store.MarshalDetails(map[string]any{"prior_run_id": idStr, "reason": reason}),
-	}); err != nil {
-		h.logger.Warn("dashboard rerun audit", "run", newID, "err", err)
-	}
-	h.logger.Info("dashboard rerun created", "prior", idStr, "new", newID, "reason", reason)
-	http.Redirect(w, r, "/dashboard/exceptions", http.StatusSeeOther)
-}
-
-// serveZeroCost is the form-based "Zero out cost"
-// handler the exceptions view posts to. Computes the
-// run's total tokens (input + output + reasoning
-// across the aggregate telemetry), appends a refund
-// row, and records the audit event. The dashboard's
-// refund list is the per-run audit trail; the global
-// audit_events table is the cross-cutting one.
-//
-// A zero-out is all-lenses by default (the form does
-// not expose a per-lens picker today; the store
-// helper is shaped to accept a lens filter when one
-// is added). The action is idempotent: a second
-// click adds a second refund row. The operator can
-// see the refund history on the run-detail page; the
-// lens_telemetry rows themselves are not zeroed (the
-// raw numbers stay so a future audit can recompute
-// the bill). The "zero out" promise is that the
-// dashboard's $ rollup excludes refunded runs — a
-// follow-up query helper does the subtraction.
-func (h *Handler) serveZeroCost(w http.ResponseWriter, r *http.Request, idStr string) {
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
-		return
-	}
-	reason := strings.TrimSpace(r.FormValue("reason"))
-	if reason == "" {
-		reason = "dashboard zero-out"
-	}
-	run, err := h.store.GetRun(r.Context(), idStr)
-	if err != nil {
-		if errors.Is(err, store.ErrUnknownRun) {
-			http.Error(w, "run not found", http.StatusNotFound)
-			return
-		}
-		h.logger.Warn("dashboard zero cost get", "run", idStr, "err", err)
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
-	}
-	telem, terr := h.store.GetTelemetry(r.Context(), idStr)
-	if terr != nil {
-		// No telemetry yet — zero-out still lands
-		// (zero tokens to zero out) so the operator
-		// is not blocked. The refund row records 0
-		// tokens; the audit row records the
-		// "no telemetry" note.
-		telem = store.Telemetry{}
-	}
-	tokens := telem.InputTokens + telem.OutputTokens + telem.ReasoningTokens
-	actor := h.actor()
-	if _, err := h.store.RecordRefund(r.Context(), store.Refund{
-		RunID:      idStr,
-		Lens:       "", // all-lenses; the per-lens picker is a follow-up
-		Tokens:     tokens,
-		RefundedBy: actor,
-	}); err != nil {
-		h.logger.Warn("dashboard zero cost refund", "run", idStr, "err", err)
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
-	}
-	if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
-		Action:   "cost.zero_out",
-		Actor:    actor,
-		TargetID: idStr,
-		Details: store.MarshalDetails(map[string]any{
-			"tokens_zeroed": tokens,
-			"cost_usd":      telem.CostUSD,
-			"reason":        reason,
-			"owner":         run.Owner,
-			"repo":          run.Repo,
-			"pr_number":     run.PRNumber,
-		}),
-	}); err != nil {
-		h.logger.Warn("dashboard zero cost audit", "run", idStr, "err", err)
-	}
-	h.logger.Info("dashboard zero cost", "run", idStr, "tokens", tokens, "cost_usd", telem.CostUSD)
-	http.Redirect(w, r, "/dashboard/exceptions", http.StatusSeeOther)
-}
-
 // actor derives the audit-log actor from the
 // BOOP_DASHBOARD_TOKEN. Today the dashboard's only
 // authentication is a shared secret, so the actor is
-// a SHA-256 prefix of the token — stable across
-// requests (same operator, same actor) and
-// non-reversible (the token is not in the audit log).
-// A future per-user identity layer replaces the
+// a SHA-256 prefix of the token (store.ActorFromToken)
+// — stable across requests (same operator, same actor)
+// and non-reversible (the token is not in the audit
+// log). A future per-user identity layer replaces the
 // token-derived actor; the AuditEvent.Actor field is
 // already a free-form string so the swap is a
 // one-call-site change.
@@ -887,81 +247,5 @@ func (h *Handler) actor() string {
 	if h.token == "" {
 		return "dashboard:disabled"
 	}
-	sum := sha256.Sum256([]byte(h.token))
-	return "dashboard:" + hex.EncodeToString(sum[:4])
-}
-
-// serveMarkOrphaned handles POST /dashboard/admin/mark-orphaned.
-// Bulk-marks every "running" row whose runner never
-// heartbeated as "failed" with a synthetic "orphaned" error.
-//
-// QUB-114: the original incident was a runner telemetry
-// regression where the runner process exited before its
-// first heartbeat, leaving every review row stuck at
-// status="running" in the dashboard. The reconciler fix
-// (k8s_reconcile.go) prevents this going forward for new
-// runs; this endpoint cleans up the legacy zombies from
-// the dashboard in one shot.
-//
-// Auth: same X-Boop-Dashboard-Token as the rest of the
-// /dashboard/* tree (the middleware in this package).
-//
-// Optional query params:
-//   grace=<duration> — overrides the default 5m grace
-//     window. Useful for tests and for the operator
-//     who wants to wait longer before marking a slow
-//     runner's row as orphaned. Format is a Go duration
-//     string (5m, 30s, 1h).
-//
-// Response: 200 with {"marked": <int>} on success, 400 on
-// a malformed grace value, 500 on a store error.
-func (h *Handler) serveMarkOrphaned(w http.ResponseWriter, r *http.Request) {
-	grace := 5 * time.Minute
-	if g := r.URL.Query().Get("grace"); g != "" {
-		d, err := time.ParseDuration(g)
-		if err != nil {
-			http.Error(w, "bad grace: "+err.Error(), http.StatusBadRequest)
-			return
-		}
-		if d < 0 {
-			http.Error(w, "grace must be non-negative", http.StatusBadRequest)
-			return
-		}
-		grace = d
-	}
-	n, err := h.store.MarkOrphanedRuns(r.Context(), grace)
-	if err != nil {
-		h.logger.Warn("dashboard mark orphaned", "err", err)
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
-	}
-	if _, err := h.store.RecordAuditEvent(r.Context(), store.AuditEvent{
-		Action:   "admin.mark_orphaned",
-		Actor:    h.actor(),
-		TargetID: "bulk",
-		Details:  store.MarshalDetails(map[string]any{"marked": n, "grace_seconds": grace.Seconds()}),
-	}); err != nil {
-		// Non-fatal: the dashboard's audit view will surface
-		// a gap, which is preferable to a 5xx that loses
-		// the operator's cleanup progress.
-		h.logger.Warn("dashboard mark orphaned audit", "err", err)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write([]byte(fmt.Sprintf(`{"marked":%d}`, n)))
-}
-
-// Health is a liveness endpoint for the dashboard. It
-// reports whether the data layer is reachable so a
-// Kubernetes probe can distinguish "the binary is up"
-// from "the data layer is broken".
-func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
-	if h.store == nil {
-		http.Error(w, "data layer disabled", http.StatusServiceUnavailable)
-		return
-	}
-	if _, err := h.store.Stats(r.Context()); err != nil {
-		http.Error(w, "store error", http.StatusInternalServerError)
-		return
-	}
-	w.WriteHeader(http.StatusOK)
+	return store.ActorFromToken("dashboard:", h.token)
 }
