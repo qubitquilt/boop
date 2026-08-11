@@ -251,8 +251,12 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   const userPrompt = buildExpertPrompt(name, ctx, deps, walkthrough);
   // 5. Call OpenRouter. The expert call uses a tighter
   // timeout than the walkthrough call (the expert returns
-  // terse JSON, not a long review). 90s is enough for the
-  // current model family.
+  // terse JSON, not a long review). 300s gives the
+  // tool-carrying experts room: the model round-trips
+  // (tool call -> tool result -> findings JSON) can take
+  // a few minutes, and a 90s cap aborted every expert on
+  // the family-picnic-platform#69 runs (minimax-m3 + tools
+  // via OpenRouter).
   //
   // Tests inject a fake via deps.callOpenRouter; production
   // defaults to the real SDK call imported above. The
@@ -260,7 +264,7 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   // but skipped the fallback here — the boop reviewer crashed
   // with "deps.callOpenRouter is not a function" on every PR
   // until this fallback landed.
-  const EXPERT_TIMEOUT_MS = 90_000;
+  const EXPERT_TIMEOUT_MS = 300_000;
   const callOpenRouterFn = deps.callOpenRouter || callOpenRouter;
   // SDK cutover: the experts are the second call site that hands
   // the reviewer the agent tool set. The test-quality / regression-
