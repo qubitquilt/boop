@@ -27,8 +27,6 @@ package webhook
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -264,18 +262,17 @@ func (h *Handler) Rerun(w http.ResponseWriter, r *http.Request) {
 
 // runnerActor derives the audit-log actor for an
 // API-initiated runner action. Mirrors the dashboard's
-// actor() (sha256 prefix of the token), but prefixed
-// "runner:" so a compliance view can split the two
-// entry points in one query. Empty RunnerToken yields
-// "runner:unconfigured" — the auth gate rejects such
-// callers before this point, so the value never lands
-// in audit_events.
+// actor() via the shared store.ActorFromToken (SHA-256
+// prefix of the token), but prefixed "runner:" so a
+// compliance view can split the two entry points in one
+// query. Empty RunnerToken yields "runner:unconfigured"
+// — the auth gate rejects such callers before this
+// point, so the value never lands in audit_events.
 func (h *Handler) runnerActor() string {
 	if h.cfg.RunnerToken == "" {
 		return "runner:unconfigured"
 	}
-	sum := sha256.Sum256([]byte(h.cfg.RunnerToken))
-	return "runner:" + hex.EncodeToString(sum[:4])
+	return store.ActorFromToken("runner:", h.cfg.RunnerToken)
 }
 
 // CreateRerunJob is the cross-package helper the

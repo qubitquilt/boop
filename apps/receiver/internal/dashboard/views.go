@@ -24,22 +24,22 @@ import (
 // which is the load-bearing "no column leaks to the
 // wire" rule the audit asked for.
 type RunView struct {
-	ID            string
-	Owner         string
-	Repo          string
-	PRNumber      int
-	Status        string
-	StartedAt     string
-	EndedAt       string
-	Duration      string
-	FailureClass  string
-	Error         string
-	PRURL         string
-	CommitSHA     string
-	ReviewNumber  int
-	Reason        string
-	LastHeartbeat string
-	SilentFor     string
+	ID              string
+	Owner           string
+	Repo            string
+	PRNumber        int
+	Status          string
+	StartedAt       string
+	EndedAt         string
+	Duration        string
+	FailureClass    string
+	Error           string
+	PRURL           string
+	CommitSHA       string
+	ReviewNumber    int
+	Reason          string
+	LastHeartbeatAt string
+	SilentFor       string
 }
 
 // newRunView projects a store.Run into the view-shaped
@@ -54,16 +54,16 @@ type RunView struct {
 // templates see only the formatted strings.
 func newRunView(r store.Run) RunView {
 	v := RunView{
-		ID:            r.ID,
-		Owner:         r.Owner,
-		Repo:          r.Repo,
-		PRNumber:      r.PRNumber,
-		Status:        string(r.Status),
-		FailureClass:  r.FailureClass,
-		Error:         r.Error,
-		CommitSHA:     r.CommitSHA,
-		ReviewNumber:  r.ReviewNumber,
-		Reason:        r.Reason,
+		ID:           r.ID,
+		Owner:        r.Owner,
+		Repo:         r.Repo,
+		PRNumber:     r.PRNumber,
+		Status:       string(r.Status),
+		FailureClass: r.FailureClass,
+		Error:        r.Error,
+		CommitSHA:    r.CommitSHA,
+		ReviewNumber: r.ReviewNumber,
+		Reason:       r.Reason,
 	}
 	if !r.StartedAt.IsZero() {
 		v.StartedAt = r.StartedAt.Format("2006-01-02 15:04:05")
@@ -75,32 +75,46 @@ func newRunView(r store.Run) RunView {
 		}
 	}
 	if r.LastHeartbeatAt != nil {
-		v.LastHeartbeat = r.LastHeartbeatAt.Format("15:04:05")
-		v.SilentFor = time.Since(*r.LastHeartbeatAt).Round(time.Second).String()
-	} else if !r.StartedAt.IsZero() {
-		v.SilentFor = time.Since(r.StartedAt).Round(time.Second).String() + " (no heartbeat ever)"
+		v.LastHeartbeatAt = r.LastHeartbeatAt.Format("15:04:05")
 	}
+	v.SilentFor = silentFor(r.StartedAt, r.LastHeartbeatAt)
 	if v.Owner != "" && v.Repo != "" && v.PRNumber > 0 {
 		v.PRURL = "https://github.com/" + v.Owner + "/" + v.Repo + "/pull/" + strconv.Itoa(v.PRNumber)
 	}
 	return v
 }
 
-// RunsRow is the rowsRow used in the runs-list view.
+// silentFor is the single home of the "how long has this
+// run been silent" rule, shared by newRunView and
+// newLiveRow. A future "stuck" threshold lands here once
+// instead of in both converters. A nil heartbeat falls
+// back to started-at so a run that never heartbeated
+// still reports elapsed silence.
+func silentFor(startedAt time.Time, lastHeartbeatAt *time.Time) string {
+	if lastHeartbeatAt != nil {
+		return time.Since(*lastHeartbeatAt).Round(time.Second).String()
+	}
+	if !startedAt.IsZero() {
+		return time.Since(startedAt).Round(time.Second).String() + " (no heartbeat ever)"
+	}
+	return ""
+}
+
+// RunsRow is the row used in the runs-list view.
 // Replaces the prior `runsRow` that embedded store.Run.
 // The Cost / Status / StartedAt / Duration are
 // pre-formatted strings; the embed-free shape means
 // a future store.Run column does not auto-leak here.
 type RunsRow struct {
-	ID            string
-	Status        string
-	StartedAt     string
-	Duration      string
-	Cost          string
-	Owner         string
-	Repo          string
-	PRNumber      int
-	FailureClass  string
+	ID           string
+	Status       string
+	StartedAt    string
+	Duration     string
+	Cost         string
+	Owner        string
+	Repo         string
+	PRNumber     int
+	FailureClass string
 }
 
 // newRunsRow is the conversion from the bulk-fetched
@@ -109,12 +123,12 @@ type RunsRow struct {
 // telemetry-derived field.
 func newRunsRow(r store.Run, t store.Telemetry) RunsRow {
 	row := RunsRow{
-		ID:            r.ID,
-		Status:        string(r.Status),
-		Owner:         r.Owner,
-		Repo:          r.Repo,
-		PRNumber:      r.PRNumber,
-		FailureClass:  r.FailureClass,
+		ID:           r.ID,
+		Status:       string(r.Status),
+		Owner:        r.Owner,
+		Repo:         r.Repo,
+		PRNumber:     r.PRNumber,
+		FailureClass: r.FailureClass,
 	}
 	if !r.StartedAt.IsZero() {
 		row.StartedAt = r.StartedAt.Format("2006-01-02 15:04")
@@ -128,7 +142,7 @@ func newRunsRow(r store.Run, t store.Telemetry) RunsRow {
 	return row
 }
 
-// LiveRow is the rowsRow used in the live view. Same
+// LiveRow is the row used in the live view. Same
 // rationale as RunsRow: an explicit DTO so the embed
 // does not leak future store columns.
 type LiveRow struct {
@@ -138,15 +152,15 @@ type LiveRow struct {
 	PRNumber        int
 	Status          string
 	StartedAt       string
-	LastHeartbeat   string
+	LastHeartbeatAt string
 	SilentFor       string
 	FailureClass    string
 }
 
 // newLiveRow is the conversion from store.Run to a
-// live-view row. The "SilentFor" computation is
-// centralized here (was inline in the old serveLive
-// path) so a future "stuck" rule lands in one place.
+// live-view row. The "SilentFor" computation lives in
+// silentFor (shared with newRunView) so a future
+// "stuck" rule lands in one place.
 func newLiveRow(r store.Run) LiveRow {
 	row := LiveRow{
 		ID:           r.ID,
@@ -160,24 +174,22 @@ func newLiveRow(r store.Run) LiveRow {
 		row.StartedAt = r.StartedAt.Format("15:04:05")
 	}
 	if r.LastHeartbeatAt != nil {
-		row.LastHeartbeat = r.LastHeartbeatAt.Format("15:04:05")
-		row.SilentFor = time.Since(*r.LastHeartbeatAt).Round(time.Second).String()
-	} else if !r.StartedAt.IsZero() {
-		row.SilentFor = time.Since(r.StartedAt).Round(time.Second).String() + " (no heartbeat ever)"
+		row.LastHeartbeatAt = r.LastHeartbeatAt.Format("15:04:05")
 	}
+	row.SilentFor = silentFor(r.StartedAt, r.LastHeartbeatAt)
 	return row
 }
 
 // ExceptionRow is the row used in the exception dock.
 // Same rationale: explicit DTO, no embed.
 type ExceptionRow struct {
-	ID            string
-	Owner         string
-	Repo          string
-	PRNumber      int
-	FailureClass  string
-	StartedAt     string
-	Error         string
+	ID           string
+	Owner        string
+	Repo         string
+	PRNumber     int
+	FailureClass string
+	StartedAt    string
+	Error        string
 }
 
 // newExceptionRow is the conversion from store.Run to

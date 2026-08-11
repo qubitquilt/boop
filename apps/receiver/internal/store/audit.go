@@ -17,6 +17,8 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -38,6 +40,20 @@ type AuditEvent struct {
 	TargetID   string
 	OccurredAt time.Time
 	Details    string
+}
+
+// ActorFromToken derives the audit-log actor string for
+// a bearer token. The actor is the SHA-256 prefix of the
+// token, namespaced by prefix ("dashboard:", "runner:")
+// so a compliance view can split the two entry points in
+// one query. Stable across requests (same token, same
+// actor) and non-reversible (the raw token never lands in
+// audit_events). Empty-token markers stay with the callers
+// (dashboard:disabled / runner:unconfigured) because each
+// endpoint has its own unauthenticated value.
+func ActorFromToken(prefix, token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return prefix + hex.EncodeToString(sum[:4])
 }
 
 // RecordAuditEvent appends a row to the audit_events

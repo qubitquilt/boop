@@ -32,10 +32,8 @@ package dashboard
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
-	"encoding/hex"
 	"html/template"
 	"log/slog"
 	"net/http"
@@ -238,10 +236,10 @@ func (h *Handler) route(w http.ResponseWriter, r *http.Request) {
 // actor derives the audit-log actor from the
 // BOOP_DASHBOARD_TOKEN. Today the dashboard's only
 // authentication is a shared secret, so the actor is
-// a SHA-256 prefix of the token — stable across
-// requests (same operator, same actor) and
-// non-reversible (the token is not in the audit log).
-// A future per-user identity layer replaces the
+// a SHA-256 prefix of the token (store.ActorFromToken)
+// — stable across requests (same operator, same actor)
+// and non-reversible (the token is not in the audit
+// log). A future per-user identity layer replaces the
 // token-derived actor; the AuditEvent.Actor field is
 // already a free-form string so the swap is a
 // one-call-site change.
@@ -249,6 +247,5 @@ func (h *Handler) actor() string {
 	if h.token == "" {
 		return "dashboard:disabled"
 	}
-	sum := sha256.Sum256([]byte(h.token))
-	return "dashboard:" + hex.EncodeToString(sum[:4])
+	return store.ActorFromToken("dashboard:", h.token)
 }
