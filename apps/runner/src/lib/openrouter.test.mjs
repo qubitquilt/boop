@@ -8,7 +8,6 @@ import {
   callOpenRouter,
   emptyTelemetry,
   extractUsage,
-  isToolsEnabled,
   runOpenCodeSkill,
   parseReviewOutput,
   buildBoopPrompt,
@@ -215,7 +214,6 @@ test("callOpenRouter falls back to stepCount 1 when getToolCalls throws", async 
   // abort the whole review — fall back to 1 so the dashboard
   // contract (stepCount is always a positive integer) holds.
   const value = makeAssistantResponse();
-  const sent = { calls: [] };
   const callModel = (_request, _options) => {
     return {
       getText: async () => "ok",
@@ -225,7 +223,6 @@ test("callOpenRouter falls back to stepCount 1 when getToolCalls throws", async 
       },
     };
   };
-  void sent;
   const result = await callOpenRouter("p", { ...baseDeps(), callModel });
   assert.equal(result.stepCount, 1);
 });
@@ -1907,20 +1904,9 @@ test("buildBoopPrompt keeps the no-tools variant when ctx.toolsEnabled === false
   assert.match(prompt, /There are no tools available/);
 });
 
-// isToolsEnabled: centralizes the BOOP_TOOLS_ENABLED kill switch.
-// buildAgentTools in tools.mjs and runOpenCodeSkill in
-// openrouter.mjs both consume this so the kill switch takes
-// effect at every site. The test pins the three states: explicit
-// true, explicit false, and unset (default true).
-test("isToolsEnabled honors ctx.toolsEnabled and defaults to true", () => {
-  assert.equal(isToolsEnabled({ toolsEnabled: false }), false);
-  assert.equal(isToolsEnabled({ toolsEnabled: true }), true);
-  assert.equal(isToolsEnabled({}), true);
-  assert.equal(isToolsEnabled(undefined), true);
-  assert.equal(isToolsEnabled(null), true);
-  // Defensive: any non-false value (including truthy strings) is treated as enabled.
-  assert.equal(isToolsEnabled({ toolsEnabled: "0" }), true);
-});
+// isToolsEnabled lives in tools.mjs as toolsAvailable, which is the
+// single gate shared by the prompt builders and the tool factory
+// (see buildAgentTools in tools.test.mjs).
 
 test("buildBoopPrompt's 'What you are receiving' block names the verification tools (QUB-132)", async () => {
   // The QUB-<next variant tells the model it CAN read the diff

@@ -28,8 +28,6 @@ import { fileURLToPath } from "node:url";
 
 import {
   loadConfig,
-  REPO_DIR,
-  CONFIG_SRC,
   NETRC_PATH,
   GITCONFIG_PATH,
 } from "./lib/config.mjs";
@@ -113,8 +111,8 @@ function makeDeps(ctx, log, cleanup) {
     fetchImpl: fetch,
     OctokitCtor: undefined, // lib/github.mjs falls back to the real Octokit
     paths: {
-      repoDir: REPO_DIR,
-      configSrc: CONFIG_SRC,
+      repoDir: ctx.repoDir,
+      configSrc: ctx.configSrc,
       netrc: NETRC_PATH,
       gitconfig: GITCONFIG_PATH,
     },

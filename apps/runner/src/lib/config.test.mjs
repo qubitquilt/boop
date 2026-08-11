@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { loadConfig, REPO_DIR, CONFIG_SRC } from "./config.mjs";
+import { loadConfig } from "./config.mjs";
 
 const validEnv = {
   PR_OWNER: "qubitquilt",
@@ -196,39 +196,33 @@ test("loadConfig reads BOOP_TOOLS_ENABLED=0 into toolsEnabled: false", () => {
   assert.equal(ctx.toolsEnabled, false);
 });
 
-// REPO_DIR + CONFIG_SRC defaults preserved when env
-// unset (K8s production contract). The constants are read at
-// module-load time, so the test asserts the defaults directly
-// rather than going through loadConfig.
-test("REPO_DIR defaults to /work/repo", () => {
-  assert.equal(process.env.BOOP_REPO_DIR, undefined);
-  assert.equal(REPO_DIR, "/work/repo");
-});
-
-test("CONFIG_SRC defaults to /home/opencode/.config/opencode", () => {
-  assert.equal(process.env.BOOP_CONFIG_SRC, undefined);
-  assert.equal(CONFIG_SRC, "/home/opencode/.config/opencode");
-});
-// by default; setting the env var to "0" disables it.
-test("loadConfig defaults toolsEnabled to true", () => {
+// repoDir + configSrc flow through loadConfig like every other
+// config field (BOOP_REPO_DIR / BOOP_CONFIG_SRC env overrides for
+// local dev; defaults preserve the K8s production mounts). Unlike
+// the old module-level constants, tests vary them via the env
+// fixture instead of polluting process.env at import time.
+test("loadConfig defaults repoDir to /work/repo", () => {
   const ctx = loadConfig(validEnv);
-  assert.equal(ctx.toolsEnabled, true);
+  assert.equal(ctx.repoDir, "/work/repo");
 });
 
-test("loadConfig reads BOOP_TOOLS_ENABLED=0 into toolsEnabled: false", () => {
+test("loadConfig reads BOOP_REPO_DIR into repoDir", () => {
   const ctx = loadConfig({
     ...validEnv,
-    BOOP_TOOLS_ENABLED: "0",
+    BOOP_REPO_DIR: "/tmp/repo",
   });
-  assert.equal(ctx.toolsEnabled, false);
+  assert.equal(ctx.repoDir, "/tmp/repo");
 });
 
-// REPO_DIR + CONFIG_SRC defaults preserved when env
-// unset (K8s production contract).
-test("loadConfig defaults REPO_DIR to /work/repo", () => {
-  assert.equal(process.env.BOOP_REPO_DIR, undefined);
+test("loadConfig defaults configSrc to /home/opencode/.config/opencode", () => {
+  const ctx = loadConfig(validEnv);
+  assert.equal(ctx.configSrc, "/home/opencode/.config/opencode");
 });
 
-test("loadConfig defaults CONFIG_SRC to /home/opencode/.config/opencode", () => {
-  assert.equal(process.env.BOOP_CONFIG_SRC, undefined);
+test("loadConfig reads BOOP_CONFIG_SRC into configSrc", () => {
+  const ctx = loadConfig({
+    ...validEnv,
+    BOOP_CONFIG_SRC: "/tmp/config",
+  });
+  assert.equal(ctx.configSrc, "/tmp/config");
 });

@@ -24,6 +24,7 @@
 // to be terse, not the runner.
 
 import { buildTelemetry, stripOpenRouterPrefix } from "./openrouter.mjs";
+import { reviewRange } from "./security.mjs";
 
 const MAX_WALKTHROUGH_CHARS = 8000;
 
@@ -34,22 +35,14 @@ const MAX_WALKTHROUGH_CHARS = 8000;
 // a sharp summary of the change so each lens can apply its
 // checklist without re-reading the full diff.
 export function buildWalkthroughPrompt(ctx, deps) {
-  // Match the ctx shape that loadConfig + workflow.mjs
-  // produce: prBaseRef + prHeadSha for first reviews;
-  // previousHeadSha + prHeadSha for re-reviews. The diff
-  // range is supplied pre-computed by workflow.mjs; the
-  // fallback here matches the same shape.
-  const {
-    diffRange,
-    prBaseRef,
-    prHeadSha,
-    isReReview,
-    previousHeadSha,
-    paths,
-  } = ctx;
-  const range = diffRange || (isReReview
-    ? `${previousHeadSha}...${prHeadSha}`
-    : `${prBaseRef}...${prHeadSha}`);
+  // Match the ctx shape that loadConfig + workflow.mjs produce:
+  // diffRange is pre-computed by the caller; when it's absent,
+  // reviewRange derives it from the review refs (base...head on
+  // first reviews, previousHead...head on re-reviews) — the same
+  // resolver the git_diff tool uses, so every diff consumer
+  // walks the same delta.
+  const { diffRange, paths } = ctx;
+  const range = diffRange || reviewRange(ctx);
   return [
     "# Task",
     "",

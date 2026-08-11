@@ -27,7 +27,7 @@
 
 import { OpenRouter, stepCountIs } from "@openrouter/agent";
 import { LENS_FILES, OPENCODE_TIMEOUT_MS } from "./config.mjs";
-import { assertSafeRef, shortSha } from "./security.mjs";
+import { assertSafeRef, reviewRange, shortSha } from "./security.mjs";
 import { lintReview, summarize } from "./ste-lint.mjs";
 import { buildAgentTools, toolsAvailable } from "./tools.mjs";
 
@@ -104,7 +104,7 @@ export async function runOpenCodeSkill(openrouterApiKey, ctx, deps) {
   } catch (err) {
     const elapsed = Date.now() - startMs;
     // The SDK uses AbortError for our timeout path (we pass
-    // controller.signal into chatSend). Anything else is
+    // controller.signal into callModel). Anything else is
     // a genuine SDK failure — 4xx, 5xx, network, etc. — and
     // should surface in the error pipeline, not the info one.
     const isAbort = err?.name === "AbortError";
@@ -304,9 +304,10 @@ export async function callOpenRouter(prompt, deps = {}) {
       // QUB-105 / abort split: the SDK surfaces AbortError
       // when the request was cancelled (timeout), and typed
       // errors with statusCode / body / contentType when the
-      // API rejected the request. Same split as the chatSend
-      // path; the runner handles AbortError as a clean timeout
-      // and any other thrown error as a genuine SDK failure.
+      // API rejected the request. Same split as the
+      // runOpenCodeSkill path; the runner handles AbortError as a
+      // clean timeout and any other thrown error as a genuine
+      // SDK failure.
       if (err?.name === "AbortError") {
         throw err;
       }
@@ -462,39 +463,12 @@ function extractAssistantText(response) {
 /**
  * Map the SDK `usage` object onto the runner's telemetry shape.
  *
- * SDK cutover: the agent SDK returns the OpenResponses
- * `Usage` shape with camelCase fields
- * (`inputTokens` / `outputTokens` / `cachedTokens` /
- * `reasoningTokens` / `totalTokens` / `cost` / `costDetails` /
- * `isByok` / `serverToolUseDetails`). The pre-swap ChatUsage
- * shape used `promptTokens` / `completionTokens` / etc. Both are
- * supported here so test fixtures that inject either shape keep
- * passing; the runner's downstream consumers (extractUsage →
- * buildTelemetry → dashboard) all read the snake_case output.
- *
- * Field mapping (OpenResponses → runner):
- *   inputTokens       → prompt_tokens
- *   outputTokens      → completion_tokens
- *   totalTokens       → total_tokens
- *   inputTokensDetails.cachedTokens    → cached_tokens
- *   inputTokensDetails.cacheWriteTokens→ cache_write_tokens
- *   outputTokensDetails.reasoningTokens→ reasoning_tokens
- *   cost              → cost
- *   costDetails.upstreamInferencePromptCost    → cost_prompt_usd
- *   costDetails.upstreamInferenceOutputCost    → cost_completion_usd
- *   costDetails.upstreamInferenceCost          → cost_upstream_usd
- *   isByok            → is_byok
- *   serverToolUseDetails.toolCallsExecuted     → server_tool_calls_executed
- *   serverToolUseDetails.toolCallsRequested    → server_tool_calls_requested
- *
- * ChatUsage fallback (`promptTokens` / `completionTokens` /
- * `cost_details` / etc.) is preserved verbatim for the existing
- * test fixtures.
- *
- * The runner's telemetry contract (see `postTelemetry` in
- * `./dashboard.mjs`) expects the snake_case keys below; the field
- * rename to `inputTokens` / `outputTokens` happens in the caller
- * (`buildTelemetry`).
+ * The agent SDK returns the OpenResponses `Usage` shape
+ * (camelCase: `inputTokens`, `costDetails`, `isByok`, ...); the
+ * pre-swap chat shape used `promptTokens` / `completionTokens` /
+ * `cost_details`. Both are supported so test fixtures keep passing.
+ * Output is snake_case — the contract `extractUsage` →
+ * `buildTelemetry` → dashboard reads.
  */
 export function extractUsage(response) {
   const usage = response?.usage;
@@ -761,19 +735,6 @@ export function stripOpenRouterPrefix(model) {
   return model.startsWith("openrouter/") ? model.slice("openrouter/".length) : model;
 }
 
-// isToolsEnabled is the kill-switch half of the gate. buildBoopPrompt
-// and runOpenCodeSkill both need to know whether to advertise the
-// tool set to the model — they use toolsAvailable(ctx, deps) in
-// tools.mjs, which combines this flag with the deps-readiness
-// check. Calling toolsAvailable directly from the prompt builders
-// means the prompt and the factory read the same answer (a
-// future dep added to the factory shows up in the prompt without
-// a second edit). Exported so tests can pin the kill-switch
-// semantics in isolation.
-export function isToolsEnabled(ctx) {
-  return ctx?.toolsEnabled !== false;
-}
-
 // whatYouAreReceivingBullets: the shared input list (skill,
 // lenses, walkthrough, expert findings, PR metadata) used by
 // both the tools-enabled and tools-disabled prompt variants.
@@ -967,16 +928,12 @@ export async function buildBoopPrompt(ctx, deps) {
   // summaries posted before this feature landed), fall back to the
   // full diff vs base — same as a first review.
   const isReReview = ctx.reviewNumber > 1 && ctx.previousHeadSha;
-  // baseRef and the prior head SHA are already regex-validated
-  // by loadConfig + the public asserts. Inlining them into the
-  // prompt (which the LLM will see) does not widen the attack
-  // surface beyond what the LLM already gets from the cloned repo,
-  // but we still want a tight diff range so the model doesn't try
-  // to inspect unrelated history.
+  // reviewRange validates every component and picks base...head on
+  // first reviews, previousHead...head on re-reviews — the same
+  // range the git_diff tool walks, so the prompt and the tool
+  // agree on the delta under review.
   const baseRef = assertSafeRef("PR_BASE_REF", ctx.prBaseRef);
-  const diffRange = isReReview
-    ? `${ctx.previousHeadSha}...${ctx.prHeadSha}`
-    : `${baseRef}...${ctx.prHeadSha}`;
+  const diffRange = reviewRange(ctx);
   const diffHint = isReReview
     ? `Re-review #${ctx.reviewNumber}: diff only the delta from the previously reviewed commit ${ctx.previousHeadSha} to ${ctx.prHeadSha} (do NOT re-review lines from earlier commits — the author has already seen those).`
     : `Compare ${baseRef}...${ctx.prHeadSha} to identify what changed.`;
@@ -1019,33 +976,16 @@ export async function buildBoopPrompt(ctx, deps) {
     "",
 // QUB-130 + SDK cutover: explicit "what you are receiving"
     // section. The narrator has been observed to hallucinate
-    // about the prompt structure on small PRs (the model claims
-    // the diff is not visible and the walkthrough is a tool
-    // call). The narrator has access to a small tool set (the
-    // SDK swap enabled tool auto-execution); the
-    // walkthrough + findings are TEXT in this prompt, NOT tool
-    // calls. Naming every input explicitly (instead of having
-    // the model guess what it is seeing) reduces the
-    // hallucination rate. The block lands BEFORE the "## Task"
-    // section so the model reads the description before it
-    // reads the task framing.
-    //
-    // Two variants of the block ship:
-    //   - the tool-enabled path (the default): names the agent
-    //     tool set so the model knows what it can call, and
-    //     reminds it that the walkthrough / findings / lenses
-    //     are TEXT, not callable tools.
-    //   - the tool-disabled path (when ctx.toolsEnabled === false,
-    //     e.g. tests that want the legacy no-tool prompt): keeps
-    //     the QUB-130 "no tools available" wording verbatim so
-    //     existing test fixtures pin the contract.
-    //
-    // Both variants share WHAT_YOU_ARE_RECEIVING_BULLETS + the
-    // TEXT_NO_TOOLS_TRAILER; only the opening line and the
-    // tool-set paragraph differ.
-    // toolsAvailable mirrors buildAgentTools's gate so the prompt
-    // and the factory read the same answer. A future dep added
-    // to the factory shows up here automatically.
+    // about the prompt structure (claims the diff is not
+    // visible, or that the walkthrough is a tool call). Naming
+    // every input explicitly reduces the hallucination rate.
+    // The block lands BEFORE "## Task" so the model reads the
+    // description before the task framing. Two variants ship:
+    // the tool-enabled default names the agent tool set; the
+    // tool-disabled path keeps the QUB-130 "no tools available"
+    // wording for fixtures that pin the legacy contract.
+    // toolsAvailable mirrors buildAgentTools's gate so the
+    // prompt and the factory read the same answer.
     !toolsAvailable(ctx, deps)
       ? [
           "## What you are receiving",

@@ -31,7 +31,11 @@
 // themselves are deterministic per call (no shared state
 // across retries), so re-attempts are safe.
 
-import { emptyTelemetry, stripOpenRouterPrefix } from "./openrouter.mjs";
+import {
+  callOpenRouter,
+  emptyTelemetry,
+  stripOpenRouterPrefix,
+} from "./openrouter.mjs";
 import { buildAgentTools, toolsAvailable } from "./tools.mjs";
 
 // pickExperts is the orchestrator. Maps a PR type to a
@@ -250,16 +254,14 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   // terse JSON, not a long review). 90s is enough for the
   // current model family.
   //
-  // The fallback matches the walkthrough pattern
-  // (walkthrough.mjs:128): tests inject a fake via
-  // deps.callOpenRouter; production resolves the real
-  // SDK call from openrouter.mjs. The multi-expert pipeline
-  // (QUB-95) inherited the deps contract but skipped the
-  // fallback here — the boop reviewer crashed with
-  // "deps.callOpenRouter is not a function" on every PR
+  // Tests inject a fake via deps.callOpenRouter; production
+  // defaults to the real SDK call imported above. The
+  // multi-expert pipeline (QUB-95) inherited the deps contract
+  // but skipped the fallback here — the boop reviewer crashed
+  // with "deps.callOpenRouter is not a function" on every PR
   // until this fallback landed.
   const EXPERT_TIMEOUT_MS = 90_000;
-  const callOpenRouter = deps.callOpenRouter || (await import("./openrouter.mjs")).callOpenRouter;
+  const callOpenRouterFn = deps.callOpenRouter || callOpenRouter;
   // SDK cutover: the experts are the second call site that hands
   // the reviewer the agent tool set. The test-quality / regression-
   // hunter experts can run `npm test` / `bun test` to verify
@@ -273,7 +275,7 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   const expertTools = buildAgentTools(ctx, deps);
   let callResult;
   try {
-    callResult = await callOpenRouter(userPrompt, {
+    callResult = await callOpenRouterFn(userPrompt, {
       ...deps,
       // QUB-117: the dispatch must forward a non-empty model
       // name to the SDK call. The single-LLM path resolves the

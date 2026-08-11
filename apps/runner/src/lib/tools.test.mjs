@@ -462,6 +462,9 @@ test("git_diff runs `git diff <range>` in repoDir", async () => {
   });
   assert.equal(out.diff, "diff --git a/foo b/foo");
   assert.equal(out.truncated, false);
+  assert.equal(out.totalBytes, "diff --git a/foo b/foo".length);
+  assert.equal(out.error, null);
+  assert.equal(out.errorName, null);
   assert.equal(calls[0].bin, "git");
   assert.deepEqual(calls[0].args, ["diff", "main...abc", "--", "foo.ts"]);
   assert.equal(calls[0].opts.cwd, "/work/repo");
@@ -476,6 +479,7 @@ test("git_diff omits the path argument when no path is supplied", async () => {
   const out = await findTool(tools, "git_diff").execute({});
   assert.deepEqual(calls[0].args, ["diff", "main...abc"]);
   assert.equal(out.diff, "full diff");
+  assert.equal(out.error, null);
 });
 
 test("git_diff returns an error string when no range is configured", async () => {
@@ -485,8 +489,46 @@ test("git_diff returns an error string when no range is configured", async () =>
   const tools = buildTools({ execFile, ctx: {} });
   const out = await findTool(tools, "git_diff").execute({});
   assert.equal(out.diff, "");
+  assert.equal(out.truncated, false);
+  assert.equal(out.totalBytes, 0);
   assert.equal(out.error, "no diff range configured");
+  assert.equal(out.errorName, "no_range");
   assert.equal(calls.length, 0, "must not spawn without a range");
+});
+
+test("git_diff rejects leading-dash ranges without spawning", async () => {
+  // The range is runner-controlled, so a leading dash is a
+  // defense-in-depth rejection (flag-injection vector), not a
+  // model-reachable path.
+  const { fn: execFile, calls } = makeExecFileFake({
+    result: { stdout: "", stderr: "", exitCode: 0 },
+  });
+  const tools = buildTools({ execFile, ctx: { diffRange: "--upload-pack=evil" } });
+  const out = await findTool(tools, "git_diff").execute({});
+  assert.equal(out.diff, "");
+  assert.equal(out.error, "unsafe diff range");
+  assert.equal(out.errorName, "unsafe_range");
+  assert.equal(calls.length, 0, "must not spawn with an unsafe range");
+});
+
+test("git_diff derives the range from ctx refs when diffRange is unset", async () => {
+  const { fn: execFile, calls } = makeExecFileFake({
+    result: { stdout: "derived diff", stderr: "", exitCode: 0 },
+  });
+  const tools = buildTools({
+    execFile,
+    ctx: {
+      reviewNumber: 1,
+      prBaseRef: "main",
+      prHeadSha: "0123456789abcdef0123456789abcdef01234567",
+    },
+  });
+  const out = await findTool(tools, "git_diff").execute({});
+  assert.deepEqual(
+    calls[0].args,
+    ["diff", "main...0123456789abcdef0123456789abcdef01234567"],
+  );
+  assert.equal(out.diff, "derived diff");
 });
 
 test("git_diff reports git-level errors", async () => {
@@ -496,6 +538,8 @@ test("git_diff reports git-level errors", async () => {
   const tools = buildTools({ execFile });
   const out = await findTool(tools, "git_diff").execute({});
   assert.equal(out.diff, "");
+  assert.equal(out.truncated, false);
+  assert.equal(out.totalBytes, 0);
   assert.match(out.error, /bad revision/);
   assert.equal(out.errorName, 128);
 });
@@ -509,6 +553,7 @@ test("git_diff truncates output at the configured cap", async () => {
   const out = await findTool(tools, "git_diff").execute({});
   assert.equal(out.truncated, true);
   assert.equal(out.diff.length, GIT_DIFF_OUTPUT_CAP_BYTES);
+  assert.equal(out.totalBytes, big.length);
 });
 
 test("git_diff rejects path-traversal escapes via resolveInsideRepo", async () => {

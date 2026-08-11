@@ -52,6 +52,7 @@
 import path from "node:path";
 import { tool } from "@openrouter/agent";
 import { z } from "zod";
+import { reviewRange } from "./security.mjs";
 
 // Per-command budget. The runner's overall call has a 25-min hard
 // kill; per-tool budgets keep any single tool call from blowing
@@ -318,11 +319,23 @@ async function readRepoFile(fs, repoDir, p, capBytes) {
 }
 
 // runGitDiff runs `git diff <range> -- <path>` in repoDir. Read-only;
-// the range comes from the runner's validated refs.
+// the range comes from reviewRange (or an explicit deps.diffRange),
+// so it is runner-controlled, never model-controlled — git_diff's
+// only model input is `path`, and that goes through
+// resolveInsideRepo below. Defense-in-depth: a leading-dash range
+// would be a git flag-injection vector (`--upload-pack=…`), so
+// reject it outright even though reviewRange/assertSafeRef already
+// guarantee it cannot occur.
 async function runGitDiff(execFile, repoDir, range, p, caps) {
-  // Both range and path go through the same guard: range is a
-  // shell-token string the model can mangle, path is a file
-  // inside the repo.
+  if (typeof range !== "string" || range.length === 0 || range.startsWith("-")) {
+    return {
+      diff: "",
+      truncated: false,
+      totalBytes: 0,
+      error: "unsafe diff range",
+      errorName: "unsafe_range",
+    };
+  }
   const args = ["diff", range];
   if (p) {
     resolveInsideRepo(repoDir, p);
@@ -339,17 +352,18 @@ async function runGitDiff(execFile, repoDir, range, p, caps) {
       },
     );
     const stdout = String(out?.stdout || "");
-    if (stdout.length > caps.outputCapBytes) {
-      return {
-        diff: stdout.slice(0, caps.outputCapBytes),
-        truncated: true,
-        totalBytes: stdout.length,
-      };
-    }
-    return { diff: stdout, truncated: false, totalBytes: stdout.length };
+    return {
+      diff: stdout.slice(0, caps.outputCapBytes),
+      truncated: stdout.length > caps.outputCapBytes,
+      totalBytes: stdout.length,
+      error: null,
+      errorName: null,
+    };
   } catch (err) {
     return {
       diff: "",
+      truncated: false,
+      totalBytes: 0,
       error: String(err?.message || err),
       errorName: err?.code || err?.name || "error",
     };
@@ -393,21 +407,11 @@ export function toolsAvailable(ctx, deps) {
   );
 }
 
-export function buildAgentTools(ctx, deps) {
-  if (!toolsAvailable(ctx, deps)) {
-    return [];
-  }
-  const repoDir = deps.paths.repoDir;
-  const execFile = deps.execFile;
-  const fs = deps.fs;
-  // diffRange precedence: ctx wins over deps. ctx is the runner's
-  // validated review range (assertSafeRef'd at loadConfig time);
-  // deps.diffRange is an optional fallback for callers that
-  // build the tool set without a full ctx. Explicit precedence so
-  // a future caller reading this code doesn't have to guess
-  // which source wins when both are set.
-  const range = ctx?.diffRange ?? deps.diffRange;
-  const caps = {
+// capsForDeps overlays a deps.caps override map onto the module-level
+// budgets. buildAgentTools and _INTERNAL.caps share this one function,
+// so a budget tuned in one place shows up in the other.
+function capsForDeps(deps) {
+  return {
     runCommand: {
       timeoutMs:
         deps?.caps?.runCommand?.timeoutMs ?? RUN_COMMAND_TIMEOUT_MS,
@@ -423,6 +427,21 @@ export function buildAgentTools(ctx, deps) {
         deps?.caps?.gitDiff?.outputCapBytes ?? GIT_DIFF_OUTPUT_CAP_BYTES,
     },
   };
+}
+
+export function buildAgentTools(ctx, deps) {
+  if (!toolsAvailable(ctx, deps)) {
+    return [];
+  }
+  const repoDir = deps.paths.repoDir;
+  const execFile = deps.execFile;
+  const fs = deps.fs;
+  // diffRange precedence: ctx wins over deps, and reviewRange derives
+  // it from the runner's validated review refs when neither is set.
+  // Explicit precedence so a future caller reading this code doesn't
+  // have to guess which source wins when multiple are present.
+  const range = ctx?.diffRange ?? deps.diffRange ?? reviewRange(ctx);
+  const caps = capsForDeps(deps);
 
   return [
     tool({
@@ -471,7 +490,13 @@ export function buildAgentTools(ctx, deps) {
       }),
       execute: async ({ path: p }) => {
         if (!range) {
-          return { diff: "", error: "no diff range configured" };
+          return {
+            diff: "",
+            truncated: false,
+            totalBytes: 0,
+            error: "no diff range configured",
+            errorName: "no_range",
+          };
         }
         return runGitDiff(execFile, repoDir, range, p, caps.gitDiff);
       },
@@ -482,15 +507,11 @@ export function buildAgentTools(ctx, deps) {
 // export the guards + caps so tests can assert on the denylist and
 // tune the budgets. Keep them in the named-export block so the
 // public surface stays small (the `buildAgentTools` factory + the
-// caps).
+// caps). caps is computed by capsForDeps — the same function the
+// factory uses — so the exported budgets always match what a
+// tool call actually enforces.
 export const _INTERNAL = {
   assertSafeCommand,
   resolveInsideRepo,
-  caps: {
-    RUN_COMMAND_TIMEOUT_MS,
-    RUN_COMMAND_OUTPUT_CAP_BYTES,
-    READ_FILE_CAP_BYTES,
-    GIT_DIFF_TIMEOUT_MS,
-    GIT_DIFF_OUTPUT_CAP_BYTES,
-  },
+  caps: capsForDeps({}),
 };
