@@ -163,7 +163,7 @@ export function loadConfig(env = process.env) {
     // fallback; QUB-98 deleted the opencode.json ConfigMap so
     // this env var is now the only source of the model name.
     openrouterModel: env.OPENROUTER_MODEL || null,
-    // QUB-<next: agent tool-set kill switch. The QUB-<next SDK
+    // QUB-132: agent tool-set kill switch. The QUB-132 SDK
     // swap gave the reviewer a tool set (run_command, read_file,
     // git_diff) for the experts + narrator. Set
     // BOOP_TOOLS_ENABLED=0 to disable tools fleet-wide (the
