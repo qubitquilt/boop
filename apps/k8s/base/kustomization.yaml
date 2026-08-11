@@ -23,5 +23,6 @@ configMapGenerator:
       - skill-boop-agent-solid-principles=runner-config/skills/boop/agents/review-solid-principles.md
       - skill-boop-agent-test-quality=runner-config/skills/boop/agents/review-test-quality.md
       - skill-boop-agent-deep=runner-config/skills/boop/agents/review-deep.md
+      - skill-boop-resource-persona=runner-config/skills/boop/resources/persona.md
     options:
       disableNameSuffixHash: true

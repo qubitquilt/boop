@@ -423,6 +423,7 @@ func buildJob(v templateVars) (*batchv1.Job, error) {
 										{Key: "skill-boop-agent-solid-principles", Path: "skills/boop/agents/review-solid-principles.md"},
 										{Key: "skill-boop-agent-test-quality", Path: "skills/boop/agents/review-test-quality.md"},
 										{Key: "skill-boop-agent-deep", Path: "skills/boop/agents/review-deep.md"},
+										{Key: "skill-boop-resource-persona", Path: "skills/boop/resources/persona.md"},
 									},
 								},
 							},
