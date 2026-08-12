@@ -32,8 +32,14 @@ jobs:
       - name: Run pinact
         uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
         # pinact-action v3 dropped the `args:` input. The action
-        # runs pinact in read-only mode by default; the comment-on-
-        # failure flow is enough — no auto-PR is opened because
-        # the run itself fails before pinact would attempt one.
+        # defaults `fix: true` (which auto-rewrites workflow files
+        # and opens a PR) — we want read-only, so we must set
+        # `fix: false` explicitly. `no_api: true` is incompatible
+        # with `fix: true` (auto-rewriting requires the GitHub API
+        # to open a follow-up PR), so we set both flags together.
+        # The run itself fails when an unpinned action lands, which
+        # surfaces the issue in the PR view; the operator runs
+        # `pinact run --fix` locally to land the rewrite.
         with:
+          fix: false
           no_api: true
