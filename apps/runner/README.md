@@ -30,7 +30,7 @@ PR. Invoked as a Kubernetes Job by the boop-receiver when a
      walkthrough and the (re-reviewed) findings into the
      structured `=== SUMMARY === / === INLINE COMMENTS ===
      / === END ===` block.
-5. Runs `lib/ste-lint.mjs` mechanically on the LLM output
+5. Runs `lib/ste-lint.ts` mechanically on the LLM output
    (best-effort; drift is logged, not re-fed to the LLM).
 6. Posts the summary as a single PR comment and the inline
    comments as line-pinned review comments.

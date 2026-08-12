@@ -159,7 +159,7 @@ edit step. The voice contract enforces:
   requested | Commented` token. Never in inline comment bodies, and
   not stacked on a single-line review.
 
-The runner's `lib/ste-lint.mjs` runs the mechanical checks on the
+The runner's `lib/ste-lint.ts` runs the mechanical checks on the
 LLM output before posting; drift is logged (LLM is the source of
 truth).
 

@@ -93,7 +93,7 @@ in-process, posts the result.
 
 #### Pipeline shape (multi-expert, QUB-95 + QUB-114)
 
-The runner's `lib/workflow.mjs` walks six macro stages:
+The runner's `lib/workflow.ts` walks six macro stages:
 **handshake → fetch → sniff → summary → inlines → cleanup**. The
 `sniff` stage wraps a six-step sub-workflow (`REVIEW_SUB_STAGES`):
 
@@ -123,7 +123,7 @@ this PR does well" opener, or the line after the closing
 `Approving | Changes requested | Commented` token. Never in inline
 comment bodies.
 
-After parse, the runner's `lib/ste-lint.mjs` runs the same
+After parse, the runner's `lib/ste-lint.ts` runs the same
 STE-flavored checks the skill mandates (no contractions, no
 marketing adjectives, ≤20-word sentences, no emoji in bodies) on
 the LLM output before posting. The linter is mechanical and
@@ -137,7 +137,7 @@ See [runner.md](./runner.md).
 Every file read the runner does — the orchestrator
 (`SKILL.md`), the seven lens files
 (`agents/review-*.md`), and the persona resource
-(`resources/persona.md`) — routes through `lib/rtk.mjs`. The
+(`resources/persona.md`) — routes through `lib/rtk.ts`. The
 adapter shells out to `rtk read` for compression; when rtk is
 missing or `BOOP_RTK_DISABLED=1` is set, the adapter falls back
 to raw `fs.readFile` transparently. The adapter is the single

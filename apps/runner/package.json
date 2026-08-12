@@ -5,9 +5,13 @@
   "private": true,
   "description": "BoopPr runner: clones a PR, runs the multi-lens review via OpenCode, and posts a friendly summary with inline comments",
   "scripts": {
-    "start": "node src/index.mjs",
-    "test": "bun test src/*.test.mjs src/lib/*.test.mjs",
-    "test:node": "node --test src/*.test.mjs src/lib/*.test.mjs"
+    "start": "node dist/index.js",
+    "dev": "bun src/index.ts",
+    "local-run": "bun scripts/local-run.ts",
+    "typecheck": "bun x tsc --noEmit",
+    "build": "bun x tsc",
+    "test": "bun test src/*.test.ts src/lib/*.test.ts src/lib/**/*.test.ts",
+    "test:node": "node --test --experimental-strip-types --no-warnings src/*.test.ts src/lib/*.test.ts src/lib/**/*.test.ts"
   },
   "engines": {
     "node": ">=22"
@@ -15,7 +19,13 @@
   "dependencies": {
     "@octokit/rest": "22.0.1",
     "@openrouter/agent": "0.9.0",
-    "jsonwebtoken": "9.0.3"
+    "jsonwebtoken": "9.0.3",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/node": "^22.10.2",
+    "typescript": "^7.0.2"
   },
   "//": "allowScripts whitelists @openrouter/sdk's postinstall (a non-blocking type-staleness check). The agent SDK pulls the client SDK as a transitive dep, so this entry is required for npm's allowScripts gate. The check exits 0 even when types are stale, so it is safe to allow.",
   "onlyBuiltDependencies": [

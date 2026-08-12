@@ -28,6 +28,10 @@ apps/runner/node_modules/
 apps/runner/.npm/
 apps/runner/coverage/
 apps/runner/.nyc_output/
+apps/runner/dist/
+apps/runner/*.tsbuildinfo
+
+
 
 # Go (apps/receiver)
 apps/receiver/bin/

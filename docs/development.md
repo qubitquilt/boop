@@ -73,13 +73,21 @@ make docker-push
 
 ```
 cd apps/runner
-make install        # npm install
-make build          # node --check src/index.mjs (syntax check)
-make test           # bun test src/*.test.mjs src/lib/*.test.mjs
+make install        # npm ci
+make typecheck      # tsc --noEmit
+make build          # tsc (writes dist/index.js)
+make test           # bun test src/*.test.ts src/lib/*.test.ts
+make test-node      # node --test --experimental-strip-types
 ```
 
-`make test` runs under Bun. `make test-node` falls back to
-`node --test` for the rare case Bun disagrees with node on a test.
+QUB-136: the runner is TypeScript. `make build` compiles `src/`
+into `dist/`; the runtime image runs `node dist/index.js`, no
+`tsx` in production. `make test` runs under Bun (the hot path).
+`make test-node` runs the same suite under
+`node --test --experimental-strip-types` (parity check — node
+strips the type annotations and runs the same source). Both
+must pass before the build-runner GitHub Action will land a
+new :stable digest.
 See [QUB-10](https://linear.app/qubit-quilt/issue/QUB-10/convert-runner-to-using-bun)
 for the rationale.
 
@@ -90,9 +98,9 @@ For the header format and other pure helpers, the test suite is the only check:
 ```
 cd apps/runner
 make test                                              # all tests, under Bun
-bun test src/review-header.test.mjs                    # just the header fixtures
-bun test src/lib/github.test.mjs                       # GitHub API surface
-node --test src/lib/openrouter.test.mjs                # SDK call, prompt builder, parser
+bun test src/review-header.test.ts                      # just the header fixtures
+bun test src/lib/github.test.ts                         # GitHub API surface
+node --test --experimental-strip-types src/lib/openrouter.test.ts  # SDK call, prompt builder, parser
 ```
 
 ### Run locally (against a real PR, outside a Job)
@@ -100,27 +108,38 @@ node --test src/lib/openrouter.test.mjs                # SDK call, prompt builde
 The runner is designed to run inside a K8s Job; all its env vars
 (PR_OWNER, PR_REPO, PR_NUMBER, PR_HEAD_SHA, PR_BASE_REF, GITHUB_APP_*,
 OPENROUTER_API_KEY, BOOP_*) are set by the Job template. To run it
-locally, set them by hand:
+locally, copy `.env.local.example` to `.env.local`, fill in the
+secrets, and use the `local-run` wrapper which does the env-var
+sanity check, the OpenRouter-key → secret-path bootstrap, and
+the skill-mount + pre-staged-repo verification before invoking
+the runner:
 
 ```
-export GITHUB_APP_ID=...
-export GITHUB_APP_PRIVATE_KEY="$(cat /path/to/key.pem)"
-export PR_OWNER=qubitquilt
-export PR_REPO=homelab-infra
-export PR_NUMBER=42
-export PR_HEAD_SHA=<sha>
-export PR_BASE_REF=main
-export OPENROUTER_API_KEY=...
-
-# Optional; usually set by the Job template
-export BOOP_STATUS_COMMENT_ID=
-export BOOP_REACTION_COMMENT_ID=
-export BOOP_REVIEW_NUMBER=1
-export BOOP_SKIP_SKILL=0   # 1 = minimal prompt smoke test
-
 cd apps/runner
-node src/index.mjs
+cp .env.local.example .env.local
+# edit .env.local: set OPENROUTER_API_KEY, point
+# BOOP_GITHUB_APP_PRIVATE_KEY_PATH at the PEM you downloaded
+# from the App's settings page, set PR_HEAD_SHA to the commit
+# you want reviewed
+(source .env.local && make local-run)
+# equivalent to: (source .env.local && npm run local-run)
 ```
+
+The wrapper stubs `cloneRepo` so it doesn't try to re-clone over
+the pre-staged repo (the production flow uses the App's installation
+token for the clone, which doesn't work for a workstation clone
+via `gh repo clone`). Everything else is real: the narrator calls
+the OpenRouter SDK, the GitHub side effects PATCH the status
+comment + POST the summary + inlines against the actual PR. A
+local run is a real review of a real PR.
+
+QUB-136: the wrapper runs via `bun scripts/local-run.ts` so the
+local dev loop does not need a `tsc` build first. Production
+goes through `tsc → dist/index.js`; the dev loop bypasses the
+build for iteration speed. The local dev loop runs under
+`bun` end-to-end (`bun install`, `bun x tsc`, `bun test`); the
+only `node` invocation is `make test-node` for the production-
+runtime parity check.
 
 The runner will:
 
@@ -345,14 +364,14 @@ the cluster does not match the GitHub App config. Compare
 | Task | Where |
 |---|---|
 | Add a new lens | [skills.md](./skills.md#editing-the-skill) |
-| Change the review header format | `apps/runner/src/review-header.mjs` + `apps/receiver/internal/github/client.go` (mirror both) + their tests |
+| Change the review header format | `apps/runner/src/review-header.ts` + `apps/receiver/internal/github/client.go` (mirror both) + their tests |
 | Change the dedup key | `apps/receiver/internal/webhook/handler.go` `buildJobName` |
 | Change the request grammar | `apps/receiver/internal/webhook/handler.go` `reviewRequestRegex` |
-| Add a new env var to the Job | `apps/receiver/internal/webhook/job-template.yaml` + `apps/runner/src/lib/config.mjs` `loadConfig` (env destructuring) + `apps/runner/src/index.mjs` (ctx field uses) |
+| Add a new env var to the Job | `apps/receiver/internal/webhook/job-template.yaml` + `apps/runner/src/lib/config.ts` `loadConfig` (env destructuring) + `apps/runner/src/index.ts` (ctx field uses) |
 | Bump the OpenRouter SDK version | `apps/runner/package.json` |
 | Add a new cluster overlay | [deployment.md](./deployment.md#to-add-a-new-cluster) |
-| Change a status emoji / label | Both the receiver's `STATUS` (`apps/receiver/internal/webhook/handler.go`) and the runner's `STATUS` (`apps/runner/src/lib/config.mjs`). The receiver builds the initial body; the runner appends the timeline. |
-| Change a pipeline step | The runner's pipeline is in `apps/runner/src/index.mjs` (orchestration) plus `apps/runner/src/lib/*.mjs` (steps). New tests belong next to the module they cover (`src/lib/<module>.test.mjs`); the integration test in `src/index.test.mjs` exercises the wiring. |
+| Change a status emoji / label | Both the receiver's `STATUS` (`apps/receiver/internal/webhook/handler.go`) and the runner's `STATUS` (`apps/runner/src/lib/config.ts`). The receiver builds the initial body; the runner appends the timeline. |
+| Change a pipeline step | The runner's pipeline is in `apps/runner/src/index.ts` (orchestration) plus `apps/runner/src/lib/*.ts` (steps). New tests belong next to the module they cover (`src/lib/<module>.test.ts`); the integration test in `src/index.test.ts` exercises the wiring. |
 
 ## See also
 

@@ -27,36 +27,48 @@ See also: [README](../apps/runner/README.md), [architecture](./architecture.md),
 ```
 apps/runner/
 ├── src/
-│   ├── index.mjs                  # thin orchestrator: loadConfig + run() with injected deps
-│   ├── review-header.mjs          # reviewHeader(n) — mirror of Go side
-│   ├── review-header.test.mjs     # node:test fixtures
+│   ├── index.ts                    # thin orchestrator: loadConfig + run() with injected deps
+│   ├── review-header.ts            # reviewHeader(n) — mirror of Go side
+│   ├── review-header.test.ts       # node:test fixtures
+│   ├── types.ts                    # shared State / Deps / Ctx / Overrides / Stage<Id> types
 │   └── lib/
-│       ├── config.mjs             # loadConfig(env), path constants, STATUS constants
-│       ├── log.mjs                # makeLogger(ctx) — JSON logger with pr/sha stamped
-│       ├── security.mjs           # assertSafeRef, assertSafeSha, readSecretFile, shortSha
-│       ├── git.mjs                # writeNetrc, writeGitconfig, cloneRepo, createCleanupRegistry
-│       ├── openrouter.mjs        # callOpenRouter, runOpenCodeSkill, buildBoopPrompt, parseReviewOutput, buildTelemetry, …
-│       ├── dashboard.mjs          # postTelemetry, postDashboardStatus — data-layer hooks
-│       ├── classify.mjs           # PR classifier stub (QUB-94 sub-workflow)
-│       ├── experts.mjs            # multi-expert review (QUB-95), meta-review (QUB-96)
-│       ├── rtk.mjs                # rtk adapter (QUB-85) — readFile with rtk + raw fallback
-│       ├── tools.mjs              # agent tool set (PR #191): run_command, read_file, git_diff
-│       ├── workflow.mjs           # macro + sub-workflow executor
-│       └── github.mjs             # mintInstallationToken, postStatus, postReview, postInlineComments, cleanupPriorReview
+│       ├── config.ts               # loadConfig(env), path constants, STATUS constants
+│       ├── log.ts                  # makeLogger(ctx) — JSON logger with pr/sha stamped
+│       ├── security.ts             # assertSafeRef, assertSafeSha, readSecretFile, shortSha
+│       ├── git.ts                  # writeNetrc, writeGitconfig, cloneRepo, createCleanupRegistry
+│       ├── openrouter.ts          # callOpenRouter, runOpenCodeSkill, buildBoopPrompt, parseReviewOutput, buildTelemetry, …
+│       ├── dashboard.ts            # postTelemetry, postDashboardStatus — data-layer hooks
+│       ├── classify.ts             # PR classifier stub (QUB-94 sub-workflow)
+│       ├── experts.ts              # multi-expert review (QUB-95), meta-review (QUB-96)
+│       ├── rtk.ts                  # rtk adapter (QUB-85) — readFile with rtk + raw fallback
+│       ├── tools.ts                # agent tool set (PR #191): run_command, read_file, git_diff
+│       ├── workflow.ts             # macro + sub-workflow executor
+│       └── github.ts               # mintInstallationToken, postStatus, postReview, postInlineComments, cleanupPriorReview
 ├── rtk/
 │   ├── config.toml                # rtk runtime config (baked into the image)
 │   └── filters.toml               # boop custom filter (trusted at build time)
 ├── package.json                   # @octokit/rest, @openrouter/agent, jsonwebtoken
-├── Dockerfile                     # ubuntu 24.04, node 22, rtk 0.44.2, npm ci
-└── Makefile                       # install / build / docker
+├── tsconfig.json                  # strict + noUncheckedIndexedAccess + allowImportingTsExtensions
+├── Dockerfile                     # ubuntu 24.04, node 22, rtk 0.44.2, npm ci + tsc
+└── Makefile                       # install / typecheck / build / test / test-node / docker
 ```
 
-`index.mjs` is just the entry point: it loads the config, mints
-the token, runs the pipeline, and cleans up. Every side effect
-lives in `lib/*.mjs`, each of which accepts a `ctx` (loaded config)
-and a `deps` bundle. A test passes fixture `ctx` + stubbed `deps`
-to drive any single function without env vars, real network, or
-real `git`.
+QUB-136: every `.mjs` is now `.ts`. `tsc` compiles `src/` to
+`dist/`, which the runtime image executes via
+`CMD ["node", "dist/index.js"]` (no `tsx` in production —
+`tsx` was removed from devDeps when the dev loop switched to
+`bun`, which runs `.ts` natively). The build image installs
+devDeps for the `tsc` compile, then runs `npm prune
+--production` so the runtime `node_modules` does not carry
+the `typescript` / `@types/*` binaries on PATH. The local dev
+loop runs end-to-end under `bun` (`bun install`, `bun x tsc`,
+`bun test`); the only `node` invocation is the production-
+runtime parity check (`make test-node`, which runs
+`node --test --experimental-strip-types` on the same source).
+`src/types.ts` is the shared contract — State, Deps, Ctx,
+Overrides, and Stage<Id> are the one place every stage + lib
+function reads; adding a new field there pushes the contract
+into the type-checker.
 
 ## Dependencies
 
@@ -173,7 +185,7 @@ The agent SDK runs on top of the OpenResponses API and gives the
 runner three things the pre-swap `chatSend` path lacked:
 
 1. **Tool auto-execution.** The runner hands the agent a tool set
-   (`run_command`, `read_file`, `git_diff` — see `lib/tools.mjs`)
+   (`run_command`, `read_file`, `git_diff` — see `lib/tools.ts`)
    and the SDK loops the model through tool calls until the model
    produces a text response or the step budget runs out. The
    walkthrough stays single-shot (no tools); the experts and
@@ -219,16 +231,16 @@ The runner uses a six-stage pipeline (QUB-95 + multi-expert):
 walkthrough → pick experts → dispatch → gather → meta-review
 → narrate. Three LLM prompt templates are in play:
 
-1. **Walkthrough** — `lib/walkthrough.mjs:buildWalkthroughPrompt`.
+1. **Walkthrough** — `lib/walkthrough.ts:buildWalkthroughPrompt`.
    One LLM call reads the diff and produces a 10–20 sentence
    human-readable summary. The expert sub-agents consume it
    as shared context.
-2. **Expert dispatch** — `lib/experts.mjs:buildExpertPrompt`.
+2. **Expert dispatch** — `lib/experts.ts:buildExpertPrompt`.
    Each expert is one LLM call. The system prompt is the
    expert's lens file (`agents/review-<expert>.md`). The user
    message is the walkthrough + the diff + the PR context.
    The expert returns JSON: `{ findings: Finding[] }`.
-3. **Narrator** — `lib/openrouter.mjs:buildBoopPrompt`. The
+3. **Narrator** — `lib/openrouter.ts:buildBoopPrompt`. The
    final LLM call synthesizes the walkthrough + the gathered
    expert findings into the structured block. The
    narrator does not walk the lenses (the experts did).
@@ -337,7 +349,7 @@ Status stages and emojis (must match the receiver's vocabulary):
 
 ## Review header
 
-`src/review-header.mjs` exports `reviewHeader(n)`. Must match
+`src/review-header.ts` exports `reviewHeader(n)`. Must match
 `github.ReviewSummaryHeader(n)` in `apps/receiver/internal/github/client.go`.
 
 ```
@@ -353,36 +365,40 @@ both sides pin this.
 
 ```
 cd apps/runner
-make build                              # node --check src/index.mjs
-make test                               # bun test src/*.test.mjs src/lib/*.test.mjs
+make typecheck                         # tsc --noEmit
+make build                             # tsc (writes dist/index.js)
+make test                              # bun test src/*.test.ts src/lib/*.test.ts
+make test-node                         # node --test --experimental-strip-types (parity)
 ```
 
 `make test` runs the local test loop under Bun. The production
 runner image still uses Node 22; this is a local-iteration
-acceleration. `make test-node` falls back to `node --test` for
-the rare case Bun disagrees with node on a test. See
-[QUB-10](https://linear.app/qubit-quilt/issue/QUB-10/convert-runner-to-using-bun).
+acceleration. `make test-node` runs the same suite under
+`node --test --experimental-strip-types` so a divergence between
+the two runtimes surfaces in CI before it surfaces in production
+(node 22 strips the type annotations and runs the same source).
+See [QUB-10](https://linear.app/qubit-quilt/issue/QUB-10/convert-runner-to-using-bun).
 
 Tests are granular — one file per module under `src/lib/`:
 
-- `src/lib/config.test.mjs` — `loadConfig` (env → ctx, defaults, error cases).
-- `src/lib/log.test.mjs` — `makeLogger` shape and JSON stamping.
-- `src/lib/security.test.mjs` — `assertSafeRef`, `assertSafeSha`, `shortSha`, `readSecretFile`.
-- `src/lib/git.test.mjs` — `createCleanupRegistry` (parallel + idempotent) and `cloneRepo` (with mock fs + execFile; verifies each git argv, env, and the netrc/gitconfig content).
-- `src/lib/openrouter.test.mjs` — `callOpenRouter` (fake `callModel` returning a ModelResult-shaped object, success / 4xx / abort / no text / token mapping for both OpenResponses `inputTokens`/`outputTokens` and the legacy ChatUsage `promptTokens`/`completionTokens` shapes), `buildTelemetry` (success / failure stamp), `parseReviewOutput` (structure sanity check + the five 2026-08-03 failure shapes), `buildBoopPrompt` (mock fs; verifies H5 markers, lens ordering, frontmatter stripping, re-review vs first-review diff range, `stripOpenRouterPrefix`, the QUB-85 rtk-adapter path, and the QUB-<next tools-enabled / tools-disabled "What you are receiving" variants), `runOpenCodeSkill` (agent branch happy path, SDK failure, AbortError, toolCount log line), and the `extractAssistantText` legacy chat-completion fallback.
-- `src/lib/rtk.test.mjs` — `createRtkAdapter` (QUB-85: BOOP_RTK_DISABLED bypass, missing-binary fallback, rtk CLI shape, per-call overrides, rtk-failure raw fallback, init memoisation, source getter, single-fallback-log, custom binary name).
-- `src/lib/github.test.mjs` — `mintInstallationToken`, `postStatus`, `postReview`, `postInlineComments` (parallel + partial failures), `cleanupPriorReview` (parallel fetches + pagination + error counting).
+- `src/lib/config.test.ts` — `loadConfig` (env → ctx, defaults, error cases).
+- `src/lib/log.test.ts` — `makeLogger` shape and JSON stamping.
+- `src/lib/security.test.ts` — `assertSafeRef`, `assertSafeSha`, `shortSha`, `readSecretFile`.
+- `src/lib/git.test.ts` — `createCleanupRegistry` (parallel + idempotent) and `cloneRepo` (with mock fs + execFile; verifies each git argv, env, and the netrc/gitconfig content).
+- `src/lib/openrouter.test.ts` — `callOpenRouter` (fake `callModel` returning a ModelResult-shaped object, success / 4xx / abort / no text / token mapping for both OpenResponses `inputTokens`/`outputTokens` and the legacy ChatUsage `promptTokens`/`completionTokens` shapes), `buildTelemetry` (success / failure stamp), `parseReviewOutput` (structure sanity check + the five 2026-08-03 failure shapes), `buildBoopPrompt` (mock fs; verifies H5 markers, lens ordering, frontmatter stripping, re-review vs first-review diff range, `stripOpenRouterPrefix`, the QUB-85 rtk-adapter path, and the QUB-<next tools-enabled / tools-disabled "What you are receiving" variants), `runOpenCodeSkill` (agent branch happy path, SDK failure, AbortError, toolCount log line), and the `extractAssistantText` legacy chat-completion fallback.
+- `src/lib/rtk.test.ts` — `createRtkAdapter` (QUB-85: BOOP_RTK_DISABLED bypass, missing-binary fallback, rtk CLI shape, per-call overrides, rtk-failure raw fallback, init memoisation, source getter, single-fallback-log, custom binary name).
+- `src/lib/github.test.ts` — `mintInstallationToken`, `postStatus`, `postReview`, `postInlineComments` (parallel + partial failures), `cleanupPriorReview` (parallel fetches + pagination + error counting).
 
-`src/index.test.mjs` is the integration test: it drives `run(env, overrides)` end-to-end with every side effect stubbed — fetch returns canned responses, Octokit is a recording fake, `spawn` and `execFile` are stubs, `runOpenCodeSkill` returns a canned review — and asserts the orchestration order (auth → review → done), failure paths, re-review cleanup gating, and defense-in-depth gates.
+`src/index.test.ts` is the integration test: it drives `run(env, overrides)` end-to-end with every side effect stubbed — fetch returns canned responses, Octokit is a recording fake, `spawn` and `execFile` are stubs, `runOpenCodeSkill` returns a canned review — and asserts the orchestration order (auth → review → done), failure paths, re-review cleanup gating, and defense-in-depth gates.
 
-The `review-header.test.mjs` mirrors
+The `review-header.test.ts` mirrors
 `apps/receiver/internal/github/review_header_test.go` — change one, change both.
 
 ## rtk adapter (QUB-85)
 
 The runner's file reads (today: the SKILL.md and the seven lens files
 from the ConfigMap mount) go through the rtk adapter in
-`src/lib/rtk.mjs`. The adapter is the single place the runner shells
+`src/lib/rtk.ts`. The adapter is the single place the runner shells
 out to `rtk read`; it routes reads through rtk when the binary is
 present and falls back to raw `fs.readFile` when rtk is missing or
 disabled. The runner-side kill switch is `BOOP_RTK_DISABLED=1`; the
