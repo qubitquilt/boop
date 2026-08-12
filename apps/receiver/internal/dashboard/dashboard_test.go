@@ -691,6 +691,138 @@ func TestServeRunDetail_RendersFailedRun(t *testing.T) {
 	}
 }
 
+// TestServeRunDetail_RendersOpenRouterMetrics covers the
+// aggregate telemetry section + per-lens table on the run
+// detail. The runner POSTs the QUB-105 fields + a per-expert
+// lens_telemetry batch; the page renders every field the
+// runner forwarded.
+func TestServeRunDetail_RendersOpenRouterMetrics(t *testing.T) {
+	h := newTestDashboardWithLogs(t, nil, func(ctx context.Context, jobName string) (string, error) {
+		return "pod log placeholder\n", nil
+	})
+	ctx := context.Background()
+	now := time.Now().UTC()
+	run := store.Run{
+		ID: "boop-a-b-99-zzzzzzz", Owner: "alice", Repo: "widgets",
+		PRNumber: 99, CommitSHA: "zzzzzzz", BaseRef: "main",
+		ReviewNumber: 1, Reason: "pull_request.opened", InstallationID: 1,
+		Status: store.StatusSucceeded, StartedAt: now.Add(-30 * time.Second),
+	}
+	if _, err := h.store.UpsertRun(ctx, run); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	dur := int64(2800)
+	reqID := "gen-2026-01-01-abc"
+	isByok := true
+	if err := h.store.RecordTelemetry(ctx, store.Telemetry{
+		RunID:               run.ID,
+		Model:               "anthropic/claude-sonnet-4",
+		Provider:            "openrouter",
+		InputTokens:         38506,
+		OutputTokens:        4218,
+		TotalTokens:         42724,
+		ReasoningTokens:     1200,
+		CacheReadTokens:     5000,
+		CostUSD:             0.00746844,
+		CostPromptUSD:       0.005,
+		CostCompletionUSD:   0.002,
+		CostUpstreamUSD:     0.007,
+		IsByok:              isByok,
+		ServerToolCallsExec: 2,
+		ServerToolCallsReq:  2,
+		RequestID:           &reqID,
+		DurationMS:          &dur,
+		StepCount:           1,
+	}); err != nil {
+		t.Fatalf("seed telemetry: %v", err)
+	}
+	if err := h.store.ReplaceLensTelemetry(ctx, run.ID, []store.LensTelemetry{
+		{RunID: run.ID, Lens: "design-pattern", Model: "anthropic/claude-sonnet-4", InputTokens: 1200, OutputTokens: 200, CostUSD: 0.002, StepCount: 1},
+		{RunID: run.ID, Lens: "readability", Model: "anthropic/claude-sonnet-4", InputTokens: 900, OutputTokens: 150, CostUSD: 0.0015, StepCount: 1},
+	}); err != nil {
+		t.Fatalf("seed lens_telemetry: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/dashboard/runs/"+run.ID, nil)
+	rr := httptest.NewRecorder()
+	h.route(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+
+	// Aggregate OpenRouter section: model, provider, cost,
+	// step count, and the QUB-105 token + cost fields.
+	// Use the unique text segments to avoid HTML-entity
+	// matching pain (the template uses &nbsp; in headers).
+	for _, want := range []string{
+		"OpenRouter",
+		"anthropic/claude-sonnet-4",
+		"openrouter",
+		"0.007468",
+		"38506", "4218", "1200", "5000",
+		"agent steps",
+		"BYOK",
+		"yes",         // IsByok chip label
+		"gen-2026-01-01-abc", // request id value
+		"2800 ms",            // SDK latency value
+		"2 executed",         // server tool calls value
+		"design-pattern",
+		"readability",
+		"0.002000", // design-pattern cost
+		"0.001500", // readability cost
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q", want)
+		}
+	}
+	// Empty state for a run with no telemetry: the
+	// "no telemetry yet" hint should NOT appear here.
+	if strings.Contains(body, "No OpenRouter telemetry for this run") {
+		t.Errorf("body incorrectly shows the no-telemetry empty state")
+	}
+}
+
+// TestServeRunDetail_RendersNoTelemetryEmptyState covers
+// the missing-telemetry path: a run that never posted the
+// aggregate rollup (pre-narrator failure) renders the
+// "No OpenRouter telemetry for this run" hint instead of
+// zero-everywhere.
+func TestServeRunDetail_RendersNoTelemetryEmptyState(t *testing.T) {
+	h := newTestDashboardWithLogs(t, nil, func(ctx context.Context, jobName string) (string, error) {
+		return "", nil
+	})
+	ctx := context.Background()
+	now := time.Now().UTC()
+	run := store.Run{
+		ID: "boop-a-b-100-wwwwwww", Owner: "alice", Repo: "widgets",
+		PRNumber: 100, CommitSHA: "wwwwwww", BaseRef: "main",
+		ReviewNumber: 1, Reason: "pull_request.opened", InstallationID: 1,
+		Status: store.StatusFailed, StartedAt: now.Add(-2 * time.Minute),
+		Error:        "narrator threw",
+		FailureClass: "container_error",
+	}
+	if _, err := h.store.UpsertRun(ctx, run); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/dashboard/runs/"+run.ID, nil)
+	rr := httptest.NewRecorder()
+	h.route(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, "No OpenRouter telemetry for this run") {
+		t.Errorf("body missing the no-telemetry hint: %s", body)
+	}
+	// The dashes for missing fields should not appear as
+	// numeric zeros (we render "—" not "0").
+	if strings.Contains(body, "Total</th>\n  <tbody>\n    <tr>\n      <td>0</td>") {
+		t.Errorf("body renders raw 0 instead of dash for missing fields")
+	}
+}
+
 // TestServeRunDetail_RendersLogsUnavailable covers the
 // "Job TTL'd" path: the FetchPodLogs callback returns
 // ("", nil) and the dashboard renders the empty-state

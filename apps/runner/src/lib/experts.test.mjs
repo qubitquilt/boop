@@ -113,7 +113,7 @@ test("runExperts runs the named experts in parallel", async () => {
   Object.assign(EXPERT_POOL, overrides.pool);
   try {
     const t0 = Date.now();
-    const findings = await runExperts(["slow-1", "slow-2"], {}, deps, {});
+    const { findings } = await runExperts(["slow-1", "slow-2"], {}, deps, {});
     const elapsed = Date.now() - t0;
     assert.equal(findings.length, 2);
     // Parallel: elapsed should be ~50ms (one slow expert),
@@ -155,7 +155,7 @@ test("runExperts concatenates findings from every expert", async () => {
       }),
     },
   };
-  const findings = await runExperts(
+  const { findings } = await runExperts(
     ["regression-hunter", "test-quality"],
     {},
     deps,

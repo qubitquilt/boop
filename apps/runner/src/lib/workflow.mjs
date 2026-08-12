@@ -846,11 +846,27 @@ async function dispatchSubStage(ctx, deps, overrides, state) {
     walkthrough: state.walkthrough,
     findings: [], // running set; experts append as they produce findings
   };
-  const findings = await run(names, ctx, deps, shared);
+  // runExperts returns { findings, lensTelemetry } in
+  // production. A test override may still return the legacy
+  // bare-array shape (a list of findings with no telemetry);
+  // accept both so the override hook is backward compatible.
+  const result = await run(names, ctx, deps, shared);
+  const findings = Array.isArray(result) ? result : result.findings || [];
+  const lensTelemetry = Array.isArray(result)
+    ? []
+    : result.lensTelemetry || [];
   state.findings = findings;
+  // Per-expert telemetry rollup. The dashboard reads this
+  // for the per-lens breakdown; the orchestrator forwards
+  // it to the receiver's lens_telemetry table at end of run
+  // (see index.mjs postRunnerTelemetryIfAny). Experts whose
+  // callResult failed (rare; only when the SDK throws) do
+  // not contribute a row.
+  state.lensTelemetry = lensTelemetry;
   deps.log("dispatch", "experts returned", {
     count: findings.length,
     names,
+    lensRows: lensTelemetry.length,
   });
 }
 
@@ -911,9 +927,14 @@ async function metaReviewSubStage(ctx, deps, overrides, state) {
   }
   deps.log("meta-review", "re-dispatching experts", { reDispatch });
   const run = overrides.runExperts || runExperts;
-  const newFindings = await run(reDispatch, ctx, deps, {
+  // Accept both the new {findings, lensTelemetry} shape
+  // (production) and the legacy bare-array shape (test
+  // override). See dispatchSubStage's matching note.
+  const reRun = await run(reDispatch, ctx, deps, {
     classification: state.classification,
   });
+  const newFindings = Array.isArray(reRun) ? reRun : reRun.findings || [];
+  const newLensRows = Array.isArray(reRun) ? [] : reRun.lensTelemetry || [];
   // Pass the reDispatch list to mergeByExpert so ALL old
   // findings for the re-dispatched experts are dropped,
   // even if the re-pass returned no new findings. Without
@@ -924,9 +945,23 @@ async function metaReviewSubStage(ctx, deps, overrides, state) {
     newFindings,
     new Set(reDispatch),
   );
+  // Merge the lens-telemetry rows the same way: keep
+  // every existing row whose lens is NOT in the re-dispatch
+  // set, replace the rows for the re-dispatched lenses
+  // with the fresh rows from the re-pass. A re-pass that
+  // returns no telemetry (e.g. the LLM was never invoked
+  // because the lens still has no findings) drops the
+  // old row — the dashboard reflects "this expert ran
+  // again but didn't generate new spend".
+  const reDispatchSet = new Set(reDispatch);
+  const keptLens = (state.lensTelemetry || []).filter(
+    (l) => !reDispatchSet.has(l.lens),
+  );
+  state.lensTelemetry = [...keptLens, ...newLensRows];
   deps.log("meta-review", "re-pass merged", {
     reDispatched: reDispatch,
     total: state.findings.length,
+    lensRows: state.lensTelemetry.length,
   });
 }
 

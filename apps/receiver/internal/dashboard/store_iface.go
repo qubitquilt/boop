@@ -59,6 +59,7 @@ type Store interface {
 	UpdateRunStatus(ctx context.Context, id string, status store.RunStatus, endedAt *time.Time, durationMS *int64, errMsg string) (store.Run, error)
 	UpsertInstallations(ctx context.Context, installs []store.Installation) error
 	RecordTelemetry(ctx context.Context, t store.Telemetry) error
+	ReplaceLensTelemetry(ctx context.Context, runID string, rows []store.LensTelemetry) error
 	TouchRunHeartbeat(ctx context.Context, runID string) error
 }
 

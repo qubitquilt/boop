@@ -1185,6 +1185,29 @@ function parseFailedReview() {
   };
 }
 
+// reviewWithLensTelemetry produces a successful review AND
+// two per-lens telemetry rows. The standard fixture's
+// expert overrides return `{ findings, telemetry }` per
+// expert (the post-RF-008 contract); the test verifies the
+// runner collects them into a single lens_telemetry batch.
+function reviewWithLensTelemetry() {
+  return {
+    summary: "## TL;DR\nlooks good",
+    inlineComments: [],
+    confidence: "high",
+    telemetry: {
+      model: "test/narrator-model",
+      inputTokens: 200,
+      outputTokens: 80,
+      totalTokens: 280,
+      costUsd: 0.0042,
+      stepCount: 1,
+      durationMs: 2400,
+      requestId: "narrator-test",
+    },
+  };
+}
+
 test("run: parseFailed (summary empty) posts telemetry + lens_telemetry (QUB-131)", async () => {
   const fetch = recordingFetch();
   const overrides = standardOverrides({
@@ -1248,15 +1271,19 @@ test("run: parseFailed without telemetry is a no-op for the telemetry POST (QUB-
   );
 });
 
-test("run: parseFailed skips lens_telemetry POST when state.lensTelemetry is unset (QUB-131)", async () => {
-  // The orchestrator never populates state.lensTelemetry today
-  // (the lens-rollup attribution is a QUB-109 future-shape; the
-  // helper guard is in place for when it does). This test pins
-  // the no-op contract: an unset `state.lensTelemetry` means no
-  // /lens_telemetry POST. The lens-batch code path itself is
-  // exercised by the dashboard.test.mjs unit tests; here we
-  // just verify the orchestrator doesn't accidentally POST an
-  // empty payload when the lens array is missing.
+test("run: parseFailed skips lens_telemetry POST when state.lensTelemetry is empty (QUB-131)", async () => {
+  // The orchestrator populates state.lensTelemetry in
+  // dispatchSubStage (one row per expert that returned
+  // telemetry). The lens_telemetry POST is a no-op when the
+  // array is empty — same no-op contract as the telemetry
+  // POST helper. A parseFailed run that never reaches
+  // dispatch (or whose expert fixture returns no telemetry)
+  // skips the POST.
+  //
+  // The lens-batch code path itself is exercised by the
+  // dashboard.test.mjs unit tests; here we just verify the
+  // orchestrator doesn't accidentally POST an empty payload
+  // when the lens array is missing.
   const fetch = recordingFetch();
   const overrides = standardOverrides({
     fetchImpl: fetch,
@@ -1269,13 +1296,81 @@ test("run: parseFailed skips lens_telemetry POST when state.lensTelemetry is uns
   assert.equal(
     lensPost,
     undefined,
-    "lens_telemetry POST must be skipped when state.lensTelemetry is unset",
+    "lens_telemetry POST must be skipped when state.lensTelemetry is empty",
   );
   // Telemetry POST still lands.
   const telemetryPost = fetch.calls.find((c) =>
     c.url.includes("/api/runs/boop-test-job-1/telemetry"),
   );
   assert.ok(telemetryPost, "expected telemetry POST alongside lens_telemetry");
+});
+
+test("run: lens_telemetry is posted per expert (one row per expert)", async () => {
+  // The multi-expert dispatch returns one telemetry row per
+  // expert; the receiver's lens_telemetry table replaces the
+  // run's rows on each POST (REPLACE semantics). Verify the
+  // runner collects per-expert rows and POSTs them as a
+  // single batch.
+  const fetch = recordingFetch();
+  const overrides = standardOverrides({
+    fetchImpl: fetch,
+    runOpenCodeSkill: async () => reviewWithLensTelemetry(),
+    // Override the default (empty) expert telemetry so the
+    // dispatch's per-expert rows are non-empty. design-pattern
+    // and readability are the two experts the QUB-95 default
+    // pool picks for a "feature" PR.
+    expertOverrides: {
+      "regression-hunter": async () => ({ findings: [], telemetry: null }),
+      "test-quality": async () => ({ findings: [], telemetry: null }),
+      "api-design": async () => ({ findings: [], telemetry: null }),
+      "error-handling": async () => ({ findings: [], telemetry: null }),
+      "design-pattern": async () => ({
+        findings: [],
+        telemetry: {
+          model: "test/expert-model",
+          inputTokens: 1000,
+          outputTokens: 200,
+          reasoningTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUsd: 0.002,
+          stepCount: 1,
+        },
+      }),
+      "readability": async () => ({
+        findings: [],
+        telemetry: {
+          model: "test/expert-model",
+          inputTokens: 800,
+          outputTokens: 150,
+          reasoningTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          costUsd: 0.0015,
+          stepCount: 1,
+        },
+      }),
+    },
+  });
+  await run(dashboardEnv(), overrides);
+  const lensPost = fetch.calls.find((c) =>
+    c.url.includes("/api/runs/boop-test-job-1/lens_telemetry"),
+  );
+  assert.ok(lensPost, "expected a lens_telemetry POST in the happy path");
+  const body = JSON.parse(lensPost.opts.body);
+  assert.ok(Array.isArray(body.lenses), "lens_telemetry body must have a lenses array");
+  // The standard fixture dispatches two experts
+  // (design-pattern, readability) per the QUB-95 default
+  // pool; verify the array has one row per expert.
+  const lensNames = body.lenses.map((l) => l.lens).sort();
+  assert.deepEqual(lensNames, ["design-pattern", "readability"]);
+  // Each row carries the per-expert cost + tokens.
+  for (const l of body.lenses) {
+    assert.equal(l.model, "test/expert-model");
+    assert.equal(typeof l.input_tokens, "number");
+    assert.equal(typeof l.cost_usd, "number");
+    assert.equal(l.step_count, 1);
+  }
 });
 
 test("run: stage throw before narrator posts status=failed and skips telemetry (QUB-131)", async () => {

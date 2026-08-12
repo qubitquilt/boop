@@ -1,6 +1,7 @@
 package dashboard
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 
@@ -98,6 +99,164 @@ func silentFor(startedAt time.Time, lastHeartbeatAt *time.Time) string {
 		return time.Since(startedAt).Round(time.Second).String() + " (no heartbeat ever)"
 	}
 	return ""
+}
+
+// TelemetryView is the run-detail DTO for the aggregate
+// OpenRouter telemetry. The receiver stores the QUB-105
+// shape (see store.Telemetry); the dashboard renders
+// every field the runner forwards. Empty/zero values are
+// shown as "—" so a partial payload (older runner, network
+// truncation) doesn't read as a clean zero-cost run.
+type TelemetryView struct {
+	Model               string
+	Provider            string
+	InputTokens         string
+	OutputTokens        string
+	TotalTokens         string
+	ReasoningTokens     string
+	CacheReadTokens     string
+	CacheWriteTokens    string
+	CostUSD             string
+	CostPromptUSD       string
+	CostCompletionUSD   string
+	CostUpstreamUSD     string
+	IsByok              bool
+	ServerToolCallsExec int64
+	ServerToolCallsReq  int64
+	RequestID           string
+	DurationMS          string
+	StepCount           int
+	Has                 bool // true when the store returned a non-empty row
+}
+
+// newTelemetryView projects store.Telemetry to the view
+// shape. `Has` is false when the store has no telemetry
+// row for the run (the runner never posted one, or the
+// run died before the narrator); the template uses it to
+// render an "no telemetry yet" empty state instead of
+// zero-everywhere.
+func newTelemetryView(t store.Telemetry) TelemetryView {
+	if t.Model == "" {
+		// No telemetry row at all — the runner never posted
+		// the aggregate rollup. Return a view with Has=false
+		// so the template renders the empty state.
+		return TelemetryView{Has: false}
+	}
+	return TelemetryView{
+		Has: true,
+		// The model + provider are non-numeric; render them
+		// verbatim (the store filters empty strings out via
+		// the JSON omitempty tags upstream).
+		Model: t.Model,
+		Provider: func() string {
+			if t.Provider == "" {
+				return "openrouter"
+			}
+			return t.Provider
+		}(),
+		// Numeric fields: 0 → "—" so a partial payload
+		// doesn't read as "the model used 0 tokens". The
+		// raw value is preserved as data-* on the <td>
+		// (template) for the "0 means 0" cases (e.g.
+		// step_count really is 1 for the single-turn
+		// path). The string-form is the only thing the
+		// template renders.
+		InputTokens:       fmtInt(t.InputTokens),
+		OutputTokens:      fmtInt(t.OutputTokens),
+		TotalTokens:       fmtInt(t.TotalTokens),
+		ReasoningTokens:   fmtInt(t.ReasoningTokens),
+		CacheReadTokens:   fmtInt(t.CacheReadTokens),
+		CacheWriteTokens:  fmtInt(t.CacheWriteTokens),
+		CostUSD:           fmtCost(t.CostUSD),
+		CostPromptUSD:     fmtCost(t.CostPromptUSD),
+		CostCompletionUSD: fmtCost(t.CostCompletionUSD),
+		CostUpstreamUSD:   fmtCost(t.CostUpstreamUSD),
+		IsByok:            t.IsByok,
+		ServerToolCallsExec: t.ServerToolCallsExec,
+		ServerToolCallsReq:  t.ServerToolCallsReq,
+		RequestID:           ptrOrEmpty(t.RequestID),
+		DurationMS:          ptrIntOrEmpty(t.DurationMS),
+		StepCount:           t.StepCount,
+	}
+}
+
+// LensTelemetryView is the per-lens DTO. Same rationale as
+// TelemetryView: every field the dashboard renders passes
+// through this converter so a future store.LensTelemetry
+// column does not auto-leak to the wire. The "Has" field
+// is implicit — a nil entry renders as an empty state.
+type LensTelemetryView struct {
+	Lens             string
+	Model            string
+	Provider         string
+	InputTokens      string
+	OutputTokens     string
+	ReasoningTokens  string
+	CacheReadTokens  string
+	CacheWriteTokens string
+	CostUSD          string
+	StepCount        int
+}
+
+// newLensTelemetryView projects a single store.LensTelemetry
+// row to the view shape. The template iterates the slice
+// and renders one row per lens.
+func newLensTelemetryView(l store.LensTelemetry) LensTelemetryView {
+	return LensTelemetryView{
+		Lens:             l.Lens,
+		Model:            l.Model,
+		Provider:         l.Provider,
+		InputTokens:      fmtInt(l.InputTokens),
+		OutputTokens:     fmtInt(l.OutputTokens),
+		ReasoningTokens:  fmtInt(l.ReasoningTokens),
+		CacheReadTokens:  fmtInt(l.CacheReadTokens),
+		CacheWriteTokens: fmtInt(l.CacheWriteTokens),
+		CostUSD:          fmtCost(l.CostUSD),
+		StepCount:        l.StepCount,
+	}
+}
+
+// fmtInt formats a token count for display. 0 → "—" so a
+// missing metric reads as "not reported" instead of "0
+// tokens", which the operator would otherwise misread as
+// "the model used nothing."
+func fmtInt(v int64) string {
+	if v == 0 {
+		return "—"
+	}
+	return strconv.FormatInt(v, 10)
+}
+
+// fmtCost formats a USD cost for display. 0 → "—" (same
+// reasoning as fmtInt). Non-zero values get 6 decimal
+// places — OpenRouter costs are sub-cent for most reviews
+// and the dashboard's run cost column uses 4; the telemetry
+// view uses 6 so a $0.000123 expert call is readable.
+func fmtCost(v float64) string {
+	if v == 0 {
+		return "—"
+	}
+	return fmt.Sprintf("$%.6f", v)
+}
+
+// ptrOrEmpty returns the dereferenced value or "" for a
+// nil pointer. Used for nullable TEXT / INTEGER columns
+// the runner may have left unset.
+func ptrOrEmpty(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// ptrIntOrEmpty formats an int64 pointer with the same
+// "0 → —" rule as fmtInt. The runner forwards duration_ms
+// as *int64; the dashboard renders the value in ms.
+func ptrIntOrEmpty(p *int64) string {
+	if p == nil {
+		return "—"
+	}
+	return fmt.Sprintf("%d ms", *p)
 }
 
 // RunsRow is the row used in the runs-list view.

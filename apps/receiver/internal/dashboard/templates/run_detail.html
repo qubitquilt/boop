@@ -79,24 +79,82 @@
 <div class="empty">Logs unavailable (Job may have been TTL'd out of the namespace; K8s garbage-collects Jobs 1h after they finish).</div>
 {{end}}
 
+<h3>OpenRouter</h3>
+{{if .Telemetry.Has}}
+<div class="kpi-row">
+  <div class="kpi"><div class="v"><code>{{.Telemetry.Model}}</code></div><div class="l">model</div></div>
+  <div class="kpi"><div class="v">{{.Telemetry.Provider}}</div><div class="l">provider</div></div>
+  <div class="kpi"><div class="v">{{.Telemetry.CostUSD}}</div><div class="l">total cost</div></div>
+  <div class="kpi"><div class="v">{{.Telemetry.StepCount}}</div><div class="l">agent steps</div></div>
+</div>
+<h4>Tokens</h4>
+<table>
+  <thead><tr><th>Input</th><th>Output</th><th>Reasoning</th><th>Cache&nbsp;read</th><th>Cache&nbsp;write</th><th>Total</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>{{.Telemetry.InputTokens}}</td>
+      <td>{{.Telemetry.OutputTokens}}</td>
+      <td>{{.Telemetry.ReasoningTokens}}</td>
+      <td>{{.Telemetry.CacheReadTokens}}</td>
+      <td>{{.Telemetry.CacheWriteTokens}}</td>
+      <td>{{.Telemetry.TotalTokens}}</td>
+    </tr>
+  </tbody>
+</table>
+<h4>Cost breakdown</h4>
+<table>
+  <thead><tr><th>Prompt</th><th>Completion</th><th>Upstream</th><th>BYOK</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>{{.Telemetry.CostPromptUSD}}</td>
+      <td>{{.Telemetry.CostCompletionUSD}}</td>
+      <td>{{.Telemetry.CostUpstreamUSD}}</td>
+      <td>{{if .Telemetry.IsByok}}<span class="chip chip-class">yes</span>{{else}}<span class="muted">routed</span>{{end}}</td>
+    </tr>
+  </tbody>
+</table>
+{{if or .Telemetry.RequestID .Telemetry.DurationMS .Telemetry.ServerToolCallsExec .Telemetry.ServerToolCallsReq}}
+<h4>Call metadata</h4>
+<table>
+  <tbody>
+    {{if .Telemetry.RequestID}}<tr><th>Request&nbsp;ID</th><td><code>{{.Telemetry.RequestID}}</code></td></tr>{{end}}
+    {{if .Telemetry.DurationMS}}<tr><th>SDK&nbsp;latency</th><td>{{.Telemetry.DurationMS}}</td></tr>{{end}}
+    {{if or .Telemetry.ServerToolCallsExec .Telemetry.ServerToolCallsReq}}
+    <tr><th>Server&nbsp;tool&nbsp;calls</th>
+      <td>{{.Telemetry.ServerToolCallsExec}} executed / {{.Telemetry.ServerToolCallsReq}} requested</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}
+{{else}}
+<div class="empty">No OpenRouter telemetry for this run. The runner may have died before the narrator finished, or the run pre-dates the QUB-105 schema (v6). The K8s pod logs below may have additional cost context.</div>
+{{end}}
+
 <h3>Per-lens breakdown</h3>
 {{if .Lenses}}
 <table>
-  <thead><tr><th>Lens</th><th>Model</th><th>Tokens (in/out)</th><th>Cost</th><th>Steps</th></tr></thead>
+  <thead><tr>
+    <th>Lens</th><th>Model</th><th>In</th><th>Out</th><th>Reason</th>
+    <th>Cache&nbsp;r/w</th><th>Cost</th><th>Steps</th>
+  </tr></thead>
   <tbody>
     {{range .Lenses}}
     <tr>
-      <td>{{.Lens}}</td>
+      <td><code>{{.Lens}}</code></td>
       <td><code>{{.Model}}</code></td>
-      <td>{{.InputTokens}} / {{.OutputTokens}}</td>
-      <td>${{.CostUSD}}</td>
+      <td>{{.InputTokens}}</td>
+      <td>{{.OutputTokens}}</td>
+      <td>{{.ReasoningTokens}}</td>
+      <td>{{.CacheReadTokens}} / {{.CacheWriteTokens}}</td>
+      <td>{{.CostUSD}}</td>
       <td>{{.StepCount}}</td>
     </tr>
     {{end}}
   </tbody>
 </table>
 {{else}}
-<div class="empty">No per-lens telemetry yet.</div>
+<div class="empty">No per-lens telemetry yet. The runner may have died before the experts finished, or the run pre-dates the per-lens rollup (QUB-131). The K8s pod logs below may have additional context.</div>
 {{end}}
 
 <h3>Lineage</h3>

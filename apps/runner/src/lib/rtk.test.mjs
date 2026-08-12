@@ -158,29 +158,66 @@ test("createRtkAdapter: per-call options override the defaults", async () => {
   ]);
 });
 
-test("createRtkAdapter: rtk read failure falls back to raw reads", async () => {
+test("createRtkAdapter: rtk read failure flips to raw mode for the rest of the run", async () => {
+  // The common case in production: rtk is on PATH (init() passes)
+  // but a real read call throws (e.g. the installed rtk rejects
+  // the ConfigMap mount path with "No such file or directory").
+  // The first failure must:
+  //   - log the failure with the path and error,
+  //   - flip the adapter to raw mode for the rest of the run,
+  //   - NOT log "rtk read failed" again on subsequent reads
+  //     (would produce 5+ noise lines per run).
   const { calls, exec } = recordingExecFile([
     { stdout: "/usr/local/bin/rtk\n" },
     { throw: new Error("rtk crashed: signal 11") },
   ]);
-  const fs = fakeFs({ "/path/to/file.md": "raw fallback" });
+  const fs = fakeFs({
+    "/path/to/a.md": "raw a",
+    "/path/to/b.md": "raw b",
+    "/path/to/c.md": "raw c",
+  });
   const logCalls = [];
   const adapter = createRtkAdapter({
     execFile: exec,
     fs,
     log: (tag, msg, meta) => logCalls.push({ tag, msg, meta }),
   });
-  const out = await adapter.readFile("/path/to/file.md");
-  assert.equal(out, "raw fallback");
-  // The fallback path is logged so an operator can correlate a
-  // rtk crash with the fallback that saved the read.
-  const fallbackLog = logCalls.find(
-    (l) => l.msg === "rtk read failed; falling back to raw read",
+  // First read: rtk throws, adapter falls back to raw, logs once.
+  assert.equal(await adapter.readFile("/path/to/a.md"), "raw a");
+  // Second + third reads: rtk is now off; raw reads silently.
+  assert.equal(await adapter.readFile("/path/to/b.md"), "raw b");
+  assert.equal(await adapter.readFile("/path/to/c.md"), "raw c");
+  // Exactly one switch log — not three per-read fallbacks.
+  const switchLogs = logCalls.filter((l) =>
+    l.msg === "rtk read failed; switching to raw read for the rest of the run",
   );
-  assert.ok(fallbackLog, "expected a fallback log line");
-  assert.match(fallbackLog.meta.err, /rtk crashed/);
-  // Sanity: the rtk call was actually attempted.
-  assert.equal(calls.length, 2);
+  assert.equal(switchLogs.length, 1, "expected exactly one switch log");
+  assert.match(switchLogs[0].meta.err, /rtk crashed/);
+  // rtk was only invoked once — the second and third reads
+  // bypass the binary entirely.
+  const rtkInvocations = calls.filter((c) => c.bin === "/usr/local/bin/rtk");
+  assert.equal(rtkInvocations.length, 1, "rtk should only be called once");
+});
+
+test("createRtkAdapter: rtk failure flip is observable in the source getter", async () => {
+  // After the first rtk failure, the source getter reports
+  // "raw" (not "rtk") so a caller that reads the field after
+  // a read sees the actual mode. Useful for tests + the
+  // orchestrator's "is rtk in the path" introspection.
+  const { exec } = recordingExecFile([
+    { stdout: "/usr/local/bin/rtk\n" },
+    { throw: new Error("rtk read failed: No such file or directory") },
+  ]);
+  const fs = fakeFs({ "/p": "raw content" });
+  const adapter = createRtkAdapter({
+    execFile: exec,
+    fs,
+    log: () => {},
+  });
+  await adapter.init();
+  assert.equal(adapter.source, "rtk");
+  await adapter.readFile("/p");
+  assert.equal(adapter.source, "raw");
 });
 
 test("createRtkAdapter: init() is idempotent and memoised", async () => {

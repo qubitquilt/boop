@@ -10,7 +10,12 @@
 // The adapter falls back to raw `fs.readFile` when:
 //   - the rtk binary is not on PATH (image built without the QUB-85
 //     changes, local dev without rtk installed),
-//   - BOOP_RTK_DISABLED=1 is set (operator kill switch).
+//   - BOOP_RTK_DISABLED=1 is set (operator kill switch),
+//   - the rtk binary is on PATH but a read call throws (e.g. the
+//     installed rtk is incompatible with the path or the
+//     ConfigMap mount). The first failure flips the adapter to
+//     raw mode for the rest of the run so the fallback log
+//     fires once, not per file.
 //
 // The two failure modes look identical to callers: `readFile(path,
 // "utf8")` returns a string. The adapter logs the fallback on the
@@ -163,11 +168,20 @@ export function createRtkAdapter({
     try {
       return await readViaRtk(execFile, env, s.binary, path, options);
     } catch (err) {
-      // One rtk call failing must not abort the whole prompt build.
-      // Fall through to the raw read so the lens still has content.
-      // The error is logged so an operator can correlate the
-      // fallback with a specific rtk call.
-      log("rtk", "rtk read failed; falling back to raw read", {
+      // First rtk call failure: flip the adapter to raw mode
+      // for the rest of the run so the fallback log fires
+      // once, not per file. The common case is a binary that
+      // is on PATH (init() passed) but cannot actually read
+      // the mount — e.g. the installed rtk rejects the
+      // ConfigMap path with "No such file or directory".
+      // Logging every failed call would produce 5+ noise
+      // lines per run; logging once and switching to raw
+      // mode is the same pattern init() already uses for
+      // the binary-missing case.
+      s.source = "raw";
+      s.reason = `rtk-error: ${String(err?.message ?? err).split("\n")[0]}`;
+      s.binary = null;
+      log("rtk", "rtk read failed; switching to raw read for the rest of the run", {
         path,
         err: String(err?.message ?? err),
       });

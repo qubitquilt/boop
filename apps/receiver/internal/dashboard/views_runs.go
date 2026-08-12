@@ -98,6 +98,12 @@ type runsFilter struct {
 // is local (same process, same *sql.DB pool) so the
 // cost is one open + three round-trips rather than
 // three serial round-trips.
+//
+// The aggregate telemetry fetch is folded into the
+// same fan-out (the OpenRouter model / tokens / cost /
+// error-context block on the run detail). It's also
+// best-effort: a missing row renders the "no telemetry"
+// empty state instead of failing the page.
 func (h *Handler) serveRunDetail(w http.ResponseWriter, r *http.Request, id string) {
 	ctx := r.Context()
 	run, err := h.store.GetRun(ctx, id)
@@ -106,16 +112,18 @@ func (h *Handler) serveRunDetail(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	type stagesResult struct {
-		stages  []store.RunStage
-		lenses  []store.LensTelemetry
-		lineage store.Lineage
+		stages    []store.RunStage
+		lenses    []store.LensTelemetry
+		lineage   store.Lineage
+		telemetry store.Telemetry
 	}
 	resCh := make(chan stagesResult, 1)
 	go func() {
 		stages, _ := h.store.ListRunStages(ctx, id)
 		lenses, _ := h.store.ListLensTelemetry(ctx, id)
 		lineage, _ := h.store.WalkLineage(ctx, id, 32)
-		resCh <- stagesResult{stages, lenses, lineage}
+		telemetry, _ := h.store.GetTelemetry(ctx, id)
+		resCh <- stagesResult{stages, lenses, lineage, telemetry}
 	}()
 	res := <-resCh
 
@@ -128,13 +136,18 @@ func (h *Handler) serveRunDetail(w http.ResponseWriter, r *http.Request, id stri
 	// renders with the structured stages + error string.
 	logs, logsErr := h.fetchLogs(ctx, id)
 
+	lensViews := make([]LensTelemetryView, 0, len(res.lenses))
+	for _, l := range res.lenses {
+		lensViews = append(lensViews, newLensTelemetryView(l))
+	}
 	data := runDetailView{
-		Nav:     "runs",
-		Run:     newRunView(run),
-		Stages:  renderWaterfall(res.stages),
-		Lenses:  res.lenses,
-		Lineage: res.lineage,
-		Logs:    logs,
+		Nav:      "runs",
+		Run:      newRunView(run),
+		Stages:   renderWaterfall(res.stages),
+		Lenses:   lensViews,
+		Lineage:  res.lineage,
+		Telemetry: newTelemetryView(res.telemetry),
+		Logs:     logs,
 	}
 	if logsErr != nil {
 		data.LogsErr = logsErr.Error()
@@ -154,13 +167,14 @@ func (h *Handler) fetchLogs(ctx context.Context, jobName string) (string, error)
 }
 
 type runDetailView struct {
-	Nav     string
-	Run     RunView
-	Stages  []stageRow
-	Lenses  []store.LensTelemetry
-	Lineage store.Lineage
-	Logs    string
-	LogsErr string
+	Nav       string
+	Run       RunView
+	Stages    []stageRow
+	Lenses    []LensTelemetryView
+	Lineage   store.Lineage
+	Telemetry TelemetryView
+	Logs      string
+	LogsErr   string
 }
 type stageRow struct {
 	Stage     string

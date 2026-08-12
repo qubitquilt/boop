@@ -308,7 +308,32 @@ async function defaultExpert(name, ctx, deps, shared = {}) {
   for (const f of parsed.findings) {
     if (f && !f.expert) f.expert = name;
   }
-  return parsed;
+  // 8. Build the per-expert telemetry row. Same shape as
+  // the orchestrator's narrator telemetry (the SDK returns
+  // a single `usage` object per call; we map the snake_case
+  // fields the receiver's lens_telemetry table expects).
+  // Best-effort: a failed LLM call has no callResult, so
+  // the per-expert row is empty and the receiver's defaults
+  // (0 for numerics, NULL for text) land on disk. The
+  // dispatch never sees a partial row.
+  const u = callResult?.usage || {};
+  const telemetry = callResult
+    ? {
+        model: callResult.model || ctx.openrouterModel || "",
+        provider: "openrouter",
+        inputTokens: u.prompt_tokens ?? 0,
+        outputTokens: u.completion_tokens ?? 0,
+        reasoningTokens: u.reasoning_tokens ?? 0,
+        cacheReadTokens: u.cached_tokens ?? 0,
+        cacheWriteTokens: 0,
+        costUsd: u.cost ?? 0,
+        stepCount:
+          typeof callResult.stepCount === "number" && callResult.stepCount > 0
+            ? callResult.stepCount
+            : 1,
+      }
+    : null;
+  return { findings: parsed.findings, telemetry };
 }
 
 // readLensBody reads the lens file body (the system prompt).
@@ -407,10 +432,11 @@ function normalizeSeverity(s) {
 }
 
 // runExperts runs a list of expert names in parallel and
-// returns the concatenated findings. Each expert runs
-// independently — a single expert failure rejects the
-// whole dispatch, and the workflow's retry machinery
-// re-attempts (per-expert failures bubble up to the gate).
+// returns the concatenated findings + a per-expert
+// telemetry rollup. Each expert runs independently — a
+// single expert failure rejects the whole dispatch, and
+// the workflow's retry machinery re-attempts (per-expert
+// failures bubble up to the gate).
 //
 // The shared object lets the experts coordinate. The
 // walkthrough is on `shared.walkthrough`; the running set of
@@ -424,9 +450,18 @@ function normalizeSeverity(s) {
 // failures (a single failure rejects the whole dispatch;
 // the gate re-attempts the dispatch; the LLM is
 // deterministic per call so re-attempts are safe).
+//
+// Return shape: { findings: Finding[], lensTelemetry:
+// { lens, model, provider, inputTokens, ..., costUsd,
+// stepCount }[] }. The lensTelemetry rows are forwarded to
+// the receiver's lens_telemetry table; the per-expert
+// cost/tokens let the dashboard break down total spend by
+// lens. Backward compat: callers that read `result.findings`
+// directly keep working; new callers use
+// `result.lensTelemetry`.
 export async function runExperts(names, ctx, deps, shared = {}) {
   if (!Array.isArray(names) || names.length === 0) {
-    return [];
+    return { findings: [], lensTelemetry: [] };
   }
   const tasks = names.map((name) => {
     const fn = deps.expertOverrides?.[name] || EXPERT_POOL[name];
@@ -453,15 +488,32 @@ export async function runExperts(names, ctx, deps, shared = {}) {
     wrapped.failed = failed.map((f) => ({ name: f.name, err: f.err }));
     throw wrapped;
   }
-  // Merge findings across experts. The orchestrator's
-  // gather step de-dupes; this is just the concat.
+  // Merge findings across experts + accumulate per-expert
+  // telemetry. The orchestrator's gather step de-dupes the
+  // findings; this is just the concat. Telemetry rows are
+  // keyed by lens name; the meta-review re-dispatch
+  // (workflow.mjs metaReviewSubStage) replaces rows by name
+  // so a re-pass updates the existing row.
   const findings = [];
+  const lensTelemetry = [];
   for (const r of results) {
-    if (r && r.ok && r.result && Array.isArray(r.result.findings)) {
-      findings.push(...r.result.findings);
+    if (!r || !r.ok || !r.result) continue;
+    const res = r.result;
+    // Legacy shape: { findings: [...] }. The expert
+    // didn't go through defaultExpert (or is a test fixture
+    // that predates the telemetry-return contract). Pull
+    // findings only; skip the lens rollup.
+    const f = Array.isArray(res.findings)
+      ? res.findings
+      : Array.isArray(res)
+        ? res
+        : [];
+    if (f.length > 0) findings.push(...f);
+    if (res.telemetry) {
+      lensTelemetry.push({ lens: r.name, ...res.telemetry });
     }
   }
-  return findings;
+  return { findings, lensTelemetry };
 }
 
 // defaultMetaReview is the stub. It accepts every finding
