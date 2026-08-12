@@ -304,7 +304,7 @@ flow:
 `priorReviewHeaderRegex` matches `## 🐾 Boop's review`,
 `## 🐾 Boop's re-review`, `## 🐾 Boop's re-review #2`, etc. The
 companion `ReviewSummaryHeader(n)` formats them. The runner's
-`apps/runner/src/review-header.mjs` mirrors both. Tests on both sides
+`apps/runner/src/review-header.ts` mirrors both. Tests on both sides
 pin the format.
 
 ## Tests

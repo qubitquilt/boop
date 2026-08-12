@@ -79,7 +79,7 @@ in parallel within each pass.
 **Stateful Job chain. State lives in the GitHub status comment.**
 
 The runner becomes an internal state machine. Macro-stages are a
-flat list in `apps/runner/src/lib/workflow.mjs`. The `sniff`
+flat list in `apps/runner/src/lib/workflow.ts`. The `sniff`
 macro-stage's `run` is a sub-workflow executor that walks a flat
 list of sub-stages. A small `withRetry` helper applies a
 bounded-attempt / exponential-backoff policy to any stage or
@@ -187,7 +187,7 @@ and the existing test suite passes end-to-end at every step.
 1. **QUB-88 — spike (this PR).** Engine choice + sub-workflow shape.
 2. **QUB-89 — define macro-stages.** Refactor `run()` so each macro
    stage is a named async function. No behavior change. New
-   `apps/runner/src/lib/workflow.mjs` exports the macro list and the
+   `apps/runner/src/lib/workflow.ts` exports the macro list and the
    executor. The `sniff` macro-stage is a thin wrapper around the
    sub-workflow (initially a single-step sub-workflow that calls the
    current `runOpenCodeSkill` — same behavior as before).
@@ -232,7 +232,7 @@ and the existing test suite passes end-to-end at every step.
 ## Open question for the team
 
 The summary comment's head-SHA marker already exists (see
-`apps/runner/src/lib/github.mjs` `postReview`). The summary gate can
+`apps/runner/src/lib/github.ts` `postReview`). The summary gate can
 reuse it to detect a duplicate summary on resume. The inlines gate has
 no equivalent marker today; the simplest dedupe is
 `(path, line, body)`-exact. Confirm the dedupe rule before the resume

@@ -7,14 +7,22 @@
 # /home/opencode/.local/share/rtk/trusted_filters.json.
 #
 # The filter is intentionally narrow: it caps `rtk read` output to
-# bound the prompt context the lens sees. The runner's adapter also
-# passes an explicit `--max-lines` and `--truncate-lines-at` per call;
-# the filter here is the safety net.
+# bound the prompt context the lens sees. The cap was previously
+# `max_lines = 400` / `truncate_lines_at = 500` — that truncated
+# SKILL.md (654 lines) on every review. The cap is now
+# `max_lines = 10000` / `truncate_lines_at = 4000` so the runner
+# sees the full skill + lens content, and the per-line cap of
+# 4000 chars covers any realistic source line. A future file of
+# 10000+ lines (or a 4000+ char line) is the legitimate safety
+# net — anything beyond that is a regression worth catching.
+# The `*_lines_at` field uses the long form (not the CLI
+# `--truncate-lines-at` flag) so a caller can still override
+# per-call without re-trust.
 schema_version = 1
 
 [filters.boop-review-read]
 description = "Boop review lens: cap rtk read output so a runaway file does not blow up the prompt"
 match_command = "^rtk\\s+read\\b"
-truncate_lines_at = 500
-max_lines = 400
+truncate_lines_at = 4000
+max_lines = 10000
 on_empty = ""

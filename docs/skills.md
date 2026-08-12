@@ -325,7 +325,7 @@ To add a new lens:
      path: skills/boop/agents/review-<name>.md
    ```
 4. Add the lens to `LENS_FILES` in
-   `apps/runner/src/lib/config.mjs`:
+   `apps/runner/src/lib/config.ts`:
    ```js
    "agents/review-<name>.md",
    ```

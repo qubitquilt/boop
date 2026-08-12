@@ -196,7 +196,7 @@ the summary comment's H2 header:
 
 Format is identical on both sides
 (`apps/receiver/internal/github/client.go` `ReviewSummaryHeader` and
-`apps/runner/src/review-header.mjs` `reviewHeader`). Tests pin both.
+`apps/runner/src/review-header.ts` `reviewHeader`). Tests pin both.
 
 ## Summary comment
 

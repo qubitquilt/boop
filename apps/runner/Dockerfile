@@ -2,11 +2,23 @@
 # QUB-114: 4-stage build (rtk, node, build, runtime). Each stage has
 # its own cache layer; the runtime stage only carries the binaries it
 # actually needs (node, rtk, git, ca-certificates).
+#
+# QUB-136: the build stage now uses bun for `bun install` and
+# `bun x tsc` (faster cold start than npm + npx, ~2x on the typecheck
+# step). The runtime stage still runs `node dist/index.js` — bun
+# stays out of the runtime image because the production contract
+# is "node 22 + the compiled JS" and a runtime that ships with bun
+# on PATH is one more binary a compromised pod could abuse. The
+# `npm prune --production` step stays because the dep tree
+# (`@octokit/rest`, `@openrouter/agent`, `jsonwebtoken`, `zod`)
+# is installed by `bun install` and lives in the same
+# `node_modules/` layout that the prune step expects.
 
 ARG TARGETARCH=arm64
 ARG RTK_VERSION=0.44.2
 ARG RTK_SHA256_ARM64=5cd3f7fa2697faf9e5b77a10ce4e699006e02d4752d792f06550697eb4b8e8a9
 ARG RTK_SHA256_AMD64=d94cc2a3e57fa534892b5235a726e7eeb7523f205a5f8f48f853bfcae7be7e33
+ARG BUN_VERSION=1.3.14
 
 # Stage 1: download + verify the rtk binary. Independent cache layer
 # so a Node or app-source change does not re-download the release.
@@ -69,7 +81,38 @@ RUN set -eux; \
     ln -sf /opt/node/bin/npx  /usr/local/bin/npx; \
     node --version; npm --version
 
-# Stage 3: npm ci + copy source + trust the rtk filter bundle.
+# Stage 2b: install bun from the official GitHub release tarball.
+# Bun is dev-only (the build stage uses it for `bun install` and
+# `bun x tsc`; the runtime stage does not see it). Downloaded
+# via a pinned URL (the asset name encodes arch, the URL path
+# encodes version) so a downgrade attack or version drift shows
+# up immediately as a 404. BUN_VERSION is bumped in lockstep
+# with the version the local dev loop + CI run on.
+FROM ubuntu:24.04 AS bun
+ARG TARGETARCH
+ARG BUN_VERSION
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl unzip \
+ && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    case "${TARGETARCH:-arm64}" in \
+      arm64) BUN_ASSET="bun-linux-aarch64" ;; \
+      amd64) BUN_ASSET="bun-linux-x64" ;; \
+      *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${BUN_ASSET}.zip" \
+         -o /tmp/bun.zip; \
+    mkdir -p /out; \
+    unzip -q /tmp/bun.zip -d /out; \
+    BUN_BIN="$(find /out -name bun -type f | head -1)"; \
+    test -n "${BUN_BIN}" || (echo "bun binary not found in archive" && exit 1); \
+    mv "${BUN_BIN}" /out/bun; \
+    chmod 0755 /out/bun; \
+    /out/bun --version; \
+    rm -f /tmp/bun.zip
+
+# Stage 3: bun install + tsc + trust the rtk filter bundle.
 # HOME=/home/opencode so the trust store lands at the path the k8s
 # pod expects. Runs as `ubuntu` (uid 1000) so the trust store is
 # owned by the same user the runner uses at runtime.
@@ -77,15 +120,37 @@ FROM node AS build
 ARG TARGETARCH
 ENV HOME=/home/opencode
 COPY --from=rtk /out/rtk /usr/local/bin/rtk
+COPY --from=bun /out/bun /usr/local/bin/bun
 WORKDIR /app
-# Copy both manifest and lockfile so `npm ci` resolves the exact
-# versions the repo tested against. Without the lockfile `npm ci`
-# refuses to run; using `npm install` instead would let a new
-# caret-range patch drift a dep on every build.
+# Copy both manifest and lockfile so `bun install` resolves the
+# exact versions the repo tested against. Without the lockfile
+# bun reads the manifest directly and may drift on a new caret
+# patch. (npm ci refuses without a lockfile; bun install tolerates
+# the absence but the lockfile pin is the contract we ship.)
 COPY package.json package-lock.json ./
-RUN --mount=type=cache,target=/root/.npm,sharing=locked \
-    npm ci --os=linux --cpu=${TARGETARCH}
+RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \
+    bun install --frozen-lockfile
 COPY src/ ./src/
+COPY tsconfig.json ./
+# QUB-136: compile TS to JS so the runtime image does not
+# need the type-checker. `bun x tsc` is bun's npx equivalent
+# — it finds tsc in node_modules and runs it. The compiled JS
+# lands in dist/; the COPY below carries it into the runtime
+# stage and the .dockerignore drops src/ to keep the image
+# slim.
+RUN bun x tsc
+# QUB-136: strip devDependencies (typescript, @types/node,
+# @types/jsonwebtoken) from the node_modules that gets COPYed
+# into the runtime stage. QUB-136 dropped `tsx` from devDeps
+# entirely (the dev + local-run loops now go through `bun`,
+# which runs .ts natively), so the "no tsx in the image" rule
+# is satisfied by construction. `npm prune --production` still
+# works on a bun-installed tree because bun produces a
+# `node_modules/` layout that npm understands. `--ignore-scripts`
+# skips the @openrouter/sdk postinstall (a non-blocking
+# type-staleness check) so the prune step doesn't fire it a
+# second time.
+RUN npm prune --production --ignore-scripts
 # rtk config + filter bundle (QUB-85). Baked into the image so every
 # pod starts with the same rtk environment; the filter is trusted at
 # build time (next RUN) so the trust store is present before the
@@ -141,4 +206,4 @@ ENV HOME=/home/opencode \
 USER ubuntu
 WORKDIR /app
 
-CMD ["node", "src/index.mjs"]
+CMD ["node", "dist/index.js"]

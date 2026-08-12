@@ -89,7 +89,7 @@ cross-component, end-to-end view.
 - **Voice contract.** The summary and inline comments are what the author
   sees. The skill enforces a hard voice contract (ASD-STE-flavored, no
   slop, no marketing adjectives, no contractions, no emoji in finding
-  bodies). The runner's `lib/ste-lint.mjs` runs the same checks
+  bodies). The runner's `lib/ste-lint.ts` runs the same checks
   mechanically before posting (best-effort; LLM is the source of
   truth). See `apps/k8s/base/runner-config/skills/boop/SKILL.md`.
 - **GitHub App auth.** The App's PEM private key + installation ID mint
@@ -108,7 +108,7 @@ cross-component, end-to-end view.
   reaction change, one notification.
 - **rtk adapter (QUB-85).** All file reads the runner
   does (the SKILL.md, the lens files, the persona
-  resource) route through `lib/rtk.mjs`, which shells
+  resource) route through `lib/rtk.ts`, which shells
   out to the `rtk` CLI for compression and falls back
   to raw `fs.readFile` when rtk is missing or
   `BOOP_RTK_DISABLED=1`.

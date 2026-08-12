@@ -27,7 +27,56 @@ env:
   IMAGE: ghcr.io/qubitquilt/boop-runner
 
 jobs:
+  # QUB-136: the runner is now TypeScript. The build job requires
+  # the test job to pass so a broken typecheck or test never lands
+  # in :stable and the next K8s Job (which pulls the digest) can't
+  # start on a runner that won't run. The receiver picks the digest
+  # up from the ConfigMap pin written by sync-image-digests, so
+  # gating the build here is the load-bearing correctness check for
+  # the migration. bun is the hot path (matches Makefile test);
+  # node --test --experimental-strip-types is the parity run the
+  # acceptance criteria pins.
+  test:
+    # QUB-136: run the test gate on every PR, including forks. A
+    # fork PR cannot push to GHCR (the `push:` flag below gates on
+    # event != pull_request) so a fork cannot ship a green build,
+    # but a fork CAN carry a typecheck regression and a maintainer
+    # who squashes the merge would land a broken build. Running
+    # tests on forks surfaces the regression in the PR view.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@423742b445fc55439e30095b428b8c5d7cbf2d6 # v2.0.1
+        with:
+          bun-version: latest
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9de8672310d406a5ef3979a # v6.4.0
+        with:
+          node-version: '22'
+      - name: Install
+        working-directory: apps/runner
+        # `bun install --frozen-lockfile` reads package-lock.json
+        # and refuses to mutate the lockfile; the install path
+        # is the same node_modules/ layout `npm ci` produces, so
+        # `npm prune --production` in the Dockerfile still works.
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        working-directory: apps/runner
+        run: bun run typecheck
+      - name: Build
+        working-directory: apps/runner
+        run: bun run build
+      - name: Test (bun)
+        working-directory: apps/runner
+        run: bun test
+      - name: Test (node --test --experimental-strip-types)
+        working-directory: apps/runner
+        # Parity run on node 22 — the production runtime. If the
+        # two diverge, a future refactor that depends on bun-only
+        # behavior surfaces here before it lands in :stable.
+        run: npm run test:node
+
   build:
+    needs: test
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
     runs-on: boop-runner-set
     permissions:
