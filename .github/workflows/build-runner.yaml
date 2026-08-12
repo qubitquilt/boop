@@ -54,10 +54,15 @@ jobs:
           node-version: '22'
       - name: Install
         working-directory: apps/runner
-        # `bun install --frozen-lockfile` reads package-lock.json
-        # and refuses to mutate the lockfile; the install path
-        # is the same node_modules/ layout `npm ci` produces, so
+        # `bun install --frozen-lockfile` reads bun.lock (Bun's
+        # native lockfile format) and refuses to mutate it. The
+        # install path produces the same `node_modules/` layout
+        # `npm ci` produces from package-lock.json, so
         # `npm prune --production` in the Dockerfile still works.
+        # We commit both bun.lock (for the Bun-based install) and
+        # package-lock.json (for any npm-based consumer + tooling
+        # that reads it) — they're regenerated together via
+        # `bun install` so the resolved tree is identical.
         run: bun install --frozen-lockfile
       - name: Typecheck
         working-directory: apps/runner

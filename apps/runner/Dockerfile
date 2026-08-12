@@ -127,7 +127,7 @@ WORKDIR /app
 # bun reads the manifest directly and may drift on a new caret
 # patch. (npm ci refuses without a lockfile; bun install tolerates
 # the absence but the lockfile pin is the contract we ship.)
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json bun.lock ./
 RUN --mount=type=cache,target=/root/.bun/install/cache,sharing=locked \
     bun install --frozen-lockfile
 COPY src/ ./src/
