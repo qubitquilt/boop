@@ -83,29 +83,20 @@ async function whichRtk(bin: string, execFile: ExecFileLike): Promise<string | n
 async function smokeTestRtk(
   binary: string,
   execFile: ExecFileLike,
+  env: NodeJS.ProcessEnv,
 ): Promise<boolean> {
   try {
-    const { stdout, stderr } = await execFile(binary, [
+    const { stdout } = await execFile(binary, [
       "read",
       "--truncate-lines-at",
-      "1000",
+      String(DEFAULT_TRUNCATE_LINES_AT),
       "--",
       "/dev/null",
     ], {
-      env: { RTK_TELEMETRY_DISABLED: "1" } as NodeJS.ProcessEnv,
+      env: { ...env, RTK_TELEMETRY_DISABLED: "1" } as NodeJS.ProcessEnv,
       timeout: 5_000,
     });
-    // A working rtk on `/dev/null` returns an empty string.
-    // A broken rtk that internally shells out to bash's `read`
-    // builtin emits a stderr like `read: --: invalid option`
-    // and exits non-zero. Treat any non-empty stderr as a
-    // smoke-test failure even if the exit code is zero (a
-    // future rtk that emits a deprecation warning to stderr
-    // for `--` would still be usable). The `?? ""` guards the
-    // optional stderr/stdout under noUncheckedIndexedAccess
-    // (the test fixtures set both, the production rtk sets
-    // neither for an empty file).
-    return (stderr ?? "").length === 0 && (stdout ?? "").length === 0;
+    return (stdout ?? "").length === 0;
   } catch {
     return false;
   }
@@ -232,7 +223,7 @@ export function createRtkAdapter({
       // same error after every file. The runner image ships
       // rtk 0.44.2 from the official release, which does not
       // have this bug — the smoke test is local-dev safety.
-      if (!(await smokeTestRtk(resolved, execFile))) {
+      if (!(await smokeTestRtk(resolved, execFile, env))) {
         state = {
           source: "raw",
           binary: resolved,
@@ -249,7 +240,7 @@ export function createRtkAdapter({
   const readFile = async (
     path: string,
     _encoding: string,
-    options: { maxLines?: number; truncateLinesAt?: number } = {},
+    options: { truncateLinesAt?: number } = {},
   ): Promise<string> => {
     const s = await init();
     if (s.source !== "rtk") {

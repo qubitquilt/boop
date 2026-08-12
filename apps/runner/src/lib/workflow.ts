@@ -352,9 +352,9 @@ export async function runSubWorkflow(
   deps: Deps,
   overrides: Overrides,
   state: State,
-): Promise<State | undefined> {
+): Promise<void> {
   const macroId = state._subWorkflowOf;
-  const result = await walkStages(stages, ctx, deps, overrides, state, {
+  await walkStages(stages, ctx, deps, overrides, state, {
     skipList: async () => {
       if (!macroId || !state.sub || !Array.isArray(state.sub[macroId])) {
         return [];
@@ -377,8 +377,6 @@ export async function runSubWorkflow(
       }
     },
   });
-  if ("parseFailed" in result) return state;
-  return undefined;
 }
 
 async function withRetry(
@@ -536,8 +534,8 @@ async function handshakeStage(ctx: Ctx, deps: Deps, overrides: Overrides, state:
   await deps.postStatus("auth");
 }
 
-async function fetchStage(ctx: Ctx, deps: Deps, _overrides: Overrides, _state: State): Promise<void> {
-  await deps.cloneRepo(ctx as Ctx & { installationToken: string }, deps);
+async function fetchStage(ctx: Ctx, deps: Deps, _overrides: Overrides, state: State): Promise<void> {
+  await deps.cloneRepo(state.installationToken as string, ctx, deps);
   deps.log("clone", "repo cloned", {
     dir: deps.paths.repoDir,
     sha: ctx.prHeadSha,

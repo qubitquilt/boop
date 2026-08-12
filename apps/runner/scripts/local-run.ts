@@ -39,7 +39,7 @@
 //   BOOP_TOOLS_ENABLED=0          — disable the agent tool set
 //                                   for a baseline run
 //
-// QUB-136: the wrapper runs via `tsx` (dev) so the local dev loop
+// QUB-136: the wrapper runs via `bun` so the local dev loop
 // does not require a `tsc` build first. Production goes through
 // `tsc → dist/index.js`; the local wrapper bypasses the build
 // because the iteration speed of "edit → run" matters more than
@@ -182,7 +182,7 @@ await run(env, {
   // pre-staged repo at BOOP_REPO_DIR is already at the head SHA.
   // This sidesteps the App-token netrc/gitconfig dance that the
   // production flow wires through the receiver.
-  cloneRepo: async (_ctx, deps) => {
+  cloneRepo: async (_token, _ctx, deps) => {
     await deps.postStatus("clone");
   },
   // Allow a couple of retries on transient stages (e.g. an

@@ -101,7 +101,8 @@ function makeDeps(overrides = {}) {
 
 test("cloneRepo runs clone, fetch, and checkout in order", async () => {
   const deps = makeDeps();
-  await cloneRepo(makeCtx(), deps);
+  const ctx = makeCtx();
+  await cloneRepo(ctx.installationToken, ctx, deps);
   assert.equal(deps.execFile.calls.length, 3);
   // Each invocation's first arg is the binary ("git").
   for (const call of deps.execFile.calls) {
@@ -116,7 +117,8 @@ test("cloneRepo runs clone, fetch, and checkout in order", async () => {
 
 test("cloneRepo uses `git fetch origin -- <refs>` (positional refs after `--`)", async () => {
   const deps = makeDeps();
-  await cloneRepo(makeCtx(), deps);
+  const ctx = makeCtx();
+  await cloneRepo(ctx.installationToken, ctx, deps);
   const fetchArgs = deps.execFile.calls[1][1];
   const sepIdx = fetchArgs.indexOf("--");
   assert.ok(sepIdx > -1, "expected `--` separator in fetch args");
@@ -125,10 +127,8 @@ test("cloneRepo uses `git fetch origin -- <refs>` (positional refs after `--`)",
 
 test("cloneRepo includes previousHeadSHA in fetch when set", async () => {
   const deps = makeDeps();
-  await cloneRepo(
-    makeCtx({ previousHeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }),
-    deps,
-  );
+  const ctx = makeCtx({ previousHeadSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+  await cloneRepo(ctx.installationToken, ctx, deps);
   const fetchArgs = deps.execFile.calls[1][1];
   const sepIdx = fetchArgs.indexOf("--");
   assert.deepEqual(
@@ -139,7 +139,8 @@ test("cloneRepo includes previousHeadSHA in fetch when set", async () => {
 
 test("cloneRepo checks out the head SHA", async () => {
   const deps = makeDeps();
-  await cloneRepo(makeCtx(), deps);
+  const ctx = makeCtx();
+  await cloneRepo(ctx.installationToken, ctx, deps);
   const checkoutArgs = deps.execFile.calls[2][1];
   // The head SHA must be the positional argument to `git checkout`.
   // Do NOT use `--` between `checkout` and the SHA: `git checkout -- <pathspec>`
@@ -153,7 +154,8 @@ test("cloneRepo checks out the head SHA", async () => {
 
 test("cloneRepo uses HOME from ctx (not process env)", async () => {
   const deps = makeDeps();
-  await cloneRepo(makeCtx({ home: "/custom-home" }), deps);
+  const ctx = makeCtx({ home: "/custom-home" });
+  await cloneRepo(ctx.installationToken, ctx, deps);
   for (const call of deps.execFile.calls) {
     assert.equal(call[2].env.HOME, "/custom-home");
   }
@@ -161,7 +163,8 @@ test("cloneRepo uses HOME from ctx (not process env)", async () => {
 
 test("cloneRepo sets GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM on the env", async () => {
   const deps = makeDeps();
-  await cloneRepo(makeCtx(), deps);
+  const ctx = makeCtx();
+  await cloneRepo(ctx.installationToken, ctx, deps);
   for (const call of deps.execFile.calls) {
     assert.equal(call[2].env.GIT_CONFIG_GLOBAL, PATHS.gitconfig);
     assert.equal(call[2].env.GIT_CONFIG_NOSYSTEM, "1");
@@ -170,7 +173,8 @@ test("cloneRepo sets GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM on the env", asyn
 
 test("cloneRepo writes netrc and gitconfig in mode 0600", async () => {
   const deps = makeDeps();
-  await cloneRepo(makeCtx(), deps);
+  const ctx = makeCtx();
+  await cloneRepo(ctx.installationToken, ctx, deps);
   const writes = deps.fs.calls.filter((c) => c[0] === "writeFile");
   assert.equal(writes.length, 2);
   // writeFile signature is fs.writeFile(path, data, options) —
@@ -184,7 +188,8 @@ test("cloneRepo writes netrc and gitconfig in mode 0600", async () => {
 
 test("cloneRepo netrc body contains the installation token and github.com machine", async () => {
   const deps = makeDeps();
-  await cloneRepo(makeCtx({ installationToken: "tok_xyz" }), deps);
+  const ctx = makeCtx({ installationToken: "tok_xyz" });
+  await cloneRepo(ctx.installationToken, ctx, deps);
   const netrcWrite = deps.fs.calls.find(
     (c) => c[0] === "writeFile" && c[1][0] === PATHS.netrc,
   );
@@ -207,7 +212,8 @@ test("cloneRepo registers netrc + gitconfig + repoDir cleanup hooks", async () =
     cleanup,
     log: () => {},
   };
-  await cloneRepo(makeCtx(), deps);
+  const ctx = makeCtx();
+  await cloneRepo(ctx.installationToken, ctx, deps);
   await cleanup.runAll();
   // Two unlinks registered (netrc + gitconfig); the repo dir rm was
   // called explicitly at the top, not via the cleanup registry.
@@ -218,7 +224,7 @@ test("cloneRepo registers netrc + gitconfig + repoDir cleanup hooks", async () =
 test("cloneRepo rejects unsafe refnames in ctx (defense in depth)", async () => {
   const deps = makeDeps();
   await assert.rejects(
-    () => cloneRepo(makeCtx({ prBaseRef: "--upload-pack=evil" }), deps),
+    () => { const ctx = makeCtx({ prBaseRef: "--upload-pack=evil" }); return cloneRepo(ctx.installationToken, ctx, deps); },
     /unsafe PR_BASE_REF/,
   );
 });
@@ -226,7 +232,7 @@ test("cloneRepo rejects unsafe refnames in ctx (defense in depth)", async () => 
 test("cloneRepo rejects unsafe head SHA", async () => {
   const deps = makeDeps();
   await assert.rejects(
-    () => cloneRepo(makeCtx({ prHeadSha: "not-a-sha" }), deps),
+    () => { const ctx = makeCtx({ prHeadSha: "not-a-sha" }); return cloneRepo(ctx.installationToken, ctx, deps); },
     /unsafe PR_HEAD_SHA/,
   );
 });

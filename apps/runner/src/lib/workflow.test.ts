@@ -259,7 +259,7 @@ test("runStages walks every macro stage in order", async () => {
       sequence.push(`postStatus(${stage})`);
     },
     setOctokit: () => sequence.push("setOctokit"),
-    cloneRepo: async (_ctx, d) => {
+    cloneRepo: async (_token, _ctx, d) => {
       sequence.push("cloneRepo");
       await d.postStatus("clone");
     },
@@ -311,7 +311,7 @@ test("runStages skips summary + inlines when review has no summary", async () =>
     postStatus: async (stage, detail) =>
       sequence.push(`postStatus(${stage}${detail ? `: ${detail}` : ""})`),
     setOctokit: () => sequence.push("setOctokit"),
-    cloneRepo: async (_ctx, d) => {
+    cloneRepo: async (_token, _ctx, d) => {
       sequence.push("cloneRepo");
       await d.postStatus("clone");
     },
@@ -512,7 +512,7 @@ test("a failed gate sets state.parseFailed and short-circuits the run (QUB-90)",
     postStatus: async (stage, detail) =>
       sequence.push(`postStatus(${stage}${detail ? `: ${detail}` : ""})`),
     setOctokit: () => sequence.push("setOctokit"),
-    cloneRepo: async (_ctx, d) => {
+    cloneRepo: async (_token, _ctx, d) => {
       sequence.push("cloneRepo");
       await d.postStatus("clone");
     },
@@ -583,7 +583,7 @@ test("a passing gate proceeds to the run (QUB-90)", async () => {
   const deps = recordingDeps({
     postStatus: async (stage) => sequence.push(`postStatus(${stage})`),
     setOctokit: () => sequence.push("setOctokit"),
-    cloneRepo: async (_ctx, d) => {
+    cloneRepo: async (_token, _ctx, d) => {
       sequence.push("cloneRepo");
       await d.postStatus("clone");
     },
@@ -626,14 +626,13 @@ test("a sub-stage gate failure surfaces as state.parseFailed (QUB-90)", async ()
   // state.parseFailed and returns.
   const deps = recordingDeps();
   const state = {};
-  const result = await runSubWorkflow(
+  await runSubWorkflow(
     REVIEW_SUB_STAGES,
     fakeCtx,
     deps,
     {},
     state,
   );
-  assert.equal(result, state);
   assert.equal(state.parseFailed, true);
   // The sub-stage gate's reason is the "failed" status.
   const last = deps.calls.postStatus[deps.calls.postStatus.length - 1];
@@ -1298,7 +1297,7 @@ test("runStages aborts when state.passed already has a macro stage (QUB-102)", a
       deps.calls.postStatus.push({ stage, detail });
     },
     setOctokit: () => sequence.push("setOctokit"),
-    cloneRepo: async (_ctx, d) => {
+    cloneRepo: async (_token, _ctx, d) => {
       sequence.push("cloneRepo");
       await d.postStatus("clone");
     },
@@ -1374,7 +1373,7 @@ test("runStages aborts even when state.passed only has the summary stage (QUB-10
       deps.calls.postStatus.push({ stage, detail });
     },
     setOctokit: () => sequence.push("setOctokit"),
-    cloneRepo: async (_ctx, d) => {
+    cloneRepo: async (_token, _ctx, d) => {
       sequence.push("cloneRepo");
       await d.postStatus("clone");
     },
@@ -1424,7 +1423,7 @@ test("runStages does not abort when state.passed is empty (QUB-102)", async () =
   const deps = recordingDeps({
     postStatus: async (stage) => sequence.push(`postStatus(${stage})`),
     setOctokit: () => sequence.push("setOctokit"),
-    cloneRepo: async (_ctx, d) => {
+    cloneRepo: async (_token, _ctx, d) => {
       sequence.push("cloneRepo");
       await d.postStatus("clone");
     },

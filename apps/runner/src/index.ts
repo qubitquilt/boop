@@ -53,14 +53,10 @@ import type { Ctx, Deps, FetchLike, OctokitLike, Overrides, State } from "./type
 
 const execFileAsync = promisify(execFile);
 
-type RunOverrides = Overrides & {
-  fs?: typeof fs;
-  execFile?: typeof execFileAsync;
-  fetchImpl?: FetchLike;
-  jwt?: typeof jwt;
-  spawnFn?: typeof spawn;
-  [key: string]: unknown;
-};
+type RunOverrides = Overrides & Partial<Pick<Deps,
+  "fs" | "execFile" | "fetchImpl" | "jwt" | "spawnFn"
+  | "sleep" | "stageMaxAttempts" | "cloneRepo"
+>>;
 
 function makeDeps(
   ctx: Ctx,
@@ -111,11 +107,11 @@ function makeDeps(
     getOctokit: () => octokitSlot.get(),
     currentCtx: () => statusCommentSlot.applyTo(ctx),
     postStatus: postStatusWrapper,
-    cloneRepo: (c, d) =>
-      cloneRepo(c as Ctx & { installationToken: string; home: string }, {
+    cloneRepo: (token, c, d) =>
+      cloneRepo(token, c, {
         ...d,
         postStatus: (s) => postStatusWrapper(s, undefined),
-      } as Parameters<typeof cloneRepo>[1]),
+      } as Parameters<typeof cloneRepo>[2]),
   };
 }
 

@@ -126,7 +126,7 @@ export type Deps = {
   postStatus: (stage: string, detail?: string) => Promise<void>;
 
   // Stage helpers
-  cloneRepo: (ctx: Ctx, deps: Deps) => Promise<void>;
+  cloneRepo: (token: string, ctx: Ctx, deps: Deps) => Promise<void>;
   expertOverrides?: Record<string, ExpertFn>;
   generateWalkthrough?: (
     ctx: Ctx,

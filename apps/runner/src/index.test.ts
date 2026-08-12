@@ -159,7 +159,7 @@ function standardOverrides(extra = {}) {
     makeOctokit: () => fakeOctokit(),
     stageMaxAttempts: 1,
     sleep: async () => {}, // no-op so any retry test doesn't actually wait
-    cloneRepo: async (ctx, deps) => {
+    cloneRepo: async (_token, _ctx, deps) => {
       await deps.postStatus("clone");
     },
     runOpenCodeSkill: async (apiKey, ctx, deps) => {

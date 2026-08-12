@@ -87,13 +87,14 @@ type CloneRepoDeps = {
 };
 
 export async function cloneRepo(
-  ctx: Ctx & { installationToken: string; home: string },
+  token: string,
+  ctx: Ctx,
   deps: CloneRepoDeps,
 ): Promise<void> {
   const { fs, execFile, paths, cleanup, log, postStatus } = deps;
   await fs.rm(paths.repoDir, { recursive: true, force: true });
   await fs.mkdir(paths.repoDir, { recursive: true });
-  await writeNetrc(ctx.installationToken, fs, cleanup, paths);
+  await writeNetrc(token, fs, cleanup, paths);
   await writeGitconfig(fs, cleanup, paths);
 
   const gitEnv: NodeJS.ProcessEnv = {

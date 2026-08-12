@@ -118,7 +118,7 @@ test("createRtkAdapter: routes through rtk read with the expected flags", async 
   assert.deepEqual(smokeCall.args, [
     "read",
     "--truncate-lines-at",
-    "1000",
+    "4000",
     "--",
     "/dev/null",
   ]);
@@ -232,8 +232,7 @@ test("createRtkAdapter: smoke-test failure disables rtk up front (no per-read er
     {
       stdout: "",
       stderr: "read: --: invalid option\n",
-      // execFile throws when exit code is non-zero; the smoke
-      // test's execFile is a record-throw so we model that.
+      throw: new Error("read: --: invalid option"),
     },
   ]);
   const fs = fakeFs({
@@ -255,13 +254,13 @@ test("createRtkAdapter: smoke-test failure disables rtk up front (no per-read er
   const rtkInvocations = calls.filter((c) => c.bin === "/opt/homebrew/bin/rtk");
   assert.equal(rtkInvocations.length, 1, "rtk should only be called once (the smoke test)");
   // The smoke test invocation matches the production CLI shape:
-  // `read --truncate-lines-at 1000 -- /dev/null`.
+  // `read --truncate-lines-at 4000 -- /dev/null`.
   const smokeArgs = rtkInvocations[0].args;
   assert.equal(smokeArgs[0], "read");
   assert.deepEqual(smokeArgs, [
     "read",
     "--truncate-lines-at",
-    "1000",
+    "4000",
     "--",
     "/dev/null",
   ]);
@@ -278,38 +277,35 @@ test("createRtkAdapter: smoke-test failure disables rtk up front (no per-read er
   assert.equal(fallbackLogs.length, 1, "exactly one fallback log");
 });
 
-test("createRtkAdapter: smoke-test emits non-empty stderr → fail; empty stderr → pass", async () => {
-  // The smoke test checks stderr length because the macOS rtk
-  // bug surfaces a `read: --: invalid option` warning on stderr
-  // (not stdout) before the process exits non-zero. A future rtk
-  // version that adds a deprecation warning to stderr would
-  // still be usable; the smoke test treats non-empty stderr as
-  // a failure even if exit code is 0.
-  const { exec: execFail } = recordingExecFile([
+test("createRtkAdapter: smoke-test passes on non-empty stderr with zero exit; fails on thrown error", async () => {
+  // The smoke test uses exit code (thrown error), not stderr content,
+  // as the failure signal. Non-empty stderr from a healthy binary
+  // (diagnostic tee-file paths, trust notices) should not fail the
+  // smoke test. Only a non-zero exit (thrown execFile error) fails it.
+  const { exec: execNoThrow } = recordingExecFile([
     { stdout: "/opt/homebrew/bin/rtk\n" },
-    { stdout: "", stderr: "read: --: invalid option\n" },
+    { stdout: "", stderr: "deprecation: -- will be removed in v0.5\n" },
   ]);
-  const adapterFail = createRtkAdapter({
-    execFile: execFail,
+  const adapterNoThrow = createRtkAdapter({
+    execFile: execNoThrow,
     fs: fakeFs({}),
     log: () => {},
   });
-  const failState = await adapterFail.init();
+  const passState = await adapterNoThrow.init();
+  assert.equal(passState.source, "rtk", "non-empty stderr with zero exit must not fail smoke test");
+
+  const { exec: execThrow } = recordingExecFile([
+    { stdout: "/opt/homebrew/bin/rtk\n" },
+    { stdout: "", stderr: "read: --: invalid option\n", throw: new Error("exit code 1") },
+  ]);
+  const adapterThrow = createRtkAdapter({
+    execFile: execThrow,
+    fs: fakeFs({}),
+    log: () => {},
+  });
+  const failState = await adapterThrow.init();
   assert.equal(failState.source, "raw");
   assert.match(failState.reason ?? "", /smoke-test-failed/);
-
-  const { exec: execPass } = recordingExecFile([
-    { stdout: "/opt/homebrew/bin/rtk\n" },
-    { stdout: "", stderr: "" },
-  ]);
-  const adapterPass = createRtkAdapter({
-    execFile: execPass,
-    fs: fakeFs({}),
-    log: () => {},
-  });
-  const passState = await adapterPass.init();
-  assert.equal(passState.source, "rtk");
-  assert.equal(passState.reason, null);
 });
 
 test("createRtkAdapter: rtk failure flip is observable in the source getter", async () => {

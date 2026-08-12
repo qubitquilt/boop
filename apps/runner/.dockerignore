@@ -2,5 +2,3 @@ node_modules
 .git
 .DS_Store
 *.log
-src
-tsconfig.json
