@@ -31,7 +31,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Run pinact
         uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
+        # pinact-action v3 dropped the `args:` input. The action
+        # runs pinact in read-only mode by default; the comment-on-
+        # failure flow is enough — no auto-PR is opened because
+        # the run itself fails before pinact would attempt one.
         with:
-          args: --skip-pr
-          # skip-pr means we don't have pinact open its own
-          # auto-PR; the comment-on-failure flow is enough.
+          no_api: true
