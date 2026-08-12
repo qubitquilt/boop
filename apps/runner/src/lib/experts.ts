@@ -58,25 +58,27 @@ import type {
   Review,
 } from "../types.ts";
 
+// Type-to-expert-set mapping. The set is data, not control flow;
+// a lookup table makes adding a new PR type a one-line edit
+// (F1 on PR #198). The keys are the closed `PrType` vocabulary
+// from classify.ts (`feature`, `bug-fix`, `refactor`, `docs`,
+// `test-only`, `infra`, `unknown`); a new type is one row plus
+// a PrType widening. The "unknown" key is the conservative
+// default — QUB-96's meta-review re-dispatches anything the
+// default pool misses.
+const PR_TYPE_EXPERTS: Record<string, string[]> = {
+  "bug-fix": ["regression-hunter", "test-quality"],
+  "feature": ["api-design", "error-handling", "test-quality"],
+  "refactor": ["design-pattern", "readability"],
+  "docs": ["readability"],
+  "test-only": ["test-quality"],
+  "infra": ["regression-hunter", "design-pattern"],
+  "unknown": ["design-pattern", "readability"],
+};
+
 export function pickExperts(classification: Classification | null | undefined): string[] {
   const type = (classification && classification.type) || "unknown";
-  switch (type) {
-    case "bug-fix":
-      return ["regression-hunter", "test-quality"];
-    case "feature":
-      return ["api-design", "error-handling", "test-quality"];
-    case "refactor":
-      return ["design-pattern", "readability"];
-    case "docs":
-      return ["readability"];
-    case "test-only":
-      return ["test-quality"];
-    case "infra":
-      return ["regression-hunter", "design-pattern"];
-    case "unknown":
-    default:
-      return ["design-pattern", "readability"];
-  }
+  return PR_TYPE_EXPERTS[type] ?? PR_TYPE_EXPERTS["unknown"]!;
 }
 
 export const EXPERT_POOL: Record<string, ExpertFn> = Object.fromEntries(

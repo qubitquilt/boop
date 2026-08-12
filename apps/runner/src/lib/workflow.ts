@@ -327,7 +327,12 @@ export async function runStages(
       return { aborted: true, reason };
     },
     onStart: (stage) => {
-      postStage(stage.id, ctx, deps);
+      // Fire-and-forget: the stage-start POST is telemetry, not
+      // a correctness gate. Awaiting it would put a 5s dashboard
+      // timeout * N stages on the critical path of every review;
+      // dropping the promise keeps the waterfall non-blocking. The
+      // dashboard helper absorbs its own errors (O2 on PR #198).
+      void postStage(stage.id, ctx, deps);
     },
     onEnd: async (stage) => {
       await postStage(stage.id, ctx, deps, { ended: true });

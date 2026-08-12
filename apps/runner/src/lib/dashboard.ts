@@ -24,6 +24,19 @@ const POST_RETRIES = 1;
 
 type DashboardDeps = Pick<Deps, "fetchImpl" | "log" | "errlog">;
 
+// runUrl builds the per-endpoint URL for a run. The run id is
+// `ctx.jobName` (the BOOP_JOB_NAME the receiver wires in) or
+// the derived fallback when the env var is unset. Five callers
+// (postStatus, postTelemetry, postStage, startHeartbeat,
+// postLensTelemetry) used to inline this template; the helper
+// centralises the URL pattern so a future endpoint is one line
+// and the encodeURIComponent + fallback can't drift (O1 on
+// PR #198).
+function runUrl(ctx: Ctx, suffix: string): string {
+  const name = ctx.jobName || jobNameFromCtx(ctx);
+  return `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(name)}/${suffix}`;
+}
+
 export async function postStatus(
   stage: string,
   ctx: Ctx,
@@ -31,7 +44,7 @@ export async function postStatus(
   reason?: string,
 ): Promise<void> {
   if (!ctx.dashboardUrl || !ctx.dashboardToken) return;
-  const url = `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(ctx.jobName || jobNameFromCtx(ctx))}/status`;
+  const url = runUrl(ctx, "status");
   const payload: { stage: string; error?: string } = { stage };
   if (reason) payload.error = reason;
   const body = JSON.stringify(payload);
@@ -45,7 +58,7 @@ export async function postTelemetry(
 ): Promise<void> {
   if (!ctx.dashboardUrl || !ctx.dashboardToken) return;
   if (!telemetry) return;
-  const url = `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(ctx.jobName || jobNameFromCtx(ctx))}/telemetry`;
+  const url = runUrl(ctx, "telemetry");
   const body = JSON.stringify({
     model: telemetry.model,
     provider: telemetry.provider,
@@ -80,7 +93,7 @@ export function postStage(
   opts: { ended?: boolean; meta?: Record<string, unknown> } = {},
 ): Promise<void> | undefined {
   if (!ctx.dashboardUrl || !ctx.dashboardToken) return;
-  const url = `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(ctx.jobName || jobNameFromCtx(ctx))}/stages`;
+  const url = runUrl(ctx, "stages");
   const body = JSON.stringify({
     stage: stageName,
     ended: !!opts.ended,
@@ -96,7 +109,7 @@ export function startHeartbeat(
   if (!ctx.dashboardUrl || !ctx.dashboardToken) {
     return () => {};
   }
-  const url = `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(ctx.jobName || jobNameFromCtx(ctx))}/heartbeat`;
+  const url = runUrl(ctx, "heartbeat");
   let stopped = false;
   const tick = () => {
     if (stopped) return;
@@ -119,7 +132,7 @@ export async function postLensTelemetry(
 ): Promise<void> {
   if (!ctx.dashboardUrl || !ctx.dashboardToken) return;
   if (!Array.isArray(lenses) || lenses.length === 0) return;
-  const url = `${ctx.dashboardUrl}/api/runs/${encodeURIComponent(ctx.jobName || jobNameFromCtx(ctx))}/lens_telemetry`;
+  const url = runUrl(ctx, "lens_telemetry");
   const body = JSON.stringify({
     lenses: lenses.map((l) => ({
       lens: l.lens,
