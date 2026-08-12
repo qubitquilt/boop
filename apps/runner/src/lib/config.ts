@@ -166,7 +166,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): {
     // The runner should NOT post a status comment + PATCH it
     // for every stage — that dings the author on every update.
     // Instead the runner adds a single terminal reaction
-    // (🦴 on done, ❌ on failed) to the trigger comment and
+    // (🎉 on done, 👎 on failed) to the trigger comment and
     // postStatus is a no-op. The trigger is silent otherwise.
     noStatusComment: env.BOOP_NO_STATUS_COMMENT === "1",
     // QUB-85: operator kill switch for the rtk adapter. When `1`,

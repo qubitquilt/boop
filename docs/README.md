@@ -24,7 +24,7 @@ GitHub App "BoopPr"
 │  - SQLite data   │ ◀── telemetry ──│  - ste-lint (mechanical)       │
 │    layer         │     + status    │  - parse output                │
 └──────────────────┘                 │  - post summary + inlines      │
-        │                            │  - 🦴 done / ❌ failed         │
+        │                            │  - 🎉 done / 👎 failed         │
         │                            └────────────────────────────────┘
         │                                     │
         └─────── GitHub App creds (in-cluster secret) ──┐
@@ -38,7 +38,7 @@ re-reviews, react 👀 on the trigger). 1-3 minutes later, a summary
 comment with the findings table arrives, followed by 0-8 line-specific
 inline comments pinned to the diff. Final state: 🦴 (bone) on the
 status comment + a `Reviewed by BoopPr` line, or ❌ on failure. In
-reaction mode the 🐾 comment never appears and the 👀 becomes 🦴 or ❌.
+reaction mode the 🐾 comment never appears and the 👀 becomes 🎉 or 👎.
 
 ## Read order
 
@@ -103,8 +103,8 @@ cross-component, end-to-end view.
   `@BoopPr review` on a comment, the receiver reacts 👀
   on the trigger and sets `BOOP_NO_STATUS_COMMENT=1` on
   the Job. The runner does not post or PATCH a status
-  comment; it adds a single terminal reaction (🦴 on
-  done, ❌ on failed) on the trigger comment. One
+  comment; it adds a single terminal reaction (🎉 on
+  done, 👎 on failed) on the trigger comment. One
   reaction change, one notification.
 - **rtk adapter (QUB-85).** All file reads the runner
   does (the SKILL.md, the lens files, the persona

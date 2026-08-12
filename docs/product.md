@@ -65,10 +65,10 @@ reacts with a single terminal emoji when it finishes:
 
 | Event | Receiver | Runner terminal reaction |
 |---|---|---|
-| `@BoopPr review` accepted, review succeeds | reacts 👀 on the trigger comment | reacts 🦴 on the trigger comment |
+| `@BoopPr review` accepted, review succeeds | reacts 👀 on the trigger comment | reacts 🎉 on the trigger comment |
 | `@BoopPr review` accepted, review fails | reacts 👀 on the trigger comment | reacts ❌ on the trigger comment |
 
-The author sees a single reaction change (`👀` → `🦴`, or `👀` → `❌`)
+The author sees a single reaction change (`👀` → `🎉`, or `👀` → `👎`)
 and one notification per re-review. No PATCH loop on a status
 comment that never existed.
 
@@ -221,8 +221,8 @@ Also accepted (case-insensitive): `@BoopPr please review`, `@BoopPr, can
 you review this`, `@BoopPr re-review`, `@BoopPr to review`.
 
 The reaction mode surface (QUB-114) applies to this path: a
-comment-triggered re-review leaves 👀 on your comment and adds 🦴
-when it finishes (or ❌ on failure). A PR-opened review gets the 🐾
+comment-triggered re-review leaves 👀 on your comment and adds 🎉
+when it finishes (or 👎 on failure). A PR-opened review gets the 🐾
 status thread instead.
 
 ## Limits

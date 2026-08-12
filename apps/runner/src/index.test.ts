@@ -317,8 +317,8 @@ test("run: postStatus failure is swallowed (best-effort)", async () => {
 // QUB-114: end-to-end test for reaction mode. The
 // receiver sets BOOP_NO_STATUS_COMMENT=1 on issue_comment
 // triggers; the runner must not post or PATCH a status
-// comment, and must add a single terminal reaction (bone on
-// done, x on failed) to the trigger comment. This is the
+// comment, and must add a single terminal reaction (hooray on
+// done, -1 on failed) to the trigger comment. This is the
 // end-to-end test that catches the postFinalReaction-octokit
 // bug the reviewer flagged.
 test("run: reaction mode (BOOP_NO_STATUS_COMMENT=1) posts no status comment + adds terminal reaction", async () => {
@@ -361,9 +361,9 @@ test("run: reaction mode (BOOP_NO_STATUS_COMMENT=1) posts no status comment + ad
     "no status comment PATCHed in reaction mode",
   );
   // The terminal reaction was added exactly once with the
-  // correct content (bone for done).
+  // correct content (hooray for done).
   assert.equal(reactionCalls.length, 1, "exactly one terminal reaction");
-  assert.equal(reactionCalls[0].content, "bone");
+  assert.equal(reactionCalls[0].content, "hooray");
   assert.equal(reactionCalls[0].comment_id, 987654);
   assert.equal(reactionCalls[0].owner, "qubitquilt");
   assert.equal(reactionCalls[0].repo, "boop");

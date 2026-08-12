@@ -826,7 +826,7 @@ func (h *Handler) submitJob(ctx context.Context, w http.ResponseWriter, delivery
 		// runner does not post a status comment; it adds a
 		// single terminal reaction to the trigger comment
 		// instead. The author's view is 👀 (set by the
-		// receiver) → 🦴 / ❌ (set by the runner). No
+		// receiver) → 🎉 / 👎 (set by the runner). No
 		// PATCH loop, no per-stage notifications.
 		NoStatusComment: boolToString(noStatusComment),
 		// QUB-106: forwarded into OPENROUTER_MODEL. The
@@ -963,7 +963,7 @@ type templateVars struct {
 	// the PATCH loop so the author is not dinged on every
 	// status update. The trigger comment received the 👀
 	// reaction from the receiver; the runner adds a single
-	// terminal reaction (🦴 on done, ❌ on failed) at the
+	// terminal reaction (🎉 on done, 👎 on failed) at the
 	// end of the run.
 	NoStatusComment string
 }

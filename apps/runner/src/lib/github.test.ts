@@ -196,7 +196,7 @@ test("postStatus skips when noStatusComment is true (QUB-114 reaction mode)", as
 });
 
 // QUB-114: postFinalReaction adds the terminal reaction to
-// the trigger comment on done (bone) or failed (x). The
+// the trigger comment on done (hooray) or failed (-1). The
 // function resolves the octokit via deps.getOctokit?.() so
 // the live runner's slot-only deps shape works (the prior
 // version destructured deps.octokit and silently no-op'd).
@@ -217,7 +217,7 @@ function reactionFakeOctokit(contentToCapture) {
   };
 }
 
-test("postFinalReaction adds bone reaction on done (deps.getOctokit slot)", async () => {
+test("postFinalReaction adds hooray reaction on done (deps.getOctokit slot)", async () => {
   // This is the bug the reviewer caught: deps in the live
   // runner exposes getOctokit (a function), not octokit (the
   // instance). The function must resolve via the slot.
@@ -226,7 +226,7 @@ test("postFinalReaction adds bone reaction on done (deps.getOctokit slot)", asyn
   const deps = { log: log.log, errlog: log.errlog, getOctokit: () => octokit };
   await postFinalReaction("done", { ...ctx, reactionCommentId: 200 }, deps);
   assert.equal(octokit.calls.length, 1);
-  assert.equal(octokit.calls[0].content, "bone");
+  assert.equal(octokit.calls[0].content, "hooray");
   assert.equal(octokit.calls[0].comment_id, 200);
   assert.equal(octokit.calls[0].owner, ctx.prOwner);
   assert.equal(octokit.calls[0].repo, ctx.prRepo);
@@ -236,13 +236,13 @@ test("postFinalReaction adds bone reaction on done (deps.getOctokit slot)", asyn
   );
 });
 
-test("postFinalReaction adds x reaction on failed", async () => {
+test("postFinalReaction adds -1 reaction on failed", async () => {
   const log = recordingLogger();
   const octokit = reactionFakeOctokit({ value: null });
   const deps = { log: log.log, errlog: log.errlog, getOctokit: () => octokit };
   await postFinalReaction("failed", { ...ctx, reactionCommentId: 201 }, deps);
   assert.equal(octokit.calls.length, 1);
-  assert.equal(octokit.calls[0].content, "x");
+  assert.equal(octokit.calls[0].content, "-1");
   assert.equal(octokit.calls[0].comment_id, 201);
 });
 
@@ -255,7 +255,7 @@ test("postFinalReaction falls back to deps.octokit when getOctokit is missing", 
   const deps = { log: log.log, errlog: log.errlog, octokit };
   await postFinalReaction("done", { ...ctx, reactionCommentId: 202 }, deps);
   assert.equal(octokit.calls.length, 1);
-  assert.equal(octokit.calls[0].content, "bone");
+  assert.equal(octokit.calls[0].content, "hooray");
   assert.equal(octokit.calls[0].comment_id, 202);
 });
 

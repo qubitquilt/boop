@@ -18,7 +18,7 @@ See also: [README](../apps/runner/README.md), [architecture](./architecture.md),
 8. Parses the `=== SUMMARY === … === INLINE COMMENTS === … === END ===`
    block from the assistant text.
 9. PATCHes the status comment to "🦴 bone delivered" (or "❌ lost the bone" on
-   failure). On reaction-mode runs (issue_comment triggers, `BOOP_NO_STATUS_COMMENT=1`) the runner does not PATCH or post a status comment; it adds a single terminal reaction (🦴 on done, ❌ on failed) on the trigger comment.
+    failure). On reaction-mode runs (issue_comment triggers, `BOOP_NO_STATUS_COMMENT=1`) the runner does not PATCH or post a status comment; it adds a single terminal reaction (🎉 on done, 👎 on failed) on the trigger comment.
 10. Posts the summary as a single PR comment and the inline comments as
     line-pinned review comments.
 
@@ -103,7 +103,7 @@ Required env vars (provided by the Job template, see [receiver.md](./receiver.md
 | `BOOP_BOT_LOGIN` | `BOT_LOGIN` on receiver | GitHub login of the bot App (e.g. `booppr[bot]`). When set on a re-review, the runner resolves outdated Boop review threads and minimizes prior Boop issue comments. |
 | `BOOP_SKIP_SKILL` | Job template | `1` for a minimal-prompt smoke test (debug only) |
 | `BOOP_RTK_DISABLED` | Job template | `1` to bypass the [rtk adapter](#rtk-adapter-qub-85) — the runner's file reads go straight to `fs.readFile`, the pre-QUB-85 behavior. Use to reproduce a regression or to debug a poisoned rtk install without rebuilding the image. |
-| `BOOP_NO_STATUS_COMMENT` | Job template | `1` to skip the status comment surface and use reactions on the trigger comment instead (QUB-114). The receiver sets this on issue_comment triggers; the runner does NOT post or PATCH a status comment, and adds a single terminal reaction (🦴 on done, ❌ on failed) on the trigger comment. |
+| `BOOP_NO_STATUS_COMMENT` | Job template | `1` to skip the status comment surface and use reactions on the trigger comment instead (QUB-114). The receiver sets this on issue_comment triggers; the runner does NOT post or PATCH a status comment, and adds a single terminal reaction (🎉 on done, 👎 on failed) on the trigger comment. |
 
 The runner exits 1 if any required env var is missing. The Job template
 sets all of them; if a value is missing the Job fails to start.
@@ -143,11 +143,11 @@ status comment, and no interim PATCHes happen. The runner
 adds a single terminal reaction to the trigger comment
 via `postFinalReaction`:
 
-- Done → 🦴 (bone) reaction
-- Failed → ❌ (cross) reaction
+- Done → 🎉 (hooray) reaction
+- Failed → 👎 (-1) reaction
 
 The author's view on a comment-triggered re-review is
-`👀` → `🦴` (or `❌`). One reaction change, one
+`👀` → `🎉` (or `👎`). One reaction change, one
 notification, no PATCH loop.
 
 On any error, `postStatus("failed", err.message)` runs and the runner

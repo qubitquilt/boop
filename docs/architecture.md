@@ -233,11 +233,11 @@ T+?s   runner clones PR
 T+?s   runner runs the same multi-expert pipeline
 T+?s   runner posts summary + inline comments to the PR
 T+?s   runner adds a single terminal reaction on the trigger
-       comment: 🦴 on done, ❌ on failed
+       comment: 🎉 on done, 👎 on failed
 ```
 
 The author's view on a comment-triggered re-review is a one-step
-transition: 👀 → 🦴 (or ❌). One reaction change, one notification,
+transition: 👀 → 🎉 (or 👎). One reaction change, one notification,
 no PATCH loop.
 
 ### Total wall-clock

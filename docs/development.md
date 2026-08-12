@@ -302,7 +302,7 @@ kubectl logs -n dev-tools -l app=boop,pr-number=<N> --tail=200 | grep '"stage":"
 5. Comment `@BoopPr review` on a third push. The status should NOT
    post a 🐾 status comment. The receiver should react 👀 on your
    trigger comment; within 1-3 minutes the runner should add a
-   single terminal reaction (🦴 on success, ❌ on failure) on your
+   single terminal reaction (🎉 on success, 👎 on failure) on your
    trigger comment. The reaction's "Triggered by @<your-handle>"
    attribution is in the status-comment model that does not apply
    here — the comment + reactions are the user-visible surface

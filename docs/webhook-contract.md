@@ -166,8 +166,8 @@ review finishes:
 
 | Run result | Final reaction | Resulting transition |
 |---|---|---|
-| succeeded | 🦴 | 👀 → 🦴 |
-| failed | ❌ | 👀 → ❌ |
+| succeeded | 🎉 | 👀 → 🎉 |
+| failed | 👎 | 👀 → 👎 |
 
 The author's view is one reaction change, one notification. No
 PATCH loop on a status comment that never existed. Pull-request

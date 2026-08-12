@@ -34,7 +34,7 @@ The internal project here is `boop`. The GitHub App on the wire is
 - **Reaction mode (PR-comment triggers)** — when a user
   re-triggers via `@BoopPr review` on a comment, Boop
   reacts 👀 on the trigger and adds a single terminal
-  reaction (🦴 on done, ❌ on failed) instead of a status
+  reaction (🎉 on done, 👎 on failed) instead of a status
   thread. One reaction change, one notification.
 - **At-mention re-review** — drop `@BoopPr review` on any
   PR comment to re-trigger him.

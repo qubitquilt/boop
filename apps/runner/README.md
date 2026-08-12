@@ -37,7 +37,7 @@ PR. Invoked as a Kubernetes Job by the boop-receiver when a
 
 On comment-triggered runs (`BOOP_NO_STATUS_COMMENT=1`,
 QUB-114), the runner does not post or PATCH a status
-comment; it adds a single terminal reaction (🦴 on done,
+comment; it adds a single terminal reaction (🎉 on done,
 ❌ on failed) on the trigger comment.
 
 ## Build

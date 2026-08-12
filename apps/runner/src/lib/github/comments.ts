@@ -149,9 +149,9 @@ export async function postFinalReaction(
   }
   const content =
     stage === "done"
-      ? "bone"
+      ? "hooray"
       : stage === "failed"
-        ? "x"
+        ? "-1"
         : null;
   if (!content) {
     log("status", "skip final reaction (unknown stage)", { stage });
