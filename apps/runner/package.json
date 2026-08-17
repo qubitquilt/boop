@@ -23,7 +23,7 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@types/jsonwebtoken": "^9.0.7",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.10.2",
     "typescript": "^7.0.2"
   },
